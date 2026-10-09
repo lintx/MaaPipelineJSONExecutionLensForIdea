@@ -107,7 +107,8 @@ internal class PipelineFlowPanel(
                 nodeList.selectedIndex = selectedIndex.coerceIn(0, model.nodes.lastIndex)
             }
             val suffix = if (model.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
-            summaryLabel.text = "当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix"
+            val generatedSuffix = if (model.isGenerated) "（生成文件，编辑已禁用）" else ""
+            summaryLabel.text = "当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix"
             refreshing = false
             renderSelectedNode()
         }
@@ -153,6 +154,7 @@ internal class PipelineFlowPanel(
             } else {
                 "在 JSON 子编辑器中修改当前值"
             }
+            isEnabled = !currentModel.isGenerated
             isFocusable = false
             addActionListener {
                 if (field.isString) editStringField(field) else editJsonField(field)
@@ -236,17 +238,17 @@ internal class PipelineFlowPanel(
                 isOpaque = false
             }
             if (reference.isString) {
-                controls.add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack) {
+                controls.add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack, !currentModel.isGenerated) {
                     toggleReferenceMarker(reference, "[JumpBack]", it)
                 })
-                controls.add(createMarkerButton("锚", "切换 Anchor 前缀", reference.isAnchor) {
+                controls.add(createMarkerButton("锚", "切换 Anchor 前缀", reference.isAnchor, !currentModel.isGenerated) {
                     toggleReferenceMarker(reference, "[Anchor]", it)
                 })
             }
-            controls.add(createReorderButton("↑", "将此后继前移", index > 0) {
+            controls.add(createReorderButton("↑", "将此后继前移", index > 0 && !currentModel.isGenerated) {
                 moveNextReference(index, -1)
             })
-            controls.add(createReorderButton("↓", "将此后继后移", index < referenceCount - 1) {
+            controls.add(createReorderButton("↓", "将此后继后移", index < referenceCount - 1 && !currentModel.isGenerated) {
                 moveNextReference(index, 1)
             })
             card.add(controls, BorderLayout.EAST)
@@ -258,10 +260,12 @@ internal class PipelineFlowPanel(
         text: String,
         tooltip: String,
         selected: Boolean,
+        enabled: Boolean,
         action: (Boolean) -> Unit,
     ): JToggleButton = JToggleButton(text).apply {
         toolTipText = tooltip
         isSelected = selected
+        isEnabled = enabled
         isFocusable = false
         preferredSize = Dimension(JBUI.scale(26), JBUI.scale(24))
         minimumSize = preferredSize
@@ -289,8 +293,24 @@ internal class PipelineFlowPanel(
         return normalizedPath.substringAfter("/assets/resource/pipeline/", file.name)
     }
 
+    private fun ensureEditable(): Boolean {
+        if (currentModel.isGenerated) {
+            Messages.showWarningDialog(project, "当前文件由生成器维护，插件不会直接修改它。", "无法编辑 Pipeline")
+            return false
+        }
+        if (currentModel.version != editor.document.modificationStamp) {
+            Messages.showWarningDialog(
+                project,
+                "源码在流程视图刷新前发生了变化，请重新选择节点后再编辑。",
+                "Pipeline 索引已过期",
+            )
+            return false
+        }
+        return true
+    }
+
     private fun editStringField(field: PipelineFieldLocation) {
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
         val newValue = Messages.showInputDialog(
             project,
             "修改 ${field.name} 的字符串值：",
@@ -304,7 +324,7 @@ internal class PipelineFlowPanel(
         if (range.startOffset < 0 || range.endOffset > editor.document.textLength) return
         val oldValue = editor.document.getText(range)
         if (oldValue == replacement) return
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
 
         // 只替换字符串值范围，避免重新格式化 JSON 或丢失 JSONC 注释。
         WriteCommandAction.runWriteCommandAction(
@@ -318,7 +338,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun editJsonField(field: PipelineFieldLocation) {
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
         val range = field.valueRange
         if (range.startOffset < 0 || range.endOffset > editor.document.textLength) return
         val initialText = editor.document.getText(range)
@@ -326,7 +346,7 @@ internal class PipelineFlowPanel(
         if (!dialog.showAndGet()) return
         val replacement = dialog.value
         if (replacement.isEmpty() || replacement == initialText) return
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
 
         WriteCommandAction.runWriteCommandAction(
             project,
@@ -356,7 +376,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun toggleReferenceMarker(reference: PipelineReference, marker: String, enabled: Boolean) {
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
         val updatedValue = if (enabled) {
             if (reference.displayName.startsWith(marker)) {
                 reference.displayName
@@ -400,7 +420,7 @@ internal class PipelineFlowPanel(
         val node = currentModel.nodes.getOrNull(nodeList.selectedIndex) ?: return
         val targetIndex = index + direction
         if (targetIndex !in node.next.indices) return
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (!ensureEditable()) return
 
         val currentRange = node.next[index].range
         val targetRange = node.next[targetIndex].range
