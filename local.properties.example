@@ -1,0 +1,5 @@
+# IntelliJ IDEA SDK 根目录，例如 IDEA 安装目录。
+ideaSdkPath=
+
+# 可选：Development Instance 启动时打开的 MaaEnd 工程目录。
+maaendPath=

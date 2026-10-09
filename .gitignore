@@ -1,0 +1,13 @@
+.gradle/
+build/
+out/
+run/
+.idea/
+.kotlin/
+.intellijPlatform/
+.task-plans/
+local.properties
+*.iml
+*.ipr
+*.iws
+*.log
