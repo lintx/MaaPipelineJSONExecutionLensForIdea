@@ -85,6 +85,12 @@ data class PipelineOverrideLocation(
     val fields: List<String>,
 )
 
+data class PipelineEntryLocation(
+    val file: VirtualFile,
+    val entryName: String,
+    val range: TextRange,
+)
+
 data class PipelineDocumentModel(
     val file: VirtualFile,
     val version: Long,
@@ -92,6 +98,7 @@ data class PipelineDocumentModel(
     val hasSyntaxErrors: Boolean,
     val isGenerated: Boolean = false,
     val pipelineOverrides: List<PipelineOverrideLocation> = emptyList(),
+    val pipelineEntries: List<PipelineEntryLocation> = emptyList(),
 )
 
 internal object PipelineDocumentIndexer {
@@ -130,6 +137,7 @@ internal object PipelineDocumentIndexer {
             hasSyntaxErrors = parsedFile.hasSyntaxErrors,
             isGenerated = parsedFile.isGenerated,
             pipelineOverrides = findPipelineOverrides(project, file, nodes.map { it.name }.toSet()),
+            pipelineEntries = findPipelineEntries(project, file, nodes.map { it.name }.toSet()),
         )
     }
 
@@ -246,7 +254,9 @@ internal object PipelineDocumentIndexer {
                 anchorTarget = anchor?.toTarget(targetNode?.toTarget()),
                 isAnchorUnresolved = anchor == null || anchorCandidates.size > 1 || anchor.definition.isCleared || targetNode == null,
                 isAmbiguousTarget = anchorCandidates.size > 1,
-                isCrossFile = anchor != null && anchor.file != source.file,
+                isCrossFile = anchor != null && (
+                    anchor.file != source.file || targetNode?.file != source.file
+                ),
             )
         }
         val candidates = candidatesByName[reference.targetName].orEmpty()
@@ -267,10 +277,7 @@ internal object PipelineDocumentIndexer {
         file: VirtualFile,
         currentNodeNames: Set<String>,
     ): List<PipelineOverrideLocation> {
-        val pipelineRoot = generateSequence(file.parent) { it.parent }
-            .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
-            ?: return emptyList()
-        val tasksRoot = pipelineRoot.parent?.parent?.findChild("tasks") ?: return emptyList()
+        val tasksRoot = findTasksRoot(file) ?: return emptyList()
         return collectJsonFiles(tasksRoot).flatMap { taskFile ->
             val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@flatMap emptyList()
             val overrides = mutableListOf<PipelineOverrideLocation>()
@@ -294,6 +301,39 @@ internal object PipelineDocumentIndexer {
             visit(jsonFile)
             overrides
         }
+    }
+
+    private fun findPipelineEntries(
+        project: Project,
+        file: VirtualFile,
+        currentNodeNames: Set<String>,
+    ): List<PipelineEntryLocation> {
+        val tasksRoot = findTasksRoot(file) ?: return emptyList()
+        return collectJsonFiles(tasksRoot).flatMap { taskFile ->
+            val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@flatMap emptyList()
+            val entries = mutableListOf<PipelineEntryLocation>()
+
+            fun visit(element: PsiElement) {
+                if (element is JsonProperty && element.name == "entry") {
+                    val entryName = element.value?.let(::scalarText)
+                    if (entryName != null && entryName in currentNodeNames) {
+                        val range = element.value?.textRange ?: element.textRange
+                        if (range != null) entries += PipelineEntryLocation(taskFile, entryName, range)
+                    }
+                }
+                element.children.forEach(::visit)
+            }
+
+            visit(jsonFile)
+            entries
+        }
+    }
+
+    private fun findTasksRoot(file: VirtualFile): VirtualFile? {
+        val pipelineRoot = generateSequence(file.parent) { it.parent }
+            .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
+            ?: return null
+        return pipelineRoot.parent?.parent?.findChild("tasks")
     }
 
     private fun PipelineNodeLocation.withDetails(valueObject: JsonObject?): PipelineNodeLocation {

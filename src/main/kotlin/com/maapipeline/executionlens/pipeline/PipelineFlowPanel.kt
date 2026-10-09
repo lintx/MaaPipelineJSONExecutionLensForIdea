@@ -324,9 +324,17 @@ internal class PipelineFlowPanel(
 
     private fun addNodeDiagnostics(location: PipelineNodeLocation) {
         val overrides = currentModel.pipelineOverrides.filter { it.targetName == location.name }
+        val entries = currentModel.pipelineEntries.filter { it.entryName == location.name }
         val unresolvedAnchors = (location.next + location.onError).filter { it.isAnchorUnresolved }
-        if (overrides.isEmpty() && unresolvedAnchors.isEmpty()) return
+        if (entries.isEmpty() && overrides.isEmpty() && unresolvedAnchors.isEmpty()) return
         detailsPanel.add(createSectionLabel("项目诊断"))
+        entries.forEach { entry ->
+            detailsPanel.add(
+                createNavigationLabel("任务入口：${displayPath(entry.file)} → ${entry.entryName}") {
+                    navigateToFileRange(entry.file, entry.range)
+                },
+            )
+        }
         overrides.forEach { override ->
             val fields = override.fields.takeIf { it.isNotEmpty() }?.joinToString(", ").orEmpty()
             val suffix = fields.takeIf { it.isNotEmpty() }?.let { "（字段：$it）" }.orEmpty()
