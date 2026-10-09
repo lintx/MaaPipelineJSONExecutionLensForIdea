@@ -1,9 +1,9 @@
 package com.maapipeline.executionlens.pipeline
 
 import java.awt.BorderLayout
+import com.intellij.ui.OnePixelSplitter
 import javax.swing.JComponent
 import javax.swing.JPanel
-import javax.swing.JSplitPane
 import javax.swing.JTabbedPane
 
 internal class PipelineEditorViews(
@@ -13,8 +13,7 @@ internal class PipelineEditorViews(
     private val sourcePage = JPanel(BorderLayout())
     private val flowPage = JPanel(BorderLayout())
     private val splitPage = JPanel(BorderLayout())
-    private val splitter = JSplitPane(JSplitPane.HORIZONTAL_SPLIT).apply {
-        resizeWeight = 0.5
+    private val splitter = OnePixelSplitter(false, 0.5f).apply {
         border = null
     }
     val tabs = JTabbedPane().apply {
@@ -38,19 +37,19 @@ internal class PipelineEditorViews(
         sourcePage.removeAll()
         flowPage.removeAll()
         splitPage.removeAll()
-        splitter.leftComponent = null
-        splitter.rightComponent = null
+        splitter.firstComponent = null
+        splitter.secondComponent = null
         when (tabs.selectedIndex) {
             0 -> sourcePage.add(source, BorderLayout.CENTER)
             1 -> flowPage.add(flow, BorderLayout.CENTER)
             2 -> {
-                splitter.leftComponent = source
-                splitter.rightComponent = flow
+                splitter.firstComponent = source
+                splitter.secondComponent = flow
                 splitPage.add(splitter, BorderLayout.CENTER)
-                splitter.setDividerLocation(0.5)
             }
         }
         revalidate()
         repaint()
     }
+
 }
