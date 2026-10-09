@@ -147,13 +147,17 @@ internal class PipelineFlowPanel(
             maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
         }
         row.add(createNavigationLabel(field.summary, field.range), BorderLayout.CENTER)
-        if (field.isString) {
-            row.add(JButton("编辑").apply {
-                toolTipText = "只替换当前字符串值，保留 JSON 其它内容"
-                isFocusable = false
-                addActionListener { editStringField(field) }
-            }, BorderLayout.EAST)
-        }
+        row.add(JButton("编辑").apply {
+            toolTipText = if (field.isString) {
+                "只替换当前字符串值，保留 JSON 其它内容"
+            } else {
+                "在 JSON 子编辑器中修改当前值"
+            }
+            isFocusable = false
+            addActionListener {
+                if (field.isString) editStringField(field) else editJsonField(field)
+            }
+        }, BorderLayout.EAST)
         detailsPanel.add(row)
     }
 
@@ -309,6 +313,27 @@ internal class PipelineFlowPanel(
             "MaaPipeline JSON Execution Lens",
             Runnable {
             editor.document.replaceString(range.startOffset, range.endOffset, replacement)
+            },
+        )
+    }
+
+    private fun editJsonField(field: PipelineFieldLocation) {
+        if (currentModel.version != editor.document.modificationStamp) return
+        val range = field.valueRange
+        if (range.startOffset < 0 || range.endOffset > editor.document.textLength) return
+        val initialText = editor.document.getText(range)
+        val dialog = PipelineJsonFieldDialog(project, field.name, initialText)
+        if (!dialog.showAndGet()) return
+        val replacement = dialog.value
+        if (replacement.isEmpty() || replacement == initialText) return
+        if (currentModel.version != editor.document.modificationStamp) return
+
+        WriteCommandAction.runWriteCommandAction(
+            project,
+            "编辑 Pipeline JSON 字段",
+            "MaaPipeline JSON Execution Lens",
+            Runnable {
+                editor.document.replaceString(range.startOffset, range.endOffset, replacement)
             },
         )
     }
