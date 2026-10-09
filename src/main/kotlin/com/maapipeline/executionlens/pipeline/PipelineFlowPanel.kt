@@ -29,6 +29,7 @@ import java.awt.event.MouseEvent
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JButton
+import javax.swing.JToggleButton
 import javax.swing.DefaultListModel
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -230,6 +231,14 @@ internal class PipelineFlowPanel(
             val controls = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
                 isOpaque = false
             }
+            if (reference.isString) {
+                controls.add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack) {
+                    toggleReferenceMarker(reference, "[JumpBack]", it)
+                })
+                controls.add(createMarkerButton("锚", "切换 Anchor 前缀", reference.isAnchor) {
+                    toggleReferenceMarker(reference, "[Anchor]", it)
+                })
+            }
             controls.add(createReorderButton("↑", "将此后继前移", index > 0) {
                 moveNextReference(index, -1)
             })
@@ -239,6 +248,21 @@ internal class PipelineFlowPanel(
             card.add(controls, BorderLayout.EAST)
         }
         return card
+    }
+
+    private fun createMarkerButton(
+        text: String,
+        tooltip: String,
+        selected: Boolean,
+        action: (Boolean) -> Unit,
+    ): JToggleButton = JToggleButton(text).apply {
+        toolTipText = tooltip
+        isSelected = selected
+        isFocusable = false
+        preferredSize = Dimension(JBUI.scale(26), JBUI.scale(24))
+        minimumSize = preferredSize
+        maximumSize = preferredSize
+        addActionListener { action(isSelected) }
     }
 
     private fun createReorderButton(
@@ -304,6 +328,47 @@ internal class PipelineFlowPanel(
             }
         }
         append('"')
+    }
+
+    private fun toggleReferenceMarker(reference: PipelineReference, marker: String, enabled: Boolean) {
+        if (currentModel.version != editor.document.modificationStamp) return
+        val updatedValue = if (enabled) {
+            if (reference.displayName.startsWith(marker)) {
+                reference.displayName
+            } else {
+                marker + reference.displayName
+            }
+        } else {
+            removeLeadingMarker(reference.displayName, marker)
+        }
+        if (updatedValue == reference.displayName) return
+        val replacement = quoteJsonString(updatedValue)
+        val range = reference.range
+        if (range.startOffset < 0 || range.endOffset > editor.document.textLength) return
+
+        // 前缀编辑只替换当前引用字符串，保留数组中的空白、注释和其它候选项。
+        WriteCommandAction.runWriteCommandAction(
+            project,
+            "编辑 Pipeline 引用标记",
+            "MaaPipeline JSON Execution Lens",
+            Runnable {
+                editor.document.replaceString(range.startOffset, range.endOffset, replacement)
+            },
+        )
+    }
+
+    private fun removeLeadingMarker(value: String, marker: String): String {
+        var offset = 0
+        while (offset < value.length && value[offset] == '[') {
+            val end = value.indexOf(']', offset)
+            if (end < 0) break
+            val currentMarker = value.substring(offset, end + 1)
+            if (currentMarker == marker) {
+                return value.removeRange(offset, end + 1)
+            }
+            offset = end + 1
+        }
+        return value
     }
 
     private fun moveNextReference(index: Int, direction: Int) {

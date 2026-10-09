@@ -38,6 +38,7 @@ data class PipelineReference(
     val range: TextRange,
     val isJumpBack: Boolean,
     val isAnchor: Boolean,
+    val isString: Boolean = true,
     val targetExists: Boolean = false,
     val isCycle: Boolean = false,
     val isSharedTarget: Boolean = false,
@@ -219,6 +220,7 @@ internal object PipelineDocumentIndexer {
                 range = range,
                 isJumpBack = markerState.isJumpBack,
                 isAnchor = markerState.isAnchor,
+                isString = value.text.trim().let { it.startsWith("\"") && it.endsWith("\"") },
             )
         }
     }
