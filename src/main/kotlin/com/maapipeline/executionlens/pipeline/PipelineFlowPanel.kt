@@ -7,6 +7,7 @@ import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.psi.PsiDocumentManager
@@ -135,6 +136,7 @@ internal class PipelineFlowPanel(
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addReferences("后继", location.next)
             addReferences("错误后继", location.onError)
+            addReferences("嵌套节点引用", location.embeddedReferences)
         }
         detailsPanel.revalidate()
         detailsPanel.repaint()
@@ -216,9 +218,16 @@ internal class PipelineFlowPanel(
             alignmentX = LEFT_ALIGNMENT
         }
         val state = states.takeIf { it.isNotEmpty() }?.joinToString("、")?.let { "（$it）" }.orEmpty()
+        val referenceLabel = buildString {
+            if (reference.kind != PipelineReferenceKind.NEXT && reference.kind != PipelineReferenceKind.ON_ERROR) {
+                append(reference.kind.label)
+                reference.propertyPath?.let { append(" [$it]") }
+                append("：")
+            }
+        }
         card.add(
             createNavigationLabel(
-                "${index + 1}. $marker${reference.displayName} $state",
+                "${index + 1}. $referenceLabel$marker${reference.displayName} $state",
             ) { navigateToReference(reference) },
             BorderLayout.CENTER,
         )
@@ -325,8 +334,11 @@ internal class PipelineFlowPanel(
     private fun addNodeDiagnostics(location: PipelineNodeLocation) {
         val overrides = currentModel.pipelineOverrides.filter { it.targetName == location.name }
         val entries = currentModel.pipelineEntries.filter { it.entryName == location.name }
-        val unresolvedAnchors = (location.next + location.onError).filter { it.isAnchorUnresolved }
-        if (entries.isEmpty() && overrides.isEmpty() && unresolvedAnchors.isEmpty()) return
+        val diagnostics = currentModel.diagnostics.filter { diagnostic ->
+            diagnostic.range.startOffset >= location.propertyRange.startOffset &&
+                diagnostic.range.endOffset <= location.propertyRange.endOffset
+        }
+        if (entries.isEmpty() && overrides.isEmpty() && diagnostics.isEmpty()) return
         detailsPanel.add(createSectionLabel("项目诊断"))
         entries.forEach { entry ->
             detailsPanel.add(
@@ -344,13 +356,24 @@ internal class PipelineFlowPanel(
                 ) { navigateToFileRange(override.file, override.range) },
             )
         }
-        unresolvedAnchors.forEach { reference ->
+        diagnostics.forEach { diagnostic ->
+            val line = lineNumber(diagnostic.file, diagnostic.range)
+            val locationText = "${displayPath(diagnostic.file)}:${line ?: "?"}"
+            val severity = if (diagnostic.severity == PipelineDiagnosticSeverity.ERROR) "错误" else "警告"
             detailsPanel.add(
-                createNavigationLabel("Anchor 未解析：${reference.displayName}") {
-                    navigateToRange(reference.range)
+                createNavigationLabel(
+                    "$severity：${diagnostic.message}（${diagnostic.kind.label} → ${diagnostic.targetName}，$locationText；建议：${diagnostic.suggestion}）",
+                ) {
+                    navigateToFileRange(diagnostic.file, diagnostic.range)
                 },
             )
         }
+    }
+
+    private fun lineNumber(file: VirtualFile, range: TextRange): Int? {
+        val document = FileDocumentManager.getInstance().getDocument(file) ?: return null
+        if (range.startOffset !in 0..document.textLength) return null
+        return document.getLineNumber(range.startOffset) + 1
     }
 
     private fun ensureEditable(): Boolean {

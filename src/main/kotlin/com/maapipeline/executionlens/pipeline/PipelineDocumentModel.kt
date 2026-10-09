@@ -24,6 +24,7 @@ data class PipelineNodeLocation(
     val onError: List<PipelineReference> = emptyList(),
     val anchor: PipelineFieldLocation? = null,
     val anchorDefinitions: List<PipelineAnchorDefinition> = emptyList(),
+    val embeddedReferences: List<PipelineReference> = emptyList(),
 )
 
 data class PipelineFieldLocation(
@@ -49,7 +50,19 @@ data class PipelineReference(
     val isAmbiguousTarget: Boolean = false,
     val isCrossFile: Boolean = false,
     val isAnchorUnresolved: Boolean = false,
+    val kind: PipelineReferenceKind = PipelineReferenceKind.NEXT,
+    val propertyPath: String? = null,
 )
+
+enum class PipelineReferenceKind(
+    val label: String,
+) {
+    NEXT("后继"),
+    ON_ERROR("错误后继"),
+    TARGET("目标"),
+    BEGIN("滑动起点"),
+    END("滑动终点"),
+}
 
 data class PipelineNodeTarget(
     val file: VirtualFile,
@@ -91,6 +104,21 @@ data class PipelineEntryLocation(
     val range: TextRange,
 )
 
+enum class PipelineDiagnosticSeverity {
+    ERROR,
+    WARNING,
+}
+
+data class PipelineDiagnostic(
+    val file: VirtualFile,
+    val range: TextRange,
+    val severity: PipelineDiagnosticSeverity,
+    val kind: PipelineReferenceKind,
+    val targetName: String,
+    val message: String,
+    val suggestion: String,
+)
+
 data class PipelineDocumentModel(
     val file: VirtualFile,
     val version: Long,
@@ -99,6 +127,7 @@ data class PipelineDocumentModel(
     val isGenerated: Boolean = false,
     val pipelineOverrides: List<PipelineOverrideLocation> = emptyList(),
     val pipelineEntries: List<PipelineEntryLocation> = emptyList(),
+    val diagnostics: List<PipelineDiagnostic> = emptyList(),
 )
 
 internal object PipelineDocumentIndexer {
@@ -116,7 +145,7 @@ internal object PipelineDocumentIndexer {
         }
         val anchorsByName = anchorEntries.groupBy { it.definition.name }
         val graph = entries.associate { entry ->
-            entry.key to allReferences(entry.node)
+            entry.key to flowReferences(entry.node)
                 .mapNotNull { candidatesByName[it.targetName].orEmpty().singleOrNull()?.key }
         }
         val inboundCounts = graph.values
@@ -128,8 +157,17 @@ internal object PipelineDocumentIndexer {
             node.copy(
                 next = resolveReferences(entry, node.next, candidatesByName, anchorsByName, graph, inboundCounts),
                 onError = resolveReferences(entry, node.onError, candidatesByName, anchorsByName, graph, inboundCounts),
+                embeddedReferences = resolveReferences(
+                    entry,
+                    node.embeddedReferences,
+                    candidatesByName,
+                    anchorsByName,
+                    graph,
+                    inboundCounts,
+                ),
             )
         }
+        val diagnostics = buildDiagnostics(file, nodes)
         return PipelineDocumentModel(
             file = file,
             version = parsedFile.version,
@@ -138,6 +176,7 @@ internal object PipelineDocumentIndexer {
             isGenerated = parsedFile.isGenerated,
             pipelineOverrides = findPipelineOverrides(project, file, nodes.map { it.name }.toSet()),
             pipelineEntries = findPipelineEntries(project, file, nodes.map { it.name }.toSet()),
+            diagnostics = diagnostics,
         )
     }
 
@@ -232,7 +271,7 @@ internal object PipelineDocumentIndexer {
         return files
     }
 
-    private fun allReferences(node: PipelineNodeLocation): List<PipelineReference> =
+    private fun flowReferences(node: PipelineNodeLocation): List<PipelineReference> =
         (node.next + node.onError).filterNot(PipelineReference::isAnchor)
 
     private fun resolveReferences(
@@ -270,6 +309,64 @@ internal object PipelineDocumentIndexer {
             isAmbiguousTarget = candidates.size > 1,
             isCrossFile = target != null && target.file != source.file,
         )
+    }
+
+    private fun buildDiagnostics(
+        file: VirtualFile,
+        nodes: List<PipelineNodeLocation>,
+    ): List<PipelineDiagnostic> = nodes.flatMap { node ->
+        (node.next + node.onError + node.embeddedReferences).mapNotNull { reference ->
+            val message: String
+            val suggestion: String
+            val severity: PipelineDiagnosticSeverity
+            when {
+                reference.isAnchorUnresolved -> {
+                    severity = PipelineDiagnosticSeverity.WARNING
+                    message = when {
+                        reference.isAmbiguousTarget -> "Anchor 名称对应多个定义"
+                        reference.anchorTarget?.isCleared == true -> "Anchor 已被清除"
+                        reference.anchorTarget?.targetNode == null -> "Anchor 的目标节点不存在"
+                        else -> "Anchor 未定义"
+                    }
+                    suggestion = when {
+                        reference.isAmbiguousTarget -> "保留唯一的 Anchor 定义，或改用明确的节点名。"
+                        reference.anchorTarget?.isCleared == true -> "为 Anchor 设置已存在的目标节点，或移除 [Anchor] 前缀。"
+                        reference.anchorTarget?.targetNode == null -> "将 Anchor 映射到已存在的节点。"
+                        else -> "在项目中定义该 Anchor，或移除 [Anchor] 前缀。"
+                    }
+                }
+
+                reference.isAmbiguousTarget -> {
+                    severity = PipelineDiagnosticSeverity.WARNING
+                    message = "目标名称不唯一"
+                    suggestion = "保持节点名称唯一，或改用唯一的节点名称。"
+                }
+
+                !reference.targetExists -> {
+                    severity = PipelineDiagnosticSeverity.ERROR
+                    message = "目标节点不存在"
+                    suggestion = when (reference.kind) {
+                        PipelineReferenceKind.TARGET,
+                        PipelineReferenceKind.BEGIN,
+                        PipelineReferenceKind.END,
+                        -> "检查字段中的节点名称，或先定义该节点。"
+
+                        else -> "检查节点名称拼写，或先定义该节点。"
+                    }
+                }
+
+                else -> return@mapNotNull null
+            }
+            PipelineDiagnostic(
+                file = file,
+                range = reference.range,
+                severity = severity,
+                kind = reference.kind,
+                targetName = reference.targetName,
+                message = message,
+                suggestion = suggestion,
+            )
+        }
     }
 
     private fun findPipelineOverrides(
@@ -342,10 +439,11 @@ internal object PipelineDocumentIndexer {
             description = valueObject.findProperty("desc")?.value?.let(::scalarText),
             recognition = valueObject.findProperty("recognition")?.toFieldLocation(),
             action = valueObject.findProperty("action")?.toFieldLocation(),
-            next = valueObject.findProperty("next")?.toReferences().orEmpty(),
-            onError = valueObject.findProperty("on_error")?.toReferences().orEmpty(),
+            next = valueObject.findProperty("next")?.toReferences(PipelineReferenceKind.NEXT).orEmpty(),
+            onError = valueObject.findProperty("on_error")?.toReferences(PipelineReferenceKind.ON_ERROR).orEmpty(),
             anchor = valueObject.findProperty("anchor")?.toFieldLocation(),
             anchorDefinitions = valueObject.findProperty("anchor")?.toAnchorDefinitions().orEmpty(),
+            embeddedReferences = valueObject.toEmbeddedReferences(),
         )
     }
 
@@ -393,25 +491,91 @@ internal object PipelineDocumentIndexer {
         )
     }
 
-    private fun JsonProperty.toReferences(): List<PipelineReference> {
+    private fun JsonProperty.toReferences(kind: PipelineReferenceKind): List<PipelineReference> {
         val values = when (val propertyValue = value) {
             is JsonArray -> propertyValue.valueList
             null -> emptyList()
             else -> listOf(propertyValue)
         }
-        return values.mapNotNull { value ->
-            val range = value.textRange ?: return@mapNotNull null
-            val raw = scalarText(value.text)
+        return values.mapNotNull { value -> value.toReference(kind) }
+    }
+
+    private fun JsonObject.toEmbeddedReferences(): List<PipelineReference> {
+        val references = mutableListOf<PipelineReference>()
+
+        fun visit(element: PsiElement, path: String) {
+            if (element is JsonProperty) {
+                val propertyPath = if (path.isEmpty()) element.name else "$path.${element.name}"
+                val kind = when (element.name) {
+                    "target" -> PipelineReferenceKind.TARGET
+                    "begin" -> PipelineReferenceKind.BEGIN
+                    "end" -> PipelineReferenceKind.END
+                    else -> null
+                }
+                if (kind != null) {
+                    references += element.value?.toEmbeddedReferences(kind, propertyPath).orEmpty()
+                }
+                if (element.name != "next" && element.name != "on_error") {
+                    element.children.forEach { child -> visit(child, propertyPath) }
+                }
+                return
+            }
+            element.children.forEach { child -> visit(child, path) }
+        }
+
+        visit(this, "")
+        return references
+    }
+
+    private fun JsonValue.toEmbeddedReferences(
+        kind: PipelineReferenceKind,
+        propertyPath: String,
+    ): List<PipelineReference> = when (this) {
+        is JsonArray -> valueList.flatMap { value -> value.toEmbeddedReferences(kind, propertyPath) }
+        else -> listOfNotNull(toReference(kind, propertyPath))
+    }
+
+    private fun JsonValue.toReference(
+        kind: PipelineReferenceKind,
+        propertyPath: String? = null,
+    ): PipelineReference? {
+        val range = textRange ?: return null
+        if (this is JsonObject) {
+            if (kind != PipelineReferenceKind.NEXT && kind != PipelineReferenceKind.ON_ERROR) return null
+            val nameValue = findProperty("name")?.value ?: return null
+            val raw = stringText(nameValue) ?: return null
             val markerState = parseReferenceMarkers(raw)
-            PipelineReference(
+            val jumpBack = findProperty("jump_back")?.value?.text?.trim() == "true"
+            val anchor = findProperty("anchor")?.value?.text?.trim() == "true"
+            return PipelineReference(
                 displayName = raw,
                 targetName = markerState.targetName,
-                range = range,
-                isJumpBack = markerState.isJumpBack,
-                isAnchor = markerState.isAnchor,
-                isString = value.text.trim().let { it.startsWith("\"") && it.endsWith("\"") },
+                range = nameValue.textRange ?: range,
+                isJumpBack = markerState.isJumpBack || jumpBack,
+                isAnchor = markerState.isAnchor || anchor,
+                isString = false,
+                kind = kind,
+                propertyPath = propertyPath,
             )
         }
+        val raw = stringText(this) ?: return null
+        val markerState = parseReferenceMarkers(raw)
+        return PipelineReference(
+            displayName = raw,
+            targetName = markerState.targetName,
+            range = range,
+            isJumpBack = markerState.isJumpBack,
+            isAnchor = markerState.isAnchor,
+            isString = true,
+            kind = kind,
+            propertyPath = propertyPath,
+        )
+    }
+
+    private fun stringText(value: JsonValue): String? {
+        val text = value.text.trim()
+        if (text.length < 2 || !text.startsWith("\"") || !text.endsWith("\"")) return null
+        return scalarText(text)
     }
 
     private fun summarizeValue(value: com.intellij.json.psi.JsonValue): String {
