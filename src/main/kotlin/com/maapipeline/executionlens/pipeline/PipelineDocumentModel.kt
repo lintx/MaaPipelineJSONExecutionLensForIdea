@@ -10,6 +10,7 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
 
 data class PipelineNodeLocation(
@@ -22,6 +23,7 @@ data class PipelineNodeLocation(
     val next: List<PipelineReference> = emptyList(),
     val onError: List<PipelineReference> = emptyList(),
     val anchor: PipelineFieldLocation? = null,
+    val anchorDefinitions: List<PipelineAnchorDefinition> = emptyList(),
 )
 
 data class PipelineFieldLocation(
@@ -43,8 +45,10 @@ data class PipelineReference(
     val isCycle: Boolean = false,
     val isSharedTarget: Boolean = false,
     val target: PipelineNodeTarget? = null,
+    val anchorTarget: PipelineAnchorTarget? = null,
     val isAmbiguousTarget: Boolean = false,
     val isCrossFile: Boolean = false,
+    val isAnchorUnresolved: Boolean = false,
 )
 
 data class PipelineNodeTarget(
@@ -57,12 +61,37 @@ data class PipelineNodeTarget(
     val nextCount: Int,
 )
 
+data class PipelineAnchorDefinition(
+    val name: String,
+    val range: TextRange,
+    val targetNodeName: String?,
+    val isCleared: Boolean,
+)
+
+data class PipelineAnchorTarget(
+    val file: VirtualFile,
+    val anchorName: String,
+    val definitionRange: TextRange,
+    val definingNodeName: String,
+    val targetNodeName: String?,
+    val targetNode: PipelineNodeTarget?,
+    val isCleared: Boolean,
+)
+
+data class PipelineOverrideLocation(
+    val file: VirtualFile,
+    val targetName: String,
+    val range: TextRange,
+    val fields: List<String>,
+)
+
 data class PipelineDocumentModel(
     val file: VirtualFile,
     val version: Long,
     val nodes: List<PipelineNodeLocation>,
     val hasSyntaxErrors: Boolean,
     val isGenerated: Boolean = false,
+    val pipelineOverrides: List<PipelineOverrideLocation> = emptyList(),
 )
 
 internal object PipelineDocumentIndexer {
@@ -73,6 +102,12 @@ internal object PipelineDocumentIndexer {
             parsed.nodes.map { node -> PipelineNodeEntry(parsed.file, node) }
         }
         val candidatesByName = entries.groupBy { it.node.name }
+        val anchorEntries = entries.flatMap { entry ->
+            entry.node.anchorDefinitions.map { definition ->
+                PipelineAnchorEntry(entry.file, entry.node, definition)
+            }
+        }
+        val anchorsByName = anchorEntries.groupBy { it.definition.name }
         val graph = entries.associate { entry ->
             entry.key to allReferences(entry.node)
                 .mapNotNull { candidatesByName[it.targetName].orEmpty().singleOrNull()?.key }
@@ -84,8 +119,8 @@ internal object PipelineDocumentIndexer {
         val nodes = parsedFile.nodes.map { node ->
             val entry = PipelineNodeEntry(file, node)
             node.copy(
-                next = resolveReferences(entry, node.next, candidatesByName, graph, inboundCounts),
-                onError = resolveReferences(entry, node.onError, candidatesByName, graph, inboundCounts),
+                next = resolveReferences(entry, node.next, candidatesByName, anchorsByName, graph, inboundCounts),
+                onError = resolveReferences(entry, node.onError, candidatesByName, anchorsByName, graph, inboundCounts),
             )
         }
         return PipelineDocumentModel(
@@ -94,6 +129,7 @@ internal object PipelineDocumentIndexer {
             nodes = nodes,
             hasSyntaxErrors = parsedFile.hasSyntaxErrors,
             isGenerated = parsedFile.isGenerated,
+            pipelineOverrides = findPipelineOverrides(project, file, nodes.map { it.name }.toSet()),
         )
     }
 
@@ -119,6 +155,22 @@ internal object PipelineDocumentIndexer {
             recognitionSummary = node.recognition?.summary,
             actionSummary = node.action?.summary,
             nextCount = node.next.size,
+        )
+    }
+
+    private data class PipelineAnchorEntry(
+        val file: VirtualFile,
+        val node: PipelineNodeLocation,
+        val definition: PipelineAnchorDefinition,
+    ) {
+        fun toTarget(targetNode: PipelineNodeTarget?): PipelineAnchorTarget = PipelineAnchorTarget(
+            file = file,
+            anchorName = definition.name,
+            definitionRange = definition.range,
+            definingNodeName = node.name,
+            targetNodeName = definition.targetNodeName,
+            targetNode = targetNode,
+            isCleared = definition.isCleared,
         )
     }
 
@@ -155,8 +207,12 @@ internal object PipelineDocumentIndexer {
         val pipelineRoot = generateSequence(file.parent) { it.parent }
             .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
             ?: return listOf(file)
-        val files = mutableListOf<VirtualFile>()
+        val files = collectJsonFiles(pipelineRoot)
+        return files.ifEmpty { listOf(file) }
+    }
 
+    private fun collectJsonFiles(root: VirtualFile): List<VirtualFile> {
+        val files = mutableListOf<VirtualFile>()
         fun visit(current: VirtualFile) {
             if (current.isDirectory) {
                 current.children.orEmpty().forEach(::visit)
@@ -164,21 +220,35 @@ internal object PipelineDocumentIndexer {
                 files += current
             }
         }
-
-        visit(pipelineRoot)
-        return files.ifEmpty { listOf(file) }
+        visit(root)
+        return files
     }
 
     private fun allReferences(node: PipelineNodeLocation): List<PipelineReference> =
-        node.next + node.onError
+        (node.next + node.onError).filterNot(PipelineReference::isAnchor)
 
     private fun resolveReferences(
         source: PipelineNodeEntry,
         references: List<PipelineReference>,
         candidatesByName: Map<String, List<PipelineNodeEntry>>,
+        anchorsByName: Map<String, List<PipelineAnchorEntry>>,
         graph: Map<String, List<String>>,
         inboundCounts: Map<String, Int>,
     ): List<PipelineReference> = references.map { reference ->
+        if (reference.isAnchor) {
+            val anchorCandidates = anchorsByName[reference.targetName].orEmpty()
+            val anchor = anchorCandidates.singleOrNull()
+            val targetNode = anchor?.definition?.targetNodeName?.let { targetName ->
+                candidatesByName[targetName].orEmpty().singleOrNull()
+            } ?: anchor?.takeUnless { it.definition.isCleared }?.let { candidatesByName[it.node.name].orEmpty().singleOrNull() }
+            return@map reference.copy(
+                targetExists = anchorCandidates.isNotEmpty(),
+                anchorTarget = anchor?.toTarget(targetNode?.toTarget()),
+                isAnchorUnresolved = anchor == null || anchorCandidates.size > 1 || anchor.definition.isCleared || targetNode == null,
+                isAmbiguousTarget = anchorCandidates.size > 1,
+                isCrossFile = anchor != null && anchor.file != source.file,
+            )
+        }
         val candidates = candidatesByName[reference.targetName].orEmpty()
         val target = candidates.singleOrNull()
         val targetKey = target?.key
@@ -192,6 +262,40 @@ internal object PipelineDocumentIndexer {
         )
     }
 
+    private fun findPipelineOverrides(
+        project: Project,
+        file: VirtualFile,
+        currentNodeNames: Set<String>,
+    ): List<PipelineOverrideLocation> {
+        val pipelineRoot = generateSequence(file.parent) { it.parent }
+            .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
+            ?: return emptyList()
+        val tasksRoot = pipelineRoot.parent?.parent?.findChild("tasks") ?: return emptyList()
+        return collectJsonFiles(tasksRoot).flatMap { taskFile ->
+            val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@flatMap emptyList()
+            val overrides = mutableListOf<PipelineOverrideLocation>()
+
+            fun visit(element: PsiElement) {
+                if (element is JsonProperty && element.name == "pipeline_override") {
+                    val overrideObject = element.value as? JsonObject
+                    overrideObject?.propertyList.orEmpty().forEach { targetProperty ->
+                        if (targetProperty.name !in currentNodeNames) return@forEach
+                        val range = targetProperty.nameElement.textRange ?: targetProperty.textRange ?: return@forEach
+                        val fields = (targetProperty.value as? JsonObject)
+                            ?.propertyList
+                            ?.map { property -> property.name }
+                            .orEmpty()
+                        overrides += PipelineOverrideLocation(taskFile, targetProperty.name, range, fields)
+                    }
+                }
+                element.children.forEach(::visit)
+            }
+
+            visit(jsonFile)
+            overrides
+        }
+    }
+
     private fun PipelineNodeLocation.withDetails(valueObject: JsonObject?): PipelineNodeLocation {
         if (valueObject == null) return this
         return copy(
@@ -201,7 +305,39 @@ internal object PipelineDocumentIndexer {
             next = valueObject.findProperty("next")?.toReferences().orEmpty(),
             onError = valueObject.findProperty("on_error")?.toReferences().orEmpty(),
             anchor = valueObject.findProperty("anchor")?.toFieldLocation(),
+            anchorDefinitions = valueObject.findProperty("anchor")?.toAnchorDefinitions().orEmpty(),
         )
+    }
+
+    private fun JsonProperty.toAnchorDefinitions(): List<PipelineAnchorDefinition> {
+        val propertyValue = value ?: return emptyList()
+        return when (propertyValue) {
+            is JsonArray -> propertyValue.valueList.mapNotNull { anchorValue ->
+                val range = anchorValue.textRange ?: return@mapNotNull null
+                val name = scalarText(anchorValue)
+                if (name.isEmpty()) return@mapNotNull null
+                PipelineAnchorDefinition(name, range, targetNodeName = null, isCleared = false)
+            }
+
+            is JsonObject -> propertyValue.propertyList.mapNotNull { anchorProperty ->
+                val range = anchorProperty.nameElement.textRange ?: anchorProperty.textRange ?: return@mapNotNull null
+                val targetName = anchorProperty.value?.let(::scalarText)
+                PipelineAnchorDefinition(
+                    name = anchorProperty.name,
+                    range = range,
+                    targetNodeName = targetName?.takeIf { it.isNotEmpty() },
+                    isCleared = targetName != null && targetName.isEmpty(),
+                )
+            }
+
+            else -> {
+                val range = propertyValue.textRange ?: return emptyList()
+                val name = scalarText(propertyValue)
+                if (name.isEmpty()) emptyList() else listOf(
+                    PipelineAnchorDefinition(name, range, targetNodeName = null, isCleared = false),
+                )
+            }
+        }
     }
 
     private fun JsonProperty.toFieldLocation(): PipelineFieldLocation? {

@@ -130,6 +130,7 @@ internal class PipelineFlowPanel(
             addFieldSummary("识别", location.recognition)
             addFieldSummary("动作", location.action)
             addFieldSummary("锚点", location.anchor)
+            addNodeDiagnostics(location)
             detailsPanel.add(JSeparator())
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addReferences("后继", location.next)
@@ -178,7 +179,8 @@ internal class PipelineFlowPanel(
             }
             val states = buildList {
                 if (reference.isAmbiguousTarget) add("目标名称不唯一")
-                if (!reference.targetExists) add("项目中未定义")
+                if (!reference.targetExists && !reference.isAnchor) add("项目中未定义")
+                if (reference.isAnchorUnresolved) add("Anchor 未解析")
                 if (reference.isCrossFile) add("跨文件")
                 if (reference.isCycle) add("回边")
                 if (reference.isSharedTarget) add("共享节点")
@@ -227,6 +229,23 @@ internal class PipelineFlowPanel(
                 target.recognitionSummary?.let { add("识别：$it") }
                 target.actionSummary?.let { add("动作：$it") }
                 add("后继：${target.nextCount}")
+            }.joinToString("  ")
+            card.add(JBLabel(summary).apply {
+                foreground = UIUtil.getContextHelpForeground()
+                border = JBUI.Borders.emptyTop(2)
+            }, BorderLayout.SOUTH)
+        }
+        reference.anchorTarget?.let { anchor ->
+            val summary = buildList {
+                add("定义：${anchor.definingNodeName}")
+                if (anchor.isCleared) {
+                    add("目标：未设置")
+                } else if (anchor.targetNode != null) {
+                    add("目标：${anchor.targetNode.name}")
+                    if (anchor.targetNode.file != file) add("文件：${displayPath(anchor.targetNode.file)}")
+                } else {
+                    add("目标：节点未定义")
+                }
             }.joinToString("  ")
             card.add(JBLabel(summary).apply {
                 foreground = UIUtil.getContextHelpForeground()
@@ -291,6 +310,39 @@ internal class PipelineFlowPanel(
     private fun pipelinePath(file: com.intellij.openapi.vfs.VirtualFile): String {
         val normalizedPath = file.path.replace('\\', '/')
         return normalizedPath.substringAfter("/assets/resource/pipeline/", file.name)
+    }
+
+    private fun displayPath(file: com.intellij.openapi.vfs.VirtualFile): String {
+        val basePath = project.basePath?.replace('\\', '/')?.trimEnd('/')
+        val normalizedPath = file.path.replace('\\', '/')
+        return if (basePath != null && normalizedPath.startsWith("$basePath/")) {
+            normalizedPath.removePrefix("$basePath/")
+        } else {
+            normalizedPath
+        }
+    }
+
+    private fun addNodeDiagnostics(location: PipelineNodeLocation) {
+        val overrides = currentModel.pipelineOverrides.filter { it.targetName == location.name }
+        val unresolvedAnchors = (location.next + location.onError).filter { it.isAnchorUnresolved }
+        if (overrides.isEmpty() && unresolvedAnchors.isEmpty()) return
+        detailsPanel.add(createSectionLabel("项目诊断"))
+        overrides.forEach { override ->
+            val fields = override.fields.takeIf { it.isNotEmpty() }?.joinToString(", ").orEmpty()
+            val suffix = fields.takeIf { it.isNotEmpty() }?.let { "（字段：$it）" }.orEmpty()
+            detailsPanel.add(
+                createNavigationLabel(
+                    "pipeline_override：${displayPath(override.file)} → ${override.targetName}$suffix",
+                ) { navigateToFileRange(override.file, override.range) },
+            )
+        }
+        unresolvedAnchors.forEach { reference ->
+            detailsPanel.add(
+                createNavigationLabel("Anchor 未解析：${reference.displayName}") {
+                    navigateToRange(reference.range)
+                },
+            )
+        }
     }
 
     private fun ensureEditable(): Boolean {
@@ -494,12 +546,21 @@ internal class PipelineFlowPanel(
     }
 
     private fun navigateToReference(reference: PipelineReference) {
-        val target = reference.target
-        if (target != null && target.file != file) {
-            OpenFileDescriptor(project, target.file, target.nameRange.startOffset).navigate(true)
+        val anchorTarget = reference.anchorTarget
+        if (anchorTarget != null) {
+            navigateToFileRange(anchorTarget.file, anchorTarget.definitionRange)
             return
         }
-        navigateToRange(target?.nameRange ?: reference.range)
+        val target = reference.target
+        navigateToFileRange(target?.file ?: file, target?.nameRange ?: reference.range)
+    }
+
+    private fun navigateToFileRange(targetFile: com.intellij.openapi.vfs.VirtualFile, range: TextRange) {
+        if (targetFile == file) {
+            navigateToRange(range)
+        } else {
+            OpenFileDescriptor(project, targetFile, range.startOffset).navigate(true)
+        }
     }
 
     override fun dispose() {
