@@ -6,6 +6,7 @@ import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
@@ -151,21 +152,58 @@ internal class PipelineFlowPanel(
                 if (reference.isJumpBack) append("↩ ")
                 if (reference.isAnchor) append("⚓ ")
             }
-            val state = when {
-                !reference.targetExists -> "（当前文件未定义，可能跨文件）"
-                reference.isCycle -> "（回边）"
-                reference.isSharedTarget -> "（共享节点）"
-                else -> ""
+            val states = buildList {
+                if (reference.isAmbiguousTarget) add("目标名称不唯一")
+                if (!reference.targetExists) add("项目中未定义")
+                if (reference.isCrossFile) add("跨文件")
+                if (reference.isCycle) add("回边")
+                if (reference.isSharedTarget) add("共享节点")
             }
-            val target = currentModel.nodes.firstOrNull { it.name == reference.targetName }
-            val navigationRange = target?.nameRange ?: reference.range
-            detailsPanel.add(
-                createNavigationLabel(
-                    "${index + 1}. $marker${reference.displayName} $state",
-                    navigationRange,
-                ),
-            )
+            detailsPanel.add(createReferenceCard(index, marker, reference, states))
         }
+    }
+
+    private fun createReferenceCard(
+        index: Int,
+        marker: String,
+        reference: PipelineReference,
+        states: List<String>,
+    ): JComponent {
+        val card = JPanel(BorderLayout()).apply {
+            isOpaque = true
+            background = UIUtil.getPanelBackground()
+            border = JBUI.Borders.compound(
+                JBUI.Borders.customLine(JBColor.border()),
+                JBUI.Borders.empty(3, 6),
+            )
+            alignmentX = LEFT_ALIGNMENT
+        }
+        val state = states.takeIf { it.isNotEmpty() }?.joinToString("、")?.let { "（$it）" }.orEmpty()
+        card.add(
+            createNavigationLabel(
+                "${index + 1}. $marker${reference.displayName} $state",
+            ) { navigateToReference(reference) },
+            BorderLayout.CENTER,
+        )
+        reference.target?.let { target ->
+            val summary = buildList {
+                if (reference.isCrossFile) add("文件：${pipelinePath(target.file)}")
+                target.description?.let { add("说明：$it") }
+                target.recognitionSummary?.let { add("识别：$it") }
+                target.actionSummary?.let { add("动作：$it") }
+                add("后继：${target.nextCount}")
+            }.joinToString("  ")
+            card.add(JBLabel(summary).apply {
+                foreground = UIUtil.getContextHelpForeground()
+                border = JBUI.Borders.emptyTop(2)
+            }, BorderLayout.SOUTH)
+        }
+        return card
+    }
+
+    private fun pipelinePath(file: com.intellij.openapi.vfs.VirtualFile): String {
+        val normalizedPath = file.path.replace('\\', '/')
+        return normalizedPath.substringAfter("/assets/resource/pipeline/", file.name)
     }
 
     private fun createSectionLabel(title: String): JBLabel = JBLabel(title).apply {
@@ -174,7 +212,10 @@ internal class PipelineFlowPanel(
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
     }
 
-    private fun createNavigationLabel(text: String, range: TextRange): JComponent = JBLabel(text).apply {
+    private fun createNavigationLabel(text: String, range: TextRange): JComponent =
+        createNavigationLabel(text) { navigateToRange(range) }
+
+    private fun createNavigationLabel(text: String, onClick: () -> Unit): JComponent = JBLabel(text).apply {
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         foreground = JBColor.namedColor("Link.activeForeground", UIUtil.getLabelForeground())
         border = JBUI.Borders.empty(2, 4)
@@ -191,7 +232,7 @@ internal class PipelineFlowPanel(
             }
 
             override fun mouseClicked(event: MouseEvent) {
-                if (event.button == MouseEvent.BUTTON1) navigateToRange(range)
+                if (event.button == MouseEvent.BUTTON1) onClick()
             }
         })
     }
@@ -208,6 +249,15 @@ internal class PipelineFlowPanel(
         editor.caretModel.moveToOffset(range.startOffset)
         editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
         editor.contentComponent.requestFocusInWindow()
+    }
+
+    private fun navigateToReference(reference: PipelineReference) {
+        val target = reference.target
+        if (target != null && target.file != file) {
+            OpenFileDescriptor(project, target.file, target.nameRange.startOffset).navigate(true)
+            return
+        }
+        navigateToRange(target?.nameRange ?: reference.range)
     }
 
     override fun dispose() {

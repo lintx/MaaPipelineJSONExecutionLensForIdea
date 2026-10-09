@@ -39,6 +39,19 @@ data class PipelineReference(
     val targetExists: Boolean = false,
     val isCycle: Boolean = false,
     val isSharedTarget: Boolean = false,
+    val target: PipelineNodeTarget? = null,
+    val isAmbiguousTarget: Boolean = false,
+    val isCrossFile: Boolean = false,
+)
+
+data class PipelineNodeTarget(
+    val file: VirtualFile,
+    val name: String,
+    val nameRange: TextRange,
+    val description: String?,
+    val recognitionSummary: String?,
+    val actionSummary: String?,
+    val nextCount: Int,
 )
 
 data class PipelineDocumentModel(
@@ -50,36 +63,116 @@ data class PipelineDocumentModel(
 
 internal object PipelineDocumentIndexer {
     fun index(project: Project, file: VirtualFile): PipelineDocumentModel {
+        val parsedFile = parseFile(project, file)
+        val parsedFiles = findPipelineJsonFiles(file).map { parseFile(project, it) }
+        val entries = parsedFiles.flatMap { parsed ->
+            parsed.nodes.map { node -> PipelineNodeEntry(parsed.file, node) }
+        }
+        val candidatesByName = entries.groupBy { it.node.name }
+        val graph = entries.associate { entry ->
+            entry.key to allReferences(entry.node)
+                .mapNotNull { candidatesByName[it.targetName].orEmpty().singleOrNull()?.key }
+        }
+        val inboundCounts = graph.values
+            .flatten()
+            .groupingBy { it }
+            .eachCount()
+        val nodes = parsedFile.nodes.map { node ->
+            val entry = PipelineNodeEntry(file, node)
+            node.copy(
+                next = resolveReferences(entry, node.next, candidatesByName, graph, inboundCounts),
+                onError = resolveReferences(entry, node.onError, candidatesByName, graph, inboundCounts),
+            )
+        }
+        return PipelineDocumentModel(
+            file = file,
+            version = parsedFile.version,
+            nodes = nodes,
+            hasSyntaxErrors = parsedFile.hasSyntaxErrors,
+        )
+    }
+
+    private data class ParsedPipelineFile(
+        val file: VirtualFile,
+        val version: Long,
+        val nodes: List<PipelineNodeLocation>,
+        val hasSyntaxErrors: Boolean,
+    )
+
+    private data class PipelineNodeEntry(
+        val file: VirtualFile,
+        val node: PipelineNodeLocation,
+    ) {
+        val key: String get() = "${file.url}#${node.name}"
+
+        fun toTarget(): PipelineNodeTarget = PipelineNodeTarget(
+            file = file,
+            name = node.name,
+            nameRange = node.nameRange,
+            description = node.description,
+            recognitionSummary = node.recognition?.summary,
+            actionSummary = node.action?.summary,
+            nextCount = node.next.size,
+        )
+    }
+
+    private fun parseFile(project: Project, file: VirtualFile): ParsedPipelineFile {
         val document = FileDocumentManager.getInstance().getDocument(file)
-        val psiFile = PsiManager.getInstance(project).findFile(file)
-        val jsonFile = psiFile as? JsonFile
+        val jsonFile = PsiManager.getInstance(project).findFile(file) as? JsonFile
         val rootObject = jsonFile?.topLevelValue as? JsonObject
-        val parsedNodes = rootObject?.propertyList.orEmpty().mapNotNull { property ->
+        val nodes = rootObject?.propertyList.orEmpty().mapNotNull { property ->
             val nameRange = property.nameElement.textRange ?: return@mapNotNull null
             val propertyRange = property.textRange ?: nameRange
             val valueObject = property.value as? JsonObject
             PipelineNodeLocation(property.name, nameRange, propertyRange)
                 .withDetails(valueObject)
         }
-        val nodeNames = parsedNodes.mapTo(linkedSetOf()) { it.name }
-        val graph = parsedNodes.associate { node ->
-            node.name to (node.next + node.onError).map(PipelineReference::targetName)
-        }
-        val inboundCounts = (parsedNodes.flatMap { it.next + it.onError })
-            .filter { it.targetName in nodeNames }
-            .groupingBy(PipelineReference::targetName)
-            .eachCount()
-        val nodes = parsedNodes.map { node ->
-            node.copy(
-                next = node.next.map { it.withGraphState(node.name, nodeNames, graph, inboundCounts) },
-                onError = node.onError.map { it.withGraphState(node.name, nodeNames, graph, inboundCounts) },
-            )
-        }
-        return PipelineDocumentModel(
+        return ParsedPipelineFile(
             file = file,
             version = document?.modificationStamp ?: -1L,
             nodes = nodes,
             hasSyntaxErrors = jsonFile == null || rootObject == null,
+        )
+    }
+
+    private fun findPipelineJsonFiles(file: VirtualFile): List<VirtualFile> {
+        val pipelineRoot = generateSequence(file.parent) { it.parent }
+            .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
+            ?: return listOf(file)
+        val files = mutableListOf<VirtualFile>()
+
+        fun visit(current: VirtualFile) {
+            if (current.isDirectory) {
+                current.children.orEmpty().forEach(::visit)
+            } else if (current.extension.equals("json", ignoreCase = true)) {
+                files += current
+            }
+        }
+
+        visit(pipelineRoot)
+        return files.ifEmpty { listOf(file) }
+    }
+
+    private fun allReferences(node: PipelineNodeLocation): List<PipelineReference> =
+        node.next + node.onError
+
+    private fun resolveReferences(
+        source: PipelineNodeEntry,
+        references: List<PipelineReference>,
+        candidatesByName: Map<String, List<PipelineNodeEntry>>,
+        graph: Map<String, List<String>>,
+        inboundCounts: Map<String, Int>,
+    ): List<PipelineReference> = references.map { reference ->
+        val candidates = candidatesByName[reference.targetName].orEmpty()
+        val target = candidates.singleOrNull()
+        val targetKey = target?.key
+        reference.copy(
+            targetExists = candidates.isNotEmpty(),
+            isCycle = targetKey != null && canReach(graph, targetKey, source.key),
+            isSharedTarget = targetKey != null && (inboundCounts[targetKey] ?: 0) > 1,
+            target = target?.toTarget(),
+            isAmbiguousTarget = candidates.size > 1,
+            isCrossFile = target != null && target.file != source.file,
         )
     }
 
@@ -165,21 +258,6 @@ internal object PipelineDocumentIndexer {
             }
         }
         return ReferenceMarkers(targetName = target, isJumpBack = isJumpBack, isAnchor = isAnchor)
-    }
-
-    private fun PipelineReference.withGraphState(
-        sourceName: String,
-        nodeNames: Set<String>,
-        graph: Map<String, List<String>>,
-        inboundCounts: Map<String, Int>,
-    ): PipelineReference {
-        val targetExists = targetName in nodeNames
-        val isCycle = targetExists && canReach(graph, targetName, sourceName)
-        return copy(
-            targetExists = targetExists,
-            isCycle = isCycle,
-            isSharedTarget = targetExists && (inboundCounts[targetName] ?: 0) > 1,
-        )
     }
 
     private fun canReach(
