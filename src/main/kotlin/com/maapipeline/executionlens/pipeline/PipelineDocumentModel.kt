@@ -28,6 +28,8 @@ data class PipelineFieldLocation(
     val name: String,
     val summary: String,
     val range: TextRange,
+    val valueRange: TextRange = range,
+    val isString: Boolean = false,
 )
 
 data class PipelineReference(
@@ -191,7 +193,14 @@ internal object PipelineDocumentIndexer {
     private fun JsonProperty.toFieldLocation(): PipelineFieldLocation? {
         val value = value ?: return null
         val range = textRange ?: return null
-        return PipelineFieldLocation(name, summarizeValue(value), range)
+        val valueRange = value.textRange ?: range
+        return PipelineFieldLocation(
+            name = name,
+            summary = summarizeValue(value),
+            range = range,
+            valueRange = valueRange,
+            isString = value.text.trim().let { it.startsWith("\"") && it.endsWith("\"") },
+        )
     }
 
     private fun JsonProperty.toReferences(): List<PipelineReference> {

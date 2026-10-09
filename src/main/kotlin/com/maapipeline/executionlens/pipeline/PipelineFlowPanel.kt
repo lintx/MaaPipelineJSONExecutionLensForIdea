@@ -7,6 +7,8 @@ import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
@@ -21,10 +23,12 @@ import java.awt.BorderLayout
 import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Font
+import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.DefaultListModel
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -136,7 +140,20 @@ internal class PipelineFlowPanel(
     private fun addFieldSummary(title: String, field: PipelineFieldLocation?) {
         if (field == null) return
         detailsPanel.add(createSectionLabel(title))
-        detailsPanel.add(createNavigationLabel(field.summary, field.range))
+        val row = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
+        }
+        row.add(createNavigationLabel(field.summary, field.range), BorderLayout.CENTER)
+        if (field.isString) {
+            row.add(JButton("编辑").apply {
+                toolTipText = "只替换当前字符串值，保留 JSON 其它内容"
+                isFocusable = false
+                addActionListener { editStringField(field) }
+            }, BorderLayout.EAST)
+        }
+        detailsPanel.add(row)
     }
 
     private fun addReferences(title: String, references: List<PipelineReference>) {
@@ -159,7 +176,16 @@ internal class PipelineFlowPanel(
                 if (reference.isCycle) add("回边")
                 if (reference.isSharedTarget) add("共享节点")
             }
-            detailsPanel.add(createReferenceCard(index, marker, reference, states))
+            detailsPanel.add(
+                createReferenceCard(
+                    index = index,
+                    marker = marker,
+                    reference = reference,
+                    states = states,
+                    allowReorder = title == "后继",
+                    referenceCount = references.size,
+                ),
+            )
         }
     }
 
@@ -168,6 +194,8 @@ internal class PipelineFlowPanel(
         marker: String,
         reference: PipelineReference,
         states: List<String>,
+        allowReorder: Boolean,
+        referenceCount: Int,
     ): JComponent {
         val card = JPanel(BorderLayout()).apply {
             isOpaque = true
@@ -198,12 +226,116 @@ internal class PipelineFlowPanel(
                 border = JBUI.Borders.emptyTop(2)
             }, BorderLayout.SOUTH)
         }
+        if (allowReorder) {
+            val controls = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+                isOpaque = false
+            }
+            controls.add(createReorderButton("↑", "将此后继前移", index > 0) {
+                moveNextReference(index, -1)
+            })
+            controls.add(createReorderButton("↓", "将此后继后移", index < referenceCount - 1) {
+                moveNextReference(index, 1)
+            })
+            card.add(controls, BorderLayout.EAST)
+        }
         return card
+    }
+
+    private fun createReorderButton(
+        text: String,
+        tooltip: String,
+        enabled: Boolean,
+        action: () -> Unit,
+    ): JButton = JButton(text).apply {
+        toolTipText = tooltip
+        isEnabled = enabled
+        isFocusable = false
+        preferredSize = Dimension(JBUI.scale(24), JBUI.scale(24))
+        minimumSize = preferredSize
+        maximumSize = preferredSize
+        addActionListener { action() }
     }
 
     private fun pipelinePath(file: com.intellij.openapi.vfs.VirtualFile): String {
         val normalizedPath = file.path.replace('\\', '/')
         return normalizedPath.substringAfter("/assets/resource/pipeline/", file.name)
+    }
+
+    private fun editStringField(field: PipelineFieldLocation) {
+        if (currentModel.version != editor.document.modificationStamp) return
+        val newValue = Messages.showInputDialog(
+            project,
+            "修改 ${field.name} 的字符串值：",
+            "编辑 Pipeline 字段",
+            null,
+            field.summary,
+            null,
+        ) ?: return
+        val replacement = quoteJsonString(newValue)
+        val range = field.valueRange
+        if (range.startOffset < 0 || range.endOffset > editor.document.textLength) return
+        val oldValue = editor.document.getText(range)
+        if (oldValue == replacement) return
+        if (currentModel.version != editor.document.modificationStamp) return
+
+        // 只替换字符串值范围，避免重新格式化 JSON 或丢失 JSONC 注释。
+        WriteCommandAction.runWriteCommandAction(
+            project,
+            "编辑 Pipeline 字段",
+            "MaaPipeline JSON Execution Lens",
+            Runnable {
+            editor.document.replaceString(range.startOffset, range.endOffset, replacement)
+            },
+        )
+    }
+
+    private fun quoteJsonString(value: String): String = buildString {
+        append('"')
+        value.forEach { character ->
+            when (character) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                else -> append(character)
+            }
+        }
+        append('"')
+    }
+
+    private fun moveNextReference(index: Int, direction: Int) {
+        val node = currentModel.nodes.getOrNull(nodeList.selectedIndex) ?: return
+        val targetIndex = index + direction
+        if (targetIndex !in node.next.indices) return
+        if (currentModel.version != editor.document.modificationStamp) return
+
+        val currentRange = node.next[index].range
+        val targetRange = node.next[targetIndex].range
+        val lowerRange: TextRange
+        val higherRange: TextRange
+        if (currentRange.startOffset < targetRange.startOffset) {
+            lowerRange = currentRange
+            higherRange = targetRange
+        } else {
+            lowerRange = targetRange
+            higherRange = currentRange
+        }
+        val lowerText = editor.document.getText(lowerRange)
+        val higherText = editor.document.getText(higherRange)
+
+        // 两次替换按源码位置从后往前执行，防止前一个值长度变化使后一个范围失效。
+        WriteCommandAction.runWriteCommandAction(
+            project,
+            "调整 Pipeline next 顺序",
+            "MaaPipeline JSON Execution Lens",
+            Runnable {
+                editor.document.replaceString(higherRange.startOffset, higherRange.endOffset, lowerText)
+                editor.document.replaceString(lowerRange.startOffset, lowerRange.endOffset, higherText)
+            },
+        )
     }
 
     private fun createSectionLabel(title: String): JBLabel = JBLabel(title).apply {
