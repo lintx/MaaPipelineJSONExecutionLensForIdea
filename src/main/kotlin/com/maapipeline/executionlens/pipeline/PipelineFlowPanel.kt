@@ -8,6 +8,8 @@ import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.psi.PsiDocumentManager
@@ -32,10 +34,12 @@ import javax.swing.BoxLayout
 import javax.swing.JButton
 import javax.swing.JToggleButton
 import javax.swing.DefaultListModel
+import javax.swing.DefaultListCellRenderer
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
+import java.awt.Component
 import com.intellij.openapi.util.TextRange
 import com.intellij.ui.OnePixelSplitter
 
@@ -48,8 +52,10 @@ internal class PipelineFlowPanel(
     private val nodeListModel = DefaultListModel<String>()
     private val nodeList = JBList(nodeListModel)
     private val summaryLabel = JBLabel()
+    private val traceButton = JButton("加载运行日志")
     private val detailsPanel = JPanel()
     private var currentModel = PipelineDocumentModel(file, -1L, emptyList(), hasSyntaxErrors = true)
+    private var currentTrace: PipelineExecutionTrace? = null
     private var disposed = false
     private var refreshing = false
     private val documentListener = object : DocumentListener {
@@ -67,6 +73,26 @@ internal class PipelineFlowPanel(
                 if (!refreshing) navigateToSelectedNode()
             }
         }
+        nodeList.cellRenderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: javax.swing.JList<*>,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                val nodeName = value as? String
+                val state = nodeName?.let { currentTrace?.latestNodeStates?.get(it) }
+                text = when (state?.status) {
+                    PipelineTraceStatus.SUCCEEDED -> "✓ $nodeName"
+                    PipelineTraceStatus.FAILED -> "✗ $nodeName"
+                    PipelineTraceStatus.STARTING -> "… $nodeName"
+                    null -> nodeName
+                }
+                return this
+            }
+        }
         detailsPanel.layout = BoxLayout(detailsPanel, BoxLayout.Y_AXIS)
         detailsPanel.border = JBUI.Borders.empty(10, 12)
         summaryLabel.foreground = UIUtil.getContextHelpForeground()
@@ -82,12 +108,22 @@ internal class PipelineFlowPanel(
             border = JBUI.Borders.empty()
             viewportBorder = null
         }
+        traceButton.apply {
+            isFocusable = false
+            toolTipText = "选择 MaaFramework debug/maafw.log，只读显示实际执行轨迹"
+            addActionListener { loadTrace() }
+        }
+        val summaryBar = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(summaryLabel, BorderLayout.CENTER)
+            add(traceButton, BorderLayout.EAST)
+        }
         val splitPane = OnePixelSplitter(false, 0.28f).apply {
             firstComponent = navigator
             secondComponent = details
             border = JBUI.Borders.emptyTop(2)
         }
-        add(summaryLabel, BorderLayout.NORTH)
+        add(summaryBar, BorderLayout.NORTH)
         add(splitPane, BorderLayout.CENTER)
         editor.document.addDocumentListener(documentListener, this)
         refreshFromDocument(editor.document)
@@ -109,7 +145,13 @@ internal class PipelineFlowPanel(
             }
             val suffix = if (model.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
             val generatedSuffix = if (model.isGenerated) "（生成文件，编辑已禁用）" else ""
-            summaryLabel.text = "当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix"
+            summaryLabel.text = buildString {
+                append("当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix")
+                currentTrace?.let { trace ->
+                    append("　日志：${trace.events.size} 个事件，已执行 ${trace.executedNodeNames.size} 个节点")
+                }
+            }
+            nodeList.repaint()
             refreshing = false
             renderSelectedNode()
         }
@@ -132,6 +174,7 @@ internal class PipelineFlowPanel(
             addFieldSummary("动作", location.action)
             addFieldSummary("锚点", location.anchor)
             addNodeDiagnostics(location)
+            addTraceSummary(location)
             detailsPanel.add(JSeparator())
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addReferences("后继", location.next)
@@ -368,6 +411,62 @@ internal class PipelineFlowPanel(
                 },
             )
         }
+    }
+
+    private fun addTraceSummary(location: PipelineNodeLocation) {
+        val trace = currentTrace ?: return
+        val events = trace.eventsForNode(location.name)
+        if (events.isEmpty()) return
+        detailsPanel.add(createSectionLabel("运行轨迹"))
+        events.takeLast(8).forEach { event ->
+            val task = event.entryName?.let { "任务 $it" }.orEmpty()
+            val suffix = if (task.isEmpty()) "" else "，$task"
+            detailsPanel.add(
+                createNavigationLabel(
+                    "${event.kind.label}：${event.status.label}$suffix（日志第 ${event.lineNumber} 行）",
+                ) { openTraceFile(event.lineNumber) },
+            )
+            if (event.candidates.isNotEmpty()) {
+                val candidates = event.candidates.joinToString("、") { candidate ->
+                    buildString {
+                        if (candidate.isJumpBack) append("↩")
+                        if (candidate.isAnchor) append("⚓")
+                        append(candidate.name)
+                    }
+                }
+                detailsPanel.add(JBLabel("候选：$candidates").apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                    border = JBUI.Borders.emptyLeft(8)
+                })
+            }
+            event.anchorName?.let { anchor ->
+                detailsPanel.add(JBLabel("运行时 Anchor：$anchor").apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                    border = JBUI.Borders.emptyLeft(8)
+                })
+            }
+        }
+    }
+
+    private fun loadTrace() {
+        val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
+            .withTitle("选择 MaaFramework 运行日志")
+            .withDescription("选择 MaaEnd debug/maafw.log 或导出的同类日志文件")
+        val defaultFile = project.baseDir?.findFileByRelativePath("debug/maafw.log")
+        val selected = FileChooser.chooseFile(descriptor, project, defaultFile) ?: return
+        val trace = runCatching { PipelineTraceParser.parse(selected) }.getOrElse { error ->
+            Messages.showErrorDialog(project, "无法读取运行日志：${error.message}", "加载运行日志失败")
+            return
+        }
+        currentTrace = trace
+        summaryLabel.text = "当前文件：${currentModel.nodes.size} 个 Pipeline 节点　日志：${trace.events.size} 个事件，已执行 ${trace.executedNodeNames.size} 个节点"
+        nodeList.repaint()
+        renderSelectedNode()
+    }
+
+    private fun openTraceFile(lineNumber: Int) {
+        val trace = currentTrace ?: return
+        OpenFileDescriptor(project, trace.file, lineNumber.coerceAtLeast(1) - 1, 0).navigate(true)
     }
 
     private fun lineNumber(file: VirtualFile, range: TextRange): Int? {
