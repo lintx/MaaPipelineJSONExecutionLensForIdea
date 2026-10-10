@@ -36,6 +36,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.Box
 import javax.swing.BoxLayout
+import javax.swing.JComboBox
 import javax.swing.JButton
 import javax.swing.JToggleButton
 import javax.swing.DefaultListModel
@@ -59,6 +60,7 @@ internal class PipelineFlowPanel(
     private val nodeListModel = DefaultListModel<String>()
     private val nodeList = JBList(nodeListModel)
     private val summaryLabel = JBLabel()
+    private val entrySelector = JComboBox<PipelineEntryLocation>()
     private val traceButton = JButton("加载运行日志")
     private val detailsPanel = object : JPanel(), Scrollable {
         override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
@@ -77,6 +79,8 @@ internal class PipelineFlowPanel(
     private var currentTrace: PipelineExecutionTrace? = null
     private var disposed = false
     private var refreshing = false
+    private var syncingEntrySelector = false
+    private var selectedEntry: PipelineEntryLocation? = null
     private var refreshGeneration = 0L
     private val documentListener = object : DocumentListener {
         override fun documentChanged(event: DocumentEvent) {
@@ -91,6 +95,34 @@ internal class PipelineFlowPanel(
             if (!event.valueIsAdjusting) {
                 renderSelectedNode()
                 if (!refreshing) navigateToSelectedNode()
+            }
+        }
+        entrySelector.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: javax.swing.JList<*>,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                val entry = value as? PipelineEntryLocation
+                text = entry?.let { "${displayPath(it.file)} → ${it.entryName}" } ?: "（无任务入口）"
+                return this
+            }
+        }
+        entrySelector.toolTipText = "选择任务入口，并定位到对应 Pipeline 节点"
+        entrySelector.addActionListener {
+            if (syncingEntrySelector) return@addActionListener
+            val entry = entrySelector.selectedItem as? PipelineEntryLocation ?: return@addActionListener
+            selectedEntry = entry
+            val index = currentModel.nodes.indexOfFirst { it.name == entry.entryName }
+            if (index < 0) return@addActionListener
+            if (nodeList.selectedIndex == index) {
+                renderSelectedNode()
+                navigateToSelectedNode()
+            } else {
+                nodeList.selectedIndex = index
             }
         }
         nodeList.cellRenderer = object : DefaultListCellRenderer() {
@@ -136,6 +168,12 @@ internal class PipelineFlowPanel(
         }
         val summaryBar = JPanel(BorderLayout()).apply {
             isOpaque = false
+            val entryPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+                isOpaque = false
+                add(JBLabel("任务入口："))
+                add(entrySelector)
+            }
+            add(entryPanel, BorderLayout.WEST)
             add(summaryLabel, BorderLayout.CENTER)
             add(traceButton, BorderLayout.EAST)
         }
@@ -167,12 +205,41 @@ internal class PipelineFlowPanel(
                     return@finishOnUiThread
                 }
                 val selectedIndex = nodeList.selectedIndex
+                val previousNodeName = currentModel.nodes.getOrNull(selectedIndex)?.name
+                val previousEntry = selectedEntry ?: (entrySelector.selectedItem as? PipelineEntryLocation)
                 refreshing = true
                 currentModel = model
                 nodeListModel.removeAllElements()
                 model.nodes.forEach { nodeListModel.addElement(it.name) }
+                val restoredEntry = previousEntry?.let { previous ->
+                    model.pipelineEntries.firstOrNull { entry ->
+                        entry.file == previous.file &&
+                            entry.entryName == previous.entryName &&
+                            entry.range == previous.range
+                    }
+                } ?: model.pipelineEntries.firstOrNull { it.entryName == previousNodeName }
+                    ?: model.pipelineEntries.firstOrNull()
+                syncingEntrySelector = true
+                try {
+                    entrySelector.removeAllItems()
+                    model.pipelineEntries.forEach(entrySelector::addItem)
+                    entrySelector.isEnabled = model.pipelineEntries.isNotEmpty()
+                    selectedEntry = restoredEntry
+                    if (restoredEntry != null) {
+                        entrySelector.selectedItem = restoredEntry
+                    }
+                } finally {
+                    syncingEntrySelector = false
+                }
+                val preferredNodeName = restoredEntry?.entryName ?: previousNodeName
+                val preferredIndex = preferredNodeName?.let { name ->
+                    model.nodes.indexOfFirst { it.name == name }
+                } ?: -1
                 if (model.nodes.isNotEmpty()) {
-                    nodeList.selectedIndex = selectedIndex.coerceIn(0, model.nodes.lastIndex)
+                    nodeList.selectedIndex = when {
+                        preferredIndex >= 0 -> preferredIndex
+                        else -> selectedIndex.coerceIn(0, model.nodes.lastIndex)
+                    }
                 }
                 val suffix = if (model.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
                 val generatedSuffix = if (model.isGenerated) "（生成文件，编辑已禁用）" else ""
@@ -207,6 +274,7 @@ internal class PipelineFlowPanel(
             addFieldSummary("动作", location.action)
             addFieldSummary("锚点", location.anchor)
             addNodeDiagnostics(location)
+            addTaskOverrideSummary(location)
             addTraceSummary(location)
             detailsPanel.add(JSeparator())
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
@@ -450,7 +518,7 @@ internal class PipelineFlowPanel(
             )
         }
         overrides.forEach { override ->
-            val fields = override.fields.takeIf { it.isNotEmpty() }?.joinToString(", ").orEmpty()
+            val fields = override.fields.takeIf { it.isNotEmpty() }?.joinToString(", ") { it.name }.orEmpty()
             val suffix = fields.takeIf { it.isNotEmpty() }?.let { "（字段：$it）" }.orEmpty()
             detailsPanel.add(
                 createNavigationLabel(
@@ -470,6 +538,66 @@ internal class PipelineFlowPanel(
             )
         }
     }
+
+    private fun addTaskOverrideSummary(location: PipelineNodeLocation) {
+        val entry = selectedEntry ?: return
+        detailsPanel.add(createSectionLabel("任务有效值"))
+        detailsPanel.add(
+            createNavigationLabel("任务：${displayPath(entry.file)} → ${entry.entryName}") {
+                navigateToFileRange(entry.file, entry.range)
+            },
+        )
+        val override = currentModel.pipelineOverrides.firstOrNull {
+            it.file == entry.file && it.targetName == location.name
+        }
+        if (override == null) {
+            detailsPanel.add(JBLabel("当前任务未覆盖此节点，所有字段使用默认值").apply {
+                foreground = UIUtil.getContextHelpForeground()
+            })
+            return
+        }
+        if (override.fields.isEmpty()) {
+            detailsPanel.add(JBLabel("当前任务存在覆盖对象，但没有可展示的字段").apply {
+                foreground = UIUtil.getContextHelpForeground()
+            })
+            return
+        }
+        override.fields.forEach { field ->
+            val defaultSummary = defaultFieldSummary(location, field.name)
+            detailsPanel.add(JBLabel("字段：${field.name}").apply {
+                font = font.deriveFont(Font.BOLD)
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            })
+            detailsPanel.add(JBLabel("默认值：$defaultSummary").apply {
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            })
+            detailsPanel.add(
+                createNavigationLabel("覆盖值：${field.summary}（点击定位）") {
+                    navigateToFileRange(override.file, field.range)
+                },
+            )
+            detailsPanel.add(JBLabel("有效值：${field.summary}").apply {
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            })
+        }
+    }
+
+    private fun defaultFieldSummary(location: PipelineNodeLocation, fieldName: String): String = when (fieldName) {
+        "desc" -> location.description ?: "（未设置）"
+        "recognition" -> location.recognition?.summary ?: "（未设置）"
+        "action" -> location.action?.summary ?: "（未设置）"
+        "anchor" -> location.anchor?.summary ?: "（未设置）"
+        "next" -> referenceSummary(location.next)
+        "on_error" -> referenceSummary(location.onError)
+        "timeout" -> location.executionPolicy.timeout?.summary ?: "（未设置）"
+        "rate_limit" -> location.executionPolicy.rateLimit?.summary ?: "（未设置）"
+        "max_hit" -> location.executionPolicy.maxHit?.summary ?: "（未设置）"
+        else -> "（当前视图未索引）"
+    }
+
+    private fun referenceSummary(references: List<PipelineReference>): String = references
+        .joinToString("、") { it.displayName }
+        .ifEmpty { "（未设置）" }
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
         val trace = currentTrace ?: return

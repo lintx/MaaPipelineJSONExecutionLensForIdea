@@ -108,7 +108,7 @@ data class PipelineOverrideLocation(
     val file: VirtualFile,
     val targetName: String,
     val range: TextRange,
-    val fields: List<String>,
+    val fields: List<PipelineFieldLocation>,
 )
 
 data class PipelineEntryLocation(
@@ -449,7 +449,7 @@ internal object PipelineDocumentIndexer {
                         val range = targetProperty.nameElement.textRange ?: targetProperty.textRange ?: return@forEach
                         val fields = (targetProperty.value as? JsonObject)
                             ?.propertyList
-                            ?.map { property -> property.name }
+                            ?.mapNotNull { property -> property.toFieldLocation() }
                             .orEmpty()
                         overrides += PipelineOverrideLocation(taskFile, targetProperty.name, range, fields)
                     }
