@@ -8,6 +8,7 @@ import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptor
 import com.intellij.openapi.ui.Messages
@@ -16,6 +17,9 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.ModalityState
+import com.intellij.util.concurrency.AppExecutorUtil
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
@@ -27,6 +31,7 @@ import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Font
 import java.awt.FlowLayout
+import java.awt.Rectangle
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.Box
@@ -39,6 +44,8 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
+import javax.swing.ScrollPaneConstants
+import javax.swing.Scrollable
 import java.awt.Component
 import com.intellij.openapi.util.TextRange
 import com.intellij.ui.OnePixelSplitter
@@ -53,11 +60,24 @@ internal class PipelineFlowPanel(
     private val nodeList = JBList(nodeListModel)
     private val summaryLabel = JBLabel()
     private val traceButton = JButton("加载运行日志")
-    private val detailsPanel = JPanel()
+    private val detailsPanel = object : JPanel(), Scrollable {
+        override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
+
+        override fun getScrollableUnitIncrement(visibleRect: Rectangle, orientation: Int, direction: Int): Int =
+            JBUI.scale(16)
+
+        override fun getScrollableBlockIncrement(visibleRect: Rectangle, orientation: Int, direction: Int): Int =
+            (visibleRect.height - JBUI.scale(16)).coerceAtLeast(JBUI.scale(16))
+
+        override fun getScrollableTracksViewportWidth(): Boolean = true
+
+        override fun getScrollableTracksViewportHeight(): Boolean = false
+    }
     private var currentModel = PipelineDocumentModel(file, -1L, emptyList(), hasSyntaxErrors = true)
     private var currentTrace: PipelineExecutionTrace? = null
     private var disposed = false
     private var refreshing = false
+    private var refreshGeneration = 0L
     private val documentListener = object : DocumentListener {
         override fun documentChanged(event: DocumentEvent) {
             refreshFromDocument(event.document)
@@ -107,6 +127,7 @@ internal class PipelineFlowPanel(
         val details = JBScrollPane(detailsPanel).apply {
             border = JBUI.Borders.empty()
             viewportBorder = null
+            horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
         }
         traceButton.apply {
             isFocusable = false
@@ -130,30 +151,42 @@ internal class PipelineFlowPanel(
     }
 
     private fun refreshFromDocument(document: Document) {
+        val generation = ++refreshGeneration
         PsiDocumentManager.getInstance(project).performWhenAllCommitted {
-            if (disposed) return@performWhenAllCommitted
-            val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> {
+            if (disposed || generation != refreshGeneration) return@performWhenAllCommitted
+            val requestedStamp = document.modificationStamp
+            ReadAction.nonBlocking<PipelineDocumentModel> {
                 PipelineDocumentIndexer.index(project, file)
-            }
-            val selectedIndex = nodeList.selectedIndex
-            refreshing = true
-            currentModel = model
-            nodeListModel.removeAllElements()
-            model.nodes.forEach { nodeListModel.addElement(it.name) }
-            if (model.nodes.isNotEmpty()) {
-                nodeList.selectedIndex = selectedIndex.coerceIn(0, model.nodes.lastIndex)
-            }
-            val suffix = if (model.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
-            val generatedSuffix = if (model.isGenerated) "（生成文件，编辑已禁用）" else ""
-            summaryLabel.text = buildString {
-                append("当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix")
-                currentTrace?.let { trace ->
-                    append("　日志：${trace.events.size} 个事件，已执行 ${trace.executedNodeNames.size} 个节点")
+            }.expireWith(this).finishOnUiThread(ModalityState.any()) { model ->
+                if (
+                    disposed ||
+                    generation != refreshGeneration ||
+                    document.modificationStamp != requestedStamp ||
+                    model.version != document.modificationStamp
+                ) {
+                    return@finishOnUiThread
                 }
+                val selectedIndex = nodeList.selectedIndex
+                refreshing = true
+                currentModel = model
+                nodeListModel.removeAllElements()
+                model.nodes.forEach { nodeListModel.addElement(it.name) }
+                if (model.nodes.isNotEmpty()) {
+                    nodeList.selectedIndex = selectedIndex.coerceIn(0, model.nodes.lastIndex)
+                }
+                val suffix = if (model.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
+                val generatedSuffix = if (model.isGenerated) "（生成文件，编辑已禁用）" else ""
+                summaryLabel.text = buildString {
+                    append("当前文件：${model.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix")
+                    currentTrace?.let { trace ->
+                        append("　日志：${trace.events.size} 个事件，已执行 ${trace.executedNodeNames.size} 个节点")
+                    }
+                }
+                nodeList.repaint()
+                refreshing = false
+                renderSelectedNode()
             }
-            nodeList.repaint()
-            refreshing = false
-            renderSelectedNode()
+                .submit(AppExecutorUtil.getAppExecutorService())
         }
     }
 
@@ -177,12 +210,36 @@ internal class PipelineFlowPanel(
             addTraceSummary(location)
             detailsPanel.add(JSeparator())
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
+            addControlFlowExplanation(location)
+            detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addReferences("后继", location.next)
             addReferences("错误后继", location.onError)
             addReferences("嵌套节点引用", location.embeddedReferences)
         }
         detailsPanel.revalidate()
         detailsPanel.repaint()
+    }
+
+    private fun addControlFlowExplanation(location: PipelineNodeLocation) {
+        detailsPanel.add(createSectionLabel("逻辑控制流"))
+        PipelineControlFlowExplanation.explain(location).forEach { line ->
+            val component = if (line.reference == null) {
+                JBLabel(line.text).apply {
+                    foreground = when (line.kind) {
+                        PipelineControlFlowLineKind.DESCRIPTION -> UIUtil.getContextHelpForeground()
+                        PipelineControlFlowLineKind.RETRY_POLICY -> UIUtil.getLabelForeground()
+                        PipelineControlFlowLineKind.TERMINAL -> UIUtil.getContextHelpForeground()
+                        else -> UIUtil.getLabelForeground()
+                    }
+                }
+            } else {
+                // 候选行沿用详情页已有的导航组件，点击后仍定位到目标节点或原始引用。
+                createNavigationLabel(line.text) { navigateToReference(line.reference) }
+            }
+            component.alignmentX = LEFT_ALIGNMENT
+            component.maximumSize = Dimension(Int.MAX_VALUE, component.preferredSize.height)
+            detailsPanel.add(component)
+        }
     }
 
     private fun addFieldSummary(title: String, field: PipelineFieldLocation?) {
@@ -324,6 +381,8 @@ internal class PipelineFlowPanel(
             })
             card.add(controls, BorderLayout.EAST)
         }
+        // BoxLayout 的纵向布局会按最大高度拉伸组件；卡片高度必须锁定为自身内容高度。
+        card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         return card
     }
 
@@ -400,8 +459,7 @@ internal class PipelineFlowPanel(
             )
         }
         diagnostics.forEach { diagnostic ->
-            val line = lineNumber(diagnostic.file, diagnostic.range)
-            val locationText = "${displayPath(diagnostic.file)}:${line ?: "?"}"
+            val locationText = "${displayPath(diagnostic.file)}:${diagnostic.lineNumber ?: "?"}"
             val severity = if (diagnostic.severity == PipelineDiagnosticSeverity.ERROR) "错误" else "警告"
             detailsPanel.add(
                 createNavigationLabel(
@@ -467,12 +525,6 @@ internal class PipelineFlowPanel(
     private fun openTraceFile(lineNumber: Int) {
         val trace = currentTrace ?: return
         OpenFileDescriptor(project, trace.file, lineNumber.coerceAtLeast(1) - 1, 0).navigate(true)
-    }
-
-    private fun lineNumber(file: VirtualFile, range: TextRange): Int? {
-        val document = FileDocumentManager.getInstance().getDocument(file) ?: return null
-        if (range.startOffset !in 0..document.textLength) return null
-        return document.getLineNumber(range.startOffset) + 1
     }
 
     private fun ensureEditable(): Boolean {
@@ -668,11 +720,16 @@ internal class PipelineFlowPanel(
     }
 
     private fun navigateToRange(range: TextRange) {
-        if (currentModel.version != editor.document.modificationStamp) return
+        if (editor.document.textLength == 0) return
         showSourceForNavigation()
-        editor.caretModel.moveToOffset(range.startOffset)
-        editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
-        editor.contentComponent.requestFocusInWindow()
+        val offset = range.startOffset.coerceIn(0, editor.document.textLength)
+        // 切换标签页后再定位，避免源码组件尚未挂载时光标移动被流程页覆盖。
+        ApplicationManager.getApplication().invokeLater({
+            if (disposed || editor.isDisposed) return@invokeLater
+            editor.caretModel.moveToOffset(offset)
+            editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
+            editor.contentComponent.requestFocusInWindow()
+        }, ModalityState.any())
     }
 
     private fun navigateToReference(reference: PipelineReference) {
@@ -688,10 +745,44 @@ internal class PipelineFlowPanel(
     private fun navigateToFileRange(targetFile: com.intellij.openapi.vfs.VirtualFile, range: TextRange) {
         if (targetFile == file) {
             navigateToRange(range)
-        } else {
-            OpenFileDescriptor(project, targetFile, range.startOffset).navigate(true)
+            return
         }
+
+        val requestedOffset = range.startOffset.coerceAtLeast(0)
+        ReadAction.nonBlocking<NavigationPosition?> {
+            val targetDocument = FileDocumentManager.getInstance().getDocument(targetFile)
+            if (targetDocument == null) {
+                null
+            } else {
+                val offset = requestedOffset.coerceIn(0, targetDocument.textLength)
+                val line = targetDocument.getLineNumber(offset)
+                NavigationPosition(offset, line, offset - targetDocument.getLineStartOffset(line))
+            }
+        }.expireWith(this).finishOnUiThread(ModalityState.any()) { position ->
+            if (disposed || !targetFile.isValid) return@finishOnUiThread
+            val descriptor = if (position == null) {
+                OpenFileDescriptor(project, targetFile, requestedOffset)
+            } else {
+                OpenFileDescriptor(project, targetFile, position.line, position.column)
+            }
+            val targetEditors = FileEditorManager.getInstance(project).openFile(targetFile, true)
+            val pipelineEditor = targetEditors
+                .filterIsInstance<PipelineFileEditor>()
+                .firstOrNull()
+            if (pipelineEditor != null && position != null) {
+                // 自定义文件编辑器隐藏了 IDEA 默认文本编辑器，必须把偏移继续传入其内部源码编辑器。
+                pipelineEditor.navigateToOffset(position.offset)
+            } else {
+                descriptor.navigate(true)
+            }
+        }.submit(AppExecutorUtil.getAppExecutorService())
     }
+
+    private data class NavigationPosition(
+        val offset: Int,
+        val line: Int,
+        val column: Int,
+    )
 
     override fun dispose() {
         disposed = true

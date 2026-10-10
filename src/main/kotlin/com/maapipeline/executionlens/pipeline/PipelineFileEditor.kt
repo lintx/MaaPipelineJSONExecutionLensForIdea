@@ -11,6 +11,8 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.ModalityState
 import java.awt.BorderLayout
 import java.beans.PropertyChangeListener
 import javax.swing.JComponent
@@ -37,6 +39,17 @@ internal class PipelineFileEditor(
 
     private fun showSourceForNavigation() {
         views.showSourceForNavigation()
+    }
+
+    internal fun navigateToOffset(offset: Int) {
+        views.showSourceForNavigation()
+        val safeOffset = offset.coerceIn(0, sourceEditor.editor.document.textLength)
+        ApplicationManager.getApplication().invokeLater({
+            if (sourceEditor.editor.isDisposed) return@invokeLater
+            sourceEditor.editor.caretModel.moveToOffset(safeOffset)
+            sourceEditor.editor.scrollingModel.scrollToCaret(com.intellij.openapi.editor.ScrollType.CENTER)
+            sourceEditor.editor.contentComponent.requestFocusInWindow()
+        }, ModalityState.any())
     }
 
     override fun getComponent(): JComponent = views
