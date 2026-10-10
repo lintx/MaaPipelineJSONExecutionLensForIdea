@@ -519,7 +519,13 @@ internal object PipelineDocumentIndexer {
         val pipelineRoot = generateSequence(file.parent) { it.parent }
             .firstOrNull { it.name.equals("pipeline", ignoreCase = true) }
             ?: return null
-        return pipelineRoot.parent?.parent?.findChild("tasks")
+        // MaaEnd 项目中任务目录可能位于 resource/tasks、resource/task 或更高一级目录；
+        // 沿 pipeline 的祖先逐级查找，避免把某一种本机目录布局写死。
+        return generateSequence(pipelineRoot.parent) { it.parent }
+            .flatMap { ancestor ->
+                sequenceOf("tasks", "task").mapNotNull { name -> ancestor.findChild(name) }
+            }
+            .firstOrNull { it.isDirectory }
     }
 
     private fun PipelineNodeLocation.withDetails(valueObject: JsonObject?): PipelineNodeLocation {

@@ -61,6 +61,7 @@ internal class PipelineFlowPanel(
     private val nodeList = JBList(nodeListModel)
     private val summaryLabel = JBLabel()
     private val entrySelector = JComboBox<PipelineEntryLocation>()
+    private val entryStatusLabel = JBLabel("未检测到任务入口")
     private val traceButton = JButton("加载运行日志")
     private val detailsPanel = object : JPanel(), Scrollable {
         override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
@@ -112,6 +113,8 @@ internal class PipelineFlowPanel(
             }
         }
         entrySelector.toolTipText = "选择任务入口，并定位到对应 Pipeline 节点"
+        entrySelector.isVisible = false
+        entryStatusLabel.foreground = UIUtil.getContextHelpForeground()
         entrySelector.addActionListener {
             if (syncingEntrySelector) return@addActionListener
             val entry = entrySelector.selectedItem as? PipelineEntryLocation ?: return@addActionListener
@@ -174,6 +177,7 @@ internal class PipelineFlowPanel(
                 isOpaque = false
                 add(JBLabel("任务入口："))
                 add(entrySelector)
+                add(entryStatusLabel)
             }
             add(entryPanel, BorderLayout.WEST)
             add(summaryLabel, BorderLayout.CENTER)
@@ -225,7 +229,10 @@ internal class PipelineFlowPanel(
                 try {
                     entrySelector.removeAllItems()
                     model.pipelineEntries.forEach(entrySelector::addItem)
-                    entrySelector.isEnabled = model.pipelineEntries.isNotEmpty()
+                    val hasEntries = model.pipelineEntries.isNotEmpty()
+                    entrySelector.isEnabled = hasEntries
+                    entrySelector.isVisible = hasEntries
+                    entryStatusLabel.isVisible = !hasEntries
                     selectedEntry = restoredEntry
                     if (restoredEntry != null) {
                         entrySelector.selectedItem = restoredEntry
