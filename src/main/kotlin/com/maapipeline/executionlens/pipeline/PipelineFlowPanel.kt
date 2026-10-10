@@ -145,7 +145,7 @@ internal class PipelineFlowPanel(
                 val reachability = if (nodeName != null && nodeName !in reachableNodeNames().orEmpty()) "○ " else ""
                 val relationMarkers = buildString {
                     if (references.any { it.isCycle }) append("↺ ")
-                    if (references.any { it.isSharedTarget }) append("⇄ ")
+                    if (references.any { it.isSharedTarget }) append("⇉ ")
                     if (references.any { it.isAnchor }) append("⚓ ")
                 }
                 text = reachability + relationMarkers + when (state?.status) {
@@ -163,10 +163,20 @@ internal class PipelineFlowPanel(
         summaryLabel.border = JBUI.Borders.empty(0, 8, 5, 8)
         nodeList.fixedCellHeight = JBUI.scale(26)
         nodeList.border = JBUI.Borders.empty(3, 0)
-        val navigator = JBScrollPane(nodeList).apply {
+        nodeList.toolTipText = "标记说明：○ 未从入口到达　↺ 循环边　⇉ 共享目标　⚓ 动态 Anchor"
+        val navigatorScroll = JBScrollPane(nodeList).apply {
             minimumSize = Dimension(180, 0)
             border = JBUI.Borders.empty()
             viewportBorder = null
+        }
+        val navigator = JPanel(BorderLayout()).apply {
+            minimumSize = Dimension(180, 0)
+            isOpaque = false
+            add(JBLabel("○ 未到达　↺ 循环　⇉ 共享　⚓ Anchor").apply {
+                foreground = UIUtil.getContextHelpForeground()
+                border = JBUI.Borders.empty(0, 4, 4, 4)
+            }, BorderLayout.NORTH)
+            add(navigatorScroll, BorderLayout.CENTER)
         }
         val details = JBScrollPane(detailsPanel).apply {
             border = JBUI.Borders.empty()
@@ -316,7 +326,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun addControlFlowExplanation(location: PipelineNodeLocation) {
-        detailsPanel.add(createSectionLabel("逻辑控制流"))
+        detailsPanel.add(createSectionLabel("逻辑控制流 · 静态推导"))
         PipelineControlFlowExplanation.explain(location).forEach { line ->
             val component = if (line.reference == null) {
                 JBLabel(line.text).apply {
@@ -758,7 +768,7 @@ internal class PipelineFlowPanel(
         val trace = currentTrace ?: return
         val events = trace.eventsForNode(location.name)
         if (events.isEmpty()) return
-        detailsPanel.add(createSectionLabel("运行轨迹"))
+        detailsPanel.add(createSectionLabel("运行轨迹 · 本次运行"))
         events.takeLast(8).forEach { event ->
             val task = event.entryName?.let { "任务 $it" }.orEmpty()
             val suffix = if (task.isEmpty()) "" else "，$task"
