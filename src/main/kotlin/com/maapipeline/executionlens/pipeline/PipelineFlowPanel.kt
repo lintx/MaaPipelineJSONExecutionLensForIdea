@@ -116,6 +116,7 @@ internal class PipelineFlowPanel(
             if (syncingEntrySelector) return@addActionListener
             val entry = entrySelector.selectedItem as? PipelineEntryLocation ?: return@addActionListener
             selectedEntry = entry
+            nodeList.repaint()
             val index = currentModel.nodes.indexOfFirst { it.name == entry.entryName }
             if (index < 0) return@addActionListener
             if (nodeList.selectedIndex == index) {
@@ -136,7 +137,8 @@ internal class PipelineFlowPanel(
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
                 val nodeName = value as? String
                 val state = nodeName?.let { currentTrace?.latestNodeStates?.get(it) }
-                text = when (state?.status) {
+                val reachability = if (nodeName != null && nodeName !in reachableNodeNames().orEmpty()) "○ " else ""
+                text = reachability + when (state?.status) {
                     PipelineTraceStatus.SUCCEEDED -> "✓ $nodeName"
                     PipelineTraceStatus.FAILED -> "✗ $nodeName"
                     PipelineTraceStatus.STARTING -> "… $nodeName"
@@ -269,6 +271,12 @@ internal class PipelineFlowPanel(
                 maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
             })
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
+            val reachable = reachableNodeNames()
+            if (reachable != null && location.name !in reachable) {
+                detailsPanel.add(JBLabel("路径分析：从当前任务入口未解析到此节点（仅计算当前文件内的静态路径）").apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                })
+            }
             location.description?.let { detailsPanel.add(JBLabel("说明：$it")) }
             addFieldSummary("识别", location.recognition)
             addFieldSummary("动作", location.action)
@@ -623,6 +631,26 @@ internal class PipelineFlowPanel(
                 else -> effective
             }
         }
+    }
+
+    private fun reachableNodeNames(): Set<String>? {
+        val entry = selectedEntry ?: return null
+        val nodesByName = currentModel.nodes.associateBy { it.name }
+        val root = nodesByName[entry.entryName] ?: return emptySet()
+        val reachable = linkedSetOf<String>()
+        fun visit(node: PipelineNodeLocation) {
+            if (!reachable.add(node.name)) return
+            effectiveNode(node).next
+                .plus(effectiveNode(node).onError)
+                .mapNotNull { reference ->
+                    reference.target
+                        ?.takeIf { target -> target.file == file }
+                        ?.let { target -> nodesByName[target.name] }
+                }
+                .forEach(::visit)
+        }
+        visit(root)
+        return reachable
     }
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
