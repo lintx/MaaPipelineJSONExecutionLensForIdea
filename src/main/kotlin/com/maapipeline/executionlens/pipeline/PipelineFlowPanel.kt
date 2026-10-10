@@ -354,37 +354,66 @@ internal class PipelineFlowPanel(
     }
 
     private fun addReferences(title: String, references: List<PipelineReference>) {
-        detailsPanel.add(createSectionLabel(title))
+        val body = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
         if (references.isEmpty()) {
-            detailsPanel.add(JBLabel("（无）").apply {
+            body.add(JBLabel("（无）").apply {
                 foreground = UIUtil.getContextHelpForeground()
             })
-            return
-        }
-        references.forEachIndexed { index, reference ->
-            val marker = buildString {
-                if (reference.isJumpBack) append("↩ ")
-                if (reference.isAnchor) append("⚓ ")
+        } else {
+            references.forEachIndexed { index, reference ->
+                val marker = buildString {
+                    if (reference.isJumpBack) append("↩ ")
+                    if (reference.isAnchor) append("⚓ ")
+                }
+                val states = buildList {
+                    if (reference.isAmbiguousTarget) add("目标名称不唯一")
+                    if (!reference.targetExists && !reference.isAnchor) add("项目中未定义")
+                    if (reference.isAnchorUnresolved) add("Anchor 未解析")
+                    if (reference.isCrossFile) add("跨文件")
+                    if (reference.isCycle) add("回边")
+                    if (reference.isSharedTarget) add("共享节点")
+                }
+                body.add(
+                    createReferenceCard(
+                        index = index,
+                        marker = marker,
+                        reference = reference,
+                        states = states,
+                        allowReorder = title == "后继",
+                        referenceCount = references.size,
+                    ),
+                )
             }
-            val states = buildList {
-                if (reference.isAmbiguousTarget) add("目标名称不唯一")
-                if (!reference.targetExists && !reference.isAnchor) add("项目中未定义")
-                if (reference.isAnchorUnresolved) add("Anchor 未解析")
-                if (reference.isCrossFile) add("跨文件")
-                if (reference.isCycle) add("回边")
-                if (reference.isSharedTarget) add("共享节点")
-            }
-            detailsPanel.add(
-                createReferenceCard(
-                    index = index,
-                    marker = marker,
-                    reference = reference,
-                    states = states,
-                    allowReorder = title == "后继",
-                    referenceCount = references.size,
-                ),
-            )
         }
+        val section = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
+        val toggleButton = JButton("收起").apply {
+            isFocusable = false
+            toolTipText = "收起或展开 $title"
+        }
+        val header = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(createSectionLabel(title), BorderLayout.CENTER)
+            add(toggleButton, BorderLayout.EAST)
+        }
+        section.add(header, BorderLayout.NORTH)
+        section.add(body, BorderLayout.CENTER)
+        // 嵌套在 BoxLayout 中时锁定自身高度，折叠后才能即时收缩而不留下空白。
+        section.maximumSize = Dimension(Int.MAX_VALUE, section.preferredSize.height)
+        toggleButton.addActionListener {
+            body.isVisible = !body.isVisible
+            toggleButton.text = if (body.isVisible) "收起" else "展开"
+            section.maximumSize = Dimension(Int.MAX_VALUE, section.preferredSize.height)
+            detailsPanel.revalidate()
+            detailsPanel.repaint()
+        }
+        detailsPanel.add(section)
     }
 
     private fun createReferenceCard(
