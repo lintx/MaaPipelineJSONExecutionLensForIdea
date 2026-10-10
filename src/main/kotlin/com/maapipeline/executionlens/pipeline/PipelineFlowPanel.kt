@@ -140,8 +140,15 @@ internal class PipelineFlowPanel(
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
                 val nodeName = value as? String
                 val state = nodeName?.let { currentTrace?.latestNodeStates?.get(it) }
+                val node = nodeName?.let { name -> currentModel.nodes.firstOrNull { it.name == name } }
+                val references = node?.let { it.next + it.onError + it.embeddedReferences }.orEmpty()
                 val reachability = if (nodeName != null && nodeName !in reachableNodeNames().orEmpty()) "○ " else ""
-                text = reachability + when (state?.status) {
+                val relationMarkers = buildString {
+                    if (references.any { it.isCycle }) append("↺ ")
+                    if (references.any { it.isSharedTarget }) append("⇄ ")
+                    if (references.any { it.isAnchor }) append("⚓ ")
+                }
+                text = reachability + relationMarkers + when (state?.status) {
                     PipelineTraceStatus.SUCCEEDED -> "✓ $nodeName"
                     PipelineTraceStatus.FAILED -> "✗ $nodeName"
                     PipelineTraceStatus.STARTING -> "… $nodeName"
@@ -288,6 +295,7 @@ internal class PipelineFlowPanel(
                     foreground = UIUtil.getContextHelpForeground()
                 })
             }
+            addRelationshipOverview(location)
             location.description?.let { detailsPanel.add(JBLabel("说明：$it")) }
             addFieldSummary("识别", location.recognition)
             addFieldSummary("动作", location.action)
@@ -718,6 +726,32 @@ internal class PipelineFlowPanel(
                 }
         }
         return null
+    }
+
+    private fun addRelationshipOverview(location: PipelineNodeLocation) {
+        val references = location.next + location.onError + location.embeddedReferences
+        val cycleReferences = references.filter { it.isCycle }
+        val sharedReferences = references.filter { it.isSharedTarget }
+        val anchorReferences = references.filter { it.isAnchor }
+        val crossFileReferences = references.filter { it.isCrossFile }
+        if (cycleReferences.isEmpty() && sharedReferences.isEmpty() && anchorReferences.isEmpty() && crossFileReferences.isEmpty()) {
+            return
+        }
+        detailsPanel.add(createSectionLabel("关系概览"))
+        addRelationshipLine("循环边", cycleReferences)
+        addRelationshipLine("共享目标", sharedReferences)
+        addRelationshipLine("动态 Anchor", anchorReferences)
+        addRelationshipLine("跨文件目标", crossFileReferences)
+    }
+
+    private fun addRelationshipLine(title: String, references: List<PipelineReference>) {
+        if (references.isEmpty()) return
+        val summary = references.joinToString("、") { it.displayName }
+        detailsPanel.add(
+            createNavigationLabel("$title：$summary") {
+                navigateToReference(references.first())
+            },
+        )
     }
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
