@@ -35,6 +35,7 @@ data class PipelineFieldLocation(
     val range: TextRange,
     val valueRange: TextRange = range,
     val isString: Boolean = false,
+    val references: List<PipelineReference> = emptyList(),
 )
 
 data class PipelineExecutionPolicy(
@@ -65,6 +66,7 @@ data class PipelineReference(
     val isAnchorUnresolved: Boolean = false,
     val kind: PipelineReferenceKind = PipelineReferenceKind.NEXT,
     val propertyPath: String? = null,
+    val sourceFile: VirtualFile? = null,
 )
 
 enum class PipelineReferenceKind(
@@ -184,6 +186,43 @@ internal object PipelineDocumentIndexer {
                 ),
             )
         }
+        val overrides = findPipelineOverrides(project, file, nodes.map { it.name }.toSet())
+        val resolvedOverrides = overrides.map { override ->
+            val sourceNode = nodes.firstOrNull { it.name == override.targetName }
+            if (sourceNode == null) {
+                override
+            } else {
+                override.copy(
+                    fields = override.fields.map { field ->
+                        when (field.name) {
+                            "next" -> field.copy(
+                                references = resolveReferences(
+                                    PipelineNodeEntry(file, sourceNode),
+                                    field.references,
+                                    candidatesByName,
+                                    anchorsByName,
+                                    graph,
+                                    inboundCounts,
+                                ),
+                            )
+
+                            "on_error" -> field.copy(
+                                references = resolveReferences(
+                                    PipelineNodeEntry(file, sourceNode),
+                                    field.references,
+                                    candidatesByName,
+                                    anchorsByName,
+                                    graph,
+                                    inboundCounts,
+                                ),
+                            )
+
+                            else -> field
+                        }
+                    },
+                )
+            }
+        }
         val diagnostics = buildDiagnostics(file, nodes)
         return PipelineDocumentModel(
             file = file,
@@ -191,7 +230,7 @@ internal object PipelineDocumentIndexer {
             nodes = nodes,
             hasSyntaxErrors = parsedFile.hasSyntaxErrors,
             isGenerated = parsedFile.isGenerated,
-            pipelineOverrides = findPipelineOverrides(project, file, nodes.map { it.name }.toSet()),
+            pipelineOverrides = resolvedOverrides,
             pipelineEntries = findPipelineEntries(project, file, nodes.map { it.name }.toSet()),
             diagnostics = diagnostics,
         )
@@ -449,7 +488,12 @@ internal object PipelineDocumentIndexer {
                         val range = targetProperty.nameElement.textRange ?: targetProperty.textRange ?: return@forEach
                         val fields = (targetProperty.value as? JsonObject)
                             ?.propertyList
-                            ?.mapNotNull { property -> property.toFieldLocation() }
+                            ?.mapNotNull { property ->
+                                property.toFieldLocation()?.let { field ->
+                                    // 覆盖字段的范围属于任务文件，供有效控制流回跳到正确的 JSON 来源。
+                                    field.copy(references = field.references.map { it.copy(sourceFile = taskFile) })
+                                }
+                            }
                             .orEmpty()
                         overrides += PipelineOverrideLocation(taskFile, targetProperty.name, range, fields)
                     }
@@ -538,6 +582,11 @@ internal object PipelineDocumentIndexer {
             range = range,
             valueRange = valueRange,
             isString = value.text.trim().let { it.startsWith("\"") && it.endsWith("\"") },
+            references = when (name) {
+                "next" -> toReferences(PipelineReferenceKind.NEXT)
+                "on_error" -> toReferences(PipelineReferenceKind.ON_ERROR)
+                else -> emptyList()
+            },
         )
     }
 

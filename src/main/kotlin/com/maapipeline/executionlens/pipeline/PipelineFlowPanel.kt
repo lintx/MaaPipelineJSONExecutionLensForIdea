@@ -278,7 +278,7 @@ internal class PipelineFlowPanel(
             addTraceSummary(location)
             detailsPanel.add(JSeparator())
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
-            addControlFlowExplanation(location)
+            addControlFlowExplanation(effectiveNode(location))
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addReferences("后继", location.next)
             addReferences("错误后继", location.onError)
@@ -599,6 +599,32 @@ internal class PipelineFlowPanel(
         .joinToString("、") { it.displayName }
         .ifEmpty { "（未设置）" }
 
+    private fun effectiveNode(location: PipelineNodeLocation): PipelineNodeLocation {
+        val entry = selectedEntry ?: return location
+        val override = currentModel.pipelineOverrides.firstOrNull {
+            it.file == entry.file && it.targetName == location.name
+        } ?: return location
+        return override.fields.fold(location) { effective, field ->
+            when (field.name) {
+                "next" -> effective.copy(next = field.references)
+                "on_error" -> effective.copy(onError = field.references)
+                "timeout" -> effective.copy(
+                    executionPolicy = effective.executionPolicy.copy(timeout = field),
+                )
+
+                "rate_limit" -> effective.copy(
+                    executionPolicy = effective.executionPolicy.copy(rateLimit = field),
+                )
+
+                "max_hit" -> effective.copy(
+                    executionPolicy = effective.executionPolicy.copy(maxHit = field),
+                )
+
+                else -> effective
+            }
+        }
+    }
+
     private fun addTraceSummary(location: PipelineNodeLocation) {
         val trace = currentTrace ?: return
         val events = trace.eventsForNode(location.name)
@@ -867,7 +893,7 @@ internal class PipelineFlowPanel(
             return
         }
         val target = reference.target
-        navigateToFileRange(target?.file ?: file, target?.nameRange ?: reference.range)
+        navigateToFileRange(target?.file ?: reference.sourceFile ?: file, target?.nameRange ?: reference.range)
     }
 
     private fun navigateToFileRange(targetFile: com.intellij.openapi.vfs.VirtualFile, range: TextRange) {
