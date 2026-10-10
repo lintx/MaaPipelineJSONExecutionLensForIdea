@@ -271,9 +271,13 @@ internal class PipelineFlowPanel(
                 maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
             })
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
-            val reachable = reachableNodeNames()
-            if (reachable != null && location.name !in reachable) {
+            val staticPath = staticPathTo(location.name)
+            if (staticPath == null && selectedEntry != null) {
                 detailsPanel.add(JBLabel("路径分析：从当前任务入口未解析到此节点（仅计算当前文件内的静态路径）").apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                })
+            } else if (staticPath != null) {
+                detailsPanel.add(JBLabel("路径分析：${staticPath.joinToString(" → ")}").apply {
                     foreground = UIUtil.getContextHelpForeground()
                 })
             }
@@ -651,6 +655,33 @@ internal class PipelineFlowPanel(
         }
         visit(root)
         return reachable
+    }
+
+    private fun staticPathTo(targetName: String): List<String>? {
+        val entry = selectedEntry ?: return null
+        val nodesByName = currentModel.nodes.associateBy { it.name }
+        val root = nodesByName[entry.entryName] ?: return null
+        val queue = ArrayDeque<List<String>>()
+        val visited = mutableSetOf<String>()
+        queue.addLast(listOf(root.name))
+        while (queue.isNotEmpty()) {
+            val path = queue.removeFirst()
+            val current = nodesByName[path.last()] ?: continue
+            if (current.name == targetName) return path
+            if (!visited.add(current.name)) continue
+            effectiveNode(current).next
+                .plus(effectiveNode(current).onError)
+                .mapNotNull { reference ->
+                    reference.target
+                        ?.takeIf { target -> target.file == file }
+                        ?.name
+                        ?.takeIf(nodesByName::containsKey)
+                }
+                .forEach { nextName ->
+                    queue.addLast(path + nextName)
+                }
+        }
+        return null
     }
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
