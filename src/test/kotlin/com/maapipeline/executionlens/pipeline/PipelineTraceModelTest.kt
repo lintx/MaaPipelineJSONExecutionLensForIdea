@@ -19,7 +19,7 @@ class PipelineTraceModelTest {
         )
 
         assertEquals("Main", parsed.taskEntries[7])
-        assertEquals(4, parsed.events.size)
+        assertEquals(5, parsed.events.size)
         assertEquals(PipelineTraceStatus.SUCCEEDED, parsed.events.last().status)
         assertEquals(4, parsed.events[2].lineNumber)
         assertTrue(parsed.events[2].candidates[0].isJumpBack)

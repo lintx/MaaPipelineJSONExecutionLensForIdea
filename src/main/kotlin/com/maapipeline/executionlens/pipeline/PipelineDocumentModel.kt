@@ -8,6 +8,7 @@ import com.intellij.json.psi.JsonValue
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiElement
@@ -163,6 +164,29 @@ data class PipelineDocumentModel(
 internal object PipelineDocumentIndexer {
     private val parsedFileCache = ConcurrentHashMap<String, ParsedPipelineFile>()
     private val taskRelationsCache = ConcurrentHashMap<String, TaskFileRelations>()
+
+    fun diagnostics(project: Project, file: VirtualFile): List<PipelineDiagnostic> {
+        val parsed = parseFile(project, file)
+        val entries = findPipelineJsonFiles(file).flatMap { candidateFile ->
+            ProgressManager.checkCanceled()
+            parseFile(project, candidateFile).nodes.map { PipelineNodeEntry(candidateFile, it) }
+        }
+        val candidatesByName = entries.groupBy { it.node.name }
+        val anchorsByName = entries.flatMap { entry ->
+            entry.node.anchorDefinitions.map { PipelineAnchorEntry(entry.file, entry.node, it) }
+        }.groupBy { it.definition.name }
+        // Inspection 不需要循环和共享关系，避免在后台高亮时反复遍历整个控制流图。
+        val nodes = parsed.nodes.map { node ->
+            ProgressManager.checkCanceled()
+            val source = PipelineNodeEntry(file, node)
+            node.copy(
+                next = resolveReferences(source, node.next, candidatesByName, anchorsByName, emptyMap(), emptyMap()),
+                onError = resolveReferences(source, node.onError, candidatesByName, anchorsByName, emptyMap(), emptyMap()),
+                embeddedReferences = resolveReferences(source, node.embeddedReferences, candidatesByName, anchorsByName, emptyMap(), emptyMap()),
+            )
+        }
+        return buildDiagnostics(file, nodes)
+    }
 
     fun index(project: Project, file: VirtualFile): PipelineDocumentModel {
         val parsedFile = parseFile(project, file)
@@ -362,6 +386,7 @@ internal object PipelineDocumentIndexer {
     private fun collectJsonFiles(root: VirtualFile): List<VirtualFile> {
         val files = mutableListOf<VirtualFile>()
         fun visit(current: VirtualFile) {
+            ProgressManager.checkCanceled()
             if (current.isDirectory) {
                 current.children.orEmpty().forEach(::visit)
             } else if (current.extension.equals("json", ignoreCase = true) || current.extension.equals("jsonc", ignoreCase = true)) {
@@ -421,49 +446,7 @@ internal object PipelineDocumentIndexer {
         val document = FileDocumentManager.getInstance().getDocument(file)
         return nodes.flatMap { node ->
         (node.next + node.onError + node.embeddedReferences).mapNotNull { reference ->
-            val message: String
-            val suggestion: String
-            val severity: PipelineDiagnosticSeverity
-            when {
-                reference.isAnchorUnresolved -> {
-                    severity = PipelineDiagnosticSeverity.WARNING
-                    message = when {
-                        reference.isAmbiguousTarget -> "Anchor 有多个运行时设置点，静态目标不确定"
-                        reference.anchorTarget?.isCleared == true -> "Anchor 已被清除"
-                        reference.anchorTarget == null -> "Anchor 未定义"
-                        reference.anchorTarget.targetNode == null -> "Anchor 的目标节点不存在"
-                        else -> "Anchor 未定义"
-                    }
-                    suggestion = when {
-                        reference.isAmbiguousTarget -> "运行时最后设置生效；核对设置顺序，或加载日志查看本次绑定。"
-                        reference.anchorTarget?.isCleared == true -> "为 Anchor 设置已存在的目标节点，或移除 [Anchor] 前缀。"
-                        reference.anchorTarget == null -> "在项目中定义该 Anchor，或移除 [Anchor] 前缀。"
-                        reference.anchorTarget.targetNode == null -> "将 Anchor 映射到已存在的节点。"
-                        else -> "在项目中定义该 Anchor，或移除 [Anchor] 前缀。"
-                    }
-                }
-
-                reference.isAmbiguousTarget -> {
-                    severity = PipelineDiagnosticSeverity.WARNING
-                    message = "目标名称不唯一"
-                    suggestion = "保持节点名称唯一，或改用唯一的节点名称。"
-                }
-
-                !reference.targetExists -> {
-                    severity = PipelineDiagnosticSeverity.ERROR
-                    message = "目标节点不存在"
-                    suggestion = when (reference.kind) {
-                        PipelineReferenceKind.TARGET,
-                        PipelineReferenceKind.BEGIN,
-                        PipelineReferenceKind.END,
-                        -> "检查字段中的节点名称，或先定义该节点。"
-
-                        else -> "检查节点名称拼写，或先定义该节点。"
-                    }
-                }
-
-                else -> return@mapNotNull null
-            }
+            val issue = PipelineReferenceDiagnostics.issue(reference) ?: return@mapNotNull null
             PipelineDiagnostic(
                 file = file,
                 range = reference.range,
@@ -472,11 +455,11 @@ internal object PipelineDocumentIndexer {
                         .takeIf { it in 0..currentDocument.textLength }
                         ?.let { currentDocument.getLineNumber(it) + 1 }
                 },
-                severity = severity,
+                severity = issue.severity,
                 kind = reference.kind,
                 targetName = reference.targetName,
-                message = message,
-                suggestion = suggestion,
+                message = issue.message,
+                suggestion = issue.suggestion,
             )
         }
         }

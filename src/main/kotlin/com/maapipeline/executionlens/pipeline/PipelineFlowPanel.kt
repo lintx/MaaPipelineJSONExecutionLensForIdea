@@ -31,6 +31,8 @@ import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFileFactory
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.ModalityState
@@ -107,6 +109,9 @@ internal class PipelineFlowPanel(
     }
     private var currentModel = PipelineDocumentModel(file, -1L, emptyList(), hasSyntaxErrors = true)
     private var currentTrace: PipelineExecutionTrace? = null
+    private var traceSourceVersions: Map<VirtualFile, Long> = emptyMap()
+    private var traceLoadGeneration = 0L
+    private var traceReplayExpanded = false
     private var disposed = false
     private var refreshing = false
     private var syncingEntrySelector = false
@@ -258,7 +263,10 @@ internal class PipelineFlowPanel(
             isEnabled = false
             toolTipText = "移除当前面板叠加的运行轨迹，不修改日志文件"
             addActionListener {
+                traceLoadGeneration++
                 currentTrace = null
+                traceSourceVersions = emptyMap()
+                traceButton.isEnabled = true
                 updateSummary()
                 nodeList.repaint()
                 renderSelectedNode()
@@ -492,8 +500,12 @@ internal class PipelineFlowPanel(
             append("当前文件：${currentModel.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix")
             if (selectedEntry != null && overrideToggle.isSelected) append("　已应用任务覆盖")
             currentTrace?.let { trace ->
-                append("　日志：${trace.events.size} 个事件，已执行 ${trace.executedNodeNames.size} 个节点")
+                val events = trace.eventsForEntry(selectedEntry?.entryName)
+                val executed = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE && it.status == PipelineTraceStatus.STARTING }
+                    .mapNotNull { it.nodeName }.distinct().size
+                append("　当前任务日志：${events.size} 个事件，已执行 $executed 个节点")
                 append("　来源：${displayPath(trace.file)}")
+                if (traceSourceChanged()) append("　⚠ 导入日志后源码已改变")
             }
         }
         clearTraceButton.isEnabled = currentTrace != null
@@ -518,12 +530,66 @@ internal class PipelineFlowPanel(
                 "当前任务：${displayPath(entry.file)} · 控制流按该任务的有效字段解释"
             })
             appendLogicRow(rows, "toolbar", 0, 34) { addLogicToolbar(it) }
+            appendTraceReplay(rows)
             val root = entry?.let(::entryRootNode) ?: location
             val rootKey = logicNodeKey(root.name, root.sourceFile ?: file)
             appendLogicNote(rows, "limit", 0, "从 ${root.name} 展开静态控制流；循环、共享节点和动态 Anchor 保留边界。组件按可视区域创建，最多展开 $MAX_LOGIC_NODES 个唯一节点。")
             appendVirtualLogicNode(root, rows, 0, setOf(rootKey), linkedSetOf(rootKey))
         }
         logicPanel.setRows(rows)
+    }
+
+    private fun traceSourceChanged(): Boolean = ReadAction.compute<Boolean, RuntimeException> {
+        traceSourceVersions.any { (source, version) ->
+            !source.isValid || (FileDocumentManager.getInstance().getDocument(source)?.modificationStamp ?: source.modificationStamp) != version
+        }
+    }
+
+    private fun appendTraceReplay(rows: MutableList<PipelineVirtualRow>) {
+        val trace = currentTrace ?: return
+        val entry = selectedEntry?.entryName
+        val events = trace.eventsForEntry(entry)
+        if (events.isEmpty()) {
+            appendLogicNote(rows, "trace:empty", 0, "当前入口没有关联日志，保留静态流程；不会借用其它任务的结果。")
+            return
+        }
+        val replay = trace.replayForEntry(entry)
+        appendLogicRow(rows, "trace:header", 0, 30) { panel ->
+            val header = JPanel(BorderLayout()).apply { isOpaque = false }
+            header.add(createFoldMarker(traceReplayExpanded, "本次运行日志回放") { expanded ->
+                traceReplayExpanded = expanded
+                renderLogicView(currentModel.nodes.getOrNull(nodeList.selectedIndex))
+            }, BorderLayout.WEST)
+            header.add(JBLabel("本次运行 · ${replay.steps.size} 条观察 · ${replay.calls.size} 次 JumpBack 推断").apply {
+                font = font.deriveFont(Font.BOLD)
+            }, BorderLayout.CENTER)
+            panel.add(header)
+        }
+        if (traceSourceChanged()) {
+            appendLogicNote(rows, "trace:changed", 0, "⚠ 导入日志后源码已改变，以下历史轨迹不代表当前源码的执行结果。")
+        }
+        val knownNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }.map { it.name }.toSet()
+        val missing = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE }.mapNotNull { it.nodeName }
+            .filterNot { it in knownNodes }.distinct()
+        if (missing.isNotEmpty()) {
+            appendLogicNote(rows, "trace:missing", 0, "⚠ 日志含当前索引未找到的节点：${missing.take(5).joinToString("、")}；请核对资源或源码版本。")
+        }
+        if (!traceReplayExpanded) return
+        appendLogicNote(rows, "trace:version", 0, "日志未提供源码版本指纹；回放仅展示观察和明确标注的推断。点击行末可定位原始日志。")
+        replay.warnings.forEachIndexed { index, warning -> appendLogicNote(rows, "trace:warning:$index", 0, "⚠ $warning") }
+        replay.steps.forEachIndexed { index, step ->
+            appendLogicRow(rows, "trace:step:$index", step.depth, 26) { panel ->
+                val line = JPanel(BorderLayout()).apply { isOpaque = false }
+                val task = step.event.taskId?.let { "[任务 $it] " }.orEmpty().takeIf { entry == null }.orEmpty()
+                val target = step.nodeName?.let { name -> currentModel.projectNodes.ifEmpty { currentModel.nodes }.singleOrNull { it.name == name } }
+                val label = if (target == null) JBLabel(task + step.text) else {
+                    createNavigationLabel(task + step.text) { navigateToLogicNode(target) }
+                }
+                line.add(label, BorderLayout.CENTER)
+                line.add(createNavigationLabel("日志 ${step.event.lineNumber}") { openTraceFile(step.event.lineNumber) }, BorderLayout.EAST)
+                panel.add(line)
+            }
+        }
     }
 
     private fun appendLogicRow(
@@ -1861,9 +1927,31 @@ internal class PipelineFlowPanel(
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
         val trace = currentTrace ?: return
-        val events = trace.eventsForEntry(selectedEntry?.entryName).filter { it.nodeName == location.name }
-        if (events.isEmpty()) return
+        val entry = selectedEntry?.entryName
+        val events = trace.eventsForEntry(entry).filter { it.nodeName == location.name }
+        val rounds = trace.roundsForEntry(entry).filter { it.started.nodeName == location.name }
+        val calls = trace.replayForEntry(entry).calls.filter { it.caller == location.name || it.target == location.name }
+        if (events.isEmpty() && rounds.isEmpty() && calls.isEmpty()) return
         detailsPanel.add(createSectionLabel("运行轨迹 · 本次运行"))
+        if (traceSourceChanged()) detailsPanel.add(JBLabel("⚠ 源码已改变，请按历史运行记录理解这些结果。"))
+        rounds.takeLast(6).forEach { round ->
+            val number = rounds.indexOf(round) + 1
+            detailsPanel.add(createNavigationLabel("候选第 $number 轮 · 日志 ${round.started.lineNumber}") {
+                openTraceFile(round.started.lineNumber)
+            })
+            round.started.candidates.forEach { candidate ->
+                detailsPanel.add(JBLabel("${candidate.name}：${round.outcome(candidate.name).label}").apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                    border = JBUI.Borders.emptyLeft(8)
+                })
+            }
+        }
+        calls.takeLast(6).forEach { call ->
+            val returned = call.resumed?.let { "推断返回 · 日志 ${it.lineNumber}" } ?: "未观察到返回"
+            detailsPanel.add(createNavigationLabel("↩ ${call.caller} → ${call.target}（推断；$returned）") {
+                openTraceFile(call.entered.lineNumber)
+            })
+        }
         events.takeLast(8).forEach { event ->
             val task = event.entryName?.let { "任务 $it" }.orEmpty()
             val suffix = if (task.isEmpty()) "" else "，$task"
@@ -1900,14 +1988,50 @@ internal class PipelineFlowPanel(
             .withDescription("选择 MaaEnd debug/maafw.log 或导出的同类日志文件")
         val defaultFile = project.baseDir?.findFileByRelativePath("debug/maafw.log")
         val selected = FileChooser.chooseFile(descriptor, project, defaultFile) ?: return
-        val trace = runCatching { PipelineTraceParser.parse(selected) }.getOrElse { error ->
-            Messages.showErrorDialog(project, "无法读取运行日志：${error.message}", "加载运行日志失败")
-            return
-        }
-        currentTrace = trace
-        updateSummary()
-        nodeList.repaint()
-        renderSelectedNode()
+        val generation = ++traceLoadGeneration
+        val sourceFiles = (currentModel.indexedVersions.keys + currentModel.pipelineOverrides.map { it.file } +
+            currentModel.pipelineEntries.map { it.file } + file).distinct()
+        traceButton.isEnabled = false
+        object : Task.Backgroundable(project, "读取 MaaFramework 运行日志", true) {
+            private var parsedTrace: PipelineExecutionTrace? = null
+            private var sourceVersions: Map<VirtualFile, Long> = emptyMap()
+
+            override fun run(indicator: ProgressIndicator) {
+                sourceVersions = ReadAction.compute<Map<VirtualFile, Long>, RuntimeException> {
+                    sourceFiles.associateWith { source ->
+                        FileDocumentManager.getInstance().getDocument(source)?.modificationStamp ?: source.modificationStamp
+                    }
+                }
+                val trace = PipelineTraceParser.parse(selected) { indicator.checkCanceled() }
+                trace.replayForEntry(null)
+                trace.taskEntries.values.toSet().forEach { entry ->
+                    indicator.checkCanceled()
+                    trace.replayForEntry(entry)
+                    trace.nodeStatesForEntry(entry)
+                }
+                parsedTrace = trace
+            }
+
+            override fun onSuccess() {
+                if (disposed || generation != traceLoadGeneration) return
+                traceButton.isEnabled = true
+                currentTrace = parsedTrace
+                traceSourceVersions = sourceVersions
+                updateSummary()
+                nodeList.repaint()
+                renderSelectedNode()
+            }
+
+            override fun onCancel() {
+                if (!disposed && generation == traceLoadGeneration) traceButton.isEnabled = true
+            }
+
+            override fun onThrowable(error: Throwable) {
+                if (disposed || generation != traceLoadGeneration) return
+                traceButton.isEnabled = true
+                Messages.showErrorDialog(project, "无法读取运行日志：${error.message}", "加载运行日志失败")
+            }
+        }.queue()
     }
 
     private fun openTraceFile(lineNumber: Int) {

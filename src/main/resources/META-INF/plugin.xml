@@ -14,5 +14,9 @@
     <extensions defaultExtensionNs="com.intellij">
         <fileEditorProvider implementation="com.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
         <postStartupActivity implementation="com.maapipeline.executionlens.MaaPipelineStartupActivity"/>
+        <localInspection language="JSON" shortName="MaaPipelineReference"
+                         displayName="MaaPipeline 节点与 Anchor 引用"
+                         groupName="MaaPipeline" enabledByDefault="true" level="WARNING"
+                         implementationClass="com.maapipeline.executionlens.pipeline.PipelineReferenceInspection"/>
     </extensions>
 </idea-plugin>

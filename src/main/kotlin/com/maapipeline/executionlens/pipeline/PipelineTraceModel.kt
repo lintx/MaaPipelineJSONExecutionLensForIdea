@@ -36,6 +36,8 @@ internal enum class PipelineTraceCandidateOutcome(
 ) {
     SELECTED("本次运行选择"),
     SKIPPED("本次运行未选择"),
+    MISSED("本轮识别未命中"),
+    MATCHED("本轮识别命中，执行未观察到"),
     UNOBSERVED("本次运行未观察到"),
 }
 
@@ -60,6 +62,10 @@ internal class PipelineExecutionTrace(
 ) {
     private val scopedEvents = mutableMapOf<String?, List<PipelineTraceEvent>>()
     private val scopedNodeStates = mutableMapOf<String?, Map<String, PipelineTraceEvent>>()
+    private val scopedRounds = mutableMapOf<String?, List<PipelineTraceRound>>()
+    private val scopedReplays = mutableMapOf<String?, PipelineTraceReplay>()
+    private val eventsByTask = events.groupBy { it.taskId }
+    private val latestTaskIdsByEntry = pipelineTraceLatestTaskIds(events, taskEntries)
     val nodeEvents: List<PipelineTraceEvent> = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE }
 
     val latestNodeStates: Map<String, PipelineTraceEvent> = nodeEvents
@@ -76,12 +82,23 @@ internal class PipelineExecutionTrace(
     fun eventsForNode(nodeName: String): List<PipelineTraceEvent> = events.filter { it.nodeName == nodeName }
 
     fun eventsForEntry(entryName: String?): List<PipelineTraceEvent> = scopedEvents.getOrPut(entryName) {
-        pipelineTraceEventsForEntry(events, taskEntries, entryName)
+        if (entryName == null) events else latestTaskIdsByEntry[entryName]?.let { eventsByTask[it] }.orEmpty()
     }
 
     fun nodeStatesForEntry(entryName: String?): Map<String, PipelineTraceEvent> = scopedNodeStates.getOrPut(entryName) {
         eventsForEntry(entryName).filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE && it.nodeName != null }
             .associateBy { it.nodeName!! }
+    }
+
+    fun roundsForEntry(entryName: String?): List<PipelineTraceRound> = scopedRounds.getOrPut(entryName) {
+        if (entryName == null) pipelineTraceRounds(events) else {
+            val taskId = latestTaskIdsByEntry[entryName]
+            if (taskId == null) emptyList() else roundsForEntry(null).filter { it.started.taskId == taskId }
+        }
+    }
+
+    fun replayForEntry(entryName: String?): PipelineTraceReplay = scopedReplays.getOrPut(entryName) {
+        PipelineTraceReplayBuilder.build(eventsForEntry(entryName), roundsForEntry(entryName))
     }
 
     fun latestNextListForNode(nodeName: String, taskId: Long? = null): PipelineTraceEvent? = events
@@ -106,7 +123,8 @@ internal class PipelineExecutionTrace(
         candidateName: String,
         entryName: String?,
     ): PipelineTraceCandidateOutcome {
-        return pipelineTraceCandidateOutcome(eventsForEntry(entryName), nodeName, candidateName)
+        return roundsForEntry(entryName).lastOrNull { it.started.nodeName == nodeName }?.outcome(candidateName)
+            ?: PipelineTraceCandidateOutcome.UNOBSERVED
     }
 }
 
@@ -116,12 +134,21 @@ internal fun pipelineTraceEventsForEntry(
     entryName: String?,
 ): List<PipelineTraceEvent> {
     if (entryName == null) return events
-    val taskIds = taskEntries.filterValues { it == entryName }.keys
-    val latestTaskId = events.lastOrNull {
-        it.taskId in taskIds && it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING
-    }?.taskId ?: events.lastOrNull { it.taskId in taskIds }?.taskId ?: return emptyList()
+    val latestTaskId = pipelineTraceLatestTaskIds(events, taskEntries)[entryName] ?: return emptyList()
     // 同名任务可能运行多次，候选和节点状态必须来自同一个 task_id，不能拼成一条虚假的路径。
     return events.filter { it.taskId == latestTaskId }
+}
+
+private fun pipelineTraceLatestTaskIds(events: List<PipelineTraceEvent>, taskEntries: Map<Long, String>): Map<String, Long> {
+    val latestEvents = mutableMapOf<String, Long>()
+    val latestStarts = mutableMapOf<String, Long>()
+    events.forEach { event ->
+        val taskId = event.taskId ?: return@forEach
+        val entry = taskEntries[taskId] ?: return@forEach
+        latestEvents[entry] = taskId
+        if (event.kind == PipelineTraceEventKind.TASK && event.status == PipelineTraceStatus.STARTING) latestStarts[entry] = taskId
+    }
+    return latestEvents + latestStarts
 }
 
 internal fun pipelineTraceCandidateOutcome(
@@ -130,35 +157,9 @@ internal fun pipelineTraceCandidateOutcome(
     candidateName: String,
     taskId: Long? = null,
 ): PipelineTraceCandidateOutcome {
-    val nextList = events
-        .asSequence()
-        .filter {
-            it.kind == PipelineTraceEventKind.NEXT_LIST &&
-                it.nodeName == nodeName &&
-                (taskId == null || it.taskId == taskId)
-        }
-        .lastOrNull() ?: return PipelineTraceCandidateOutcome.UNOBSERVED
-    if (nextList.candidates.none { it.name == candidateName }) {
-        return PipelineTraceCandidateOutcome.UNOBSERVED
-    }
-    val nextListIndex = events.indexOfLast { it === nextList }
-    val selectedTarget = events
-        .asSequence()
-        .drop(nextListIndex + 1)
-        .firstOrNull { event ->
-            event.kind == PipelineTraceEventKind.PIPELINE_NODE &&
-                event.status == PipelineTraceStatus.STARTING &&
-                (nextList.taskId == null || event.taskId == nextList.taskId)
-        }
-        ?.nodeName
-    if (selectedTarget == null || nextList.candidates.none { it.name == selectedTarget }) {
-        return PipelineTraceCandidateOutcome.UNOBSERVED
-    }
-    return if (selectedTarget == candidateName) {
-        PipelineTraceCandidateOutcome.SELECTED
-    } else {
-        PipelineTraceCandidateOutcome.SKIPPED
-    }
+    val scoped = if (taskId == null) events else events.filter { it.taskId == taskId }
+    return pipelineTraceRounds(scoped).lastOrNull { it.started.nodeName == nodeName }?.outcome(candidateName)
+        ?: PipelineTraceCandidateOutcome.UNOBSERVED
 }
 
 internal data class PipelineTraceParseResult(
@@ -172,23 +173,26 @@ internal object PipelineTraceParser {
     private const val detailsPrefix = "[details="
     private const val fallbackDetailsPrefix = "[details_json="
 
-    fun parse(file: VirtualFile): PipelineExecutionTrace {
+    fun parse(file: VirtualFile, checkCanceled: () -> Unit = {}): PipelineExecutionTrace {
         val parsed = file.inputStream.use { input ->
-            parseLines(input.bufferedReader(StandardCharsets.UTF_8).lineSequence())
+            parseLines(input.bufferedReader(StandardCharsets.UTF_8).lineSequence(), checkCanceled)
         }
         return PipelineExecutionTrace(file, parsed.events, parsed.taskEntries)
     }
 
     internal fun parseText(text: String): PipelineTraceParseResult = parseLines(text.lineSequence())
 
-    private fun parseLines(lines: Sequence<String>): PipelineTraceParseResult {
+    private fun parseLines(lines: Sequence<String>, checkCanceled: () -> Unit = {}): PipelineTraceParseResult {
+        checkCanceled()
         val events = mutableListOf<PipelineTraceEvent>()
         val taskEntries = mutableMapOf<Long, String>()
         var lineNumber = 0
         lines.forEach { line ->
             lineNumber++
+            if (lineNumber % 1000 == 0) checkCanceled()
             parseLine(line, lineNumber, events, taskEntries)
         }
+        checkCanceled()
         return PipelineTraceParseResult(events, taskEntries)
     }
 
@@ -294,15 +298,29 @@ internal object PipelineTraceParser {
 
     private fun JsonElement.toCandidate(): PipelineTraceCandidate? {
         if (isJsonPrimitive && asJsonPrimitive.isString) {
-            return PipelineTraceCandidate(asString, isJumpBack = false, isAnchor = false)
+            return traceCandidate(asString, isJumpBack = false, isAnchor = false)
         }
         val objectValue = takeIf(JsonElement::isJsonObject)?.asJsonObject ?: return null
         val name = objectValue.stringValue("name") ?: return null
-        return PipelineTraceCandidate(
-            name = name,
+        return traceCandidate(
+            rawName = name,
             isJumpBack = objectValue.booleanValue("jump_back"),
             isAnchor = objectValue.booleanValue("anchor"),
         )
+    }
+
+    private fun traceCandidate(rawName: String, isJumpBack: Boolean, isAnchor: Boolean): PipelineTraceCandidate {
+        var name = rawName
+        var jumpBack = isJumpBack
+        var anchor = isAnchor
+        while (name.startsWith("[")) {
+            when {
+                name.startsWith("[JumpBack]") -> { jumpBack = true; name = name.removePrefix("[JumpBack]") }
+                name.startsWith("[Anchor]") -> { anchor = true; name = name.removePrefix("[Anchor]") }
+                else -> break
+            }
+        }
+        return PipelineTraceCandidate(name, jumpBack, anchor)
     }
 
     private fun JsonObject.stringValue(name: String): String? = get(name)
@@ -321,6 +339,7 @@ internal object PipelineTraceParser {
 
     private fun PipelineTraceEvent.sameEvent(other: PipelineTraceEvent): Boolean =
         message == other.message &&
+            timestamp == other.timestamp &&
             status == other.status &&
             taskId == other.taskId &&
             nodeName == other.nodeName &&
