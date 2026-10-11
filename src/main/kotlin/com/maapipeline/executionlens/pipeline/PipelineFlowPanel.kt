@@ -647,6 +647,11 @@ internal class PipelineFlowPanel(
         addAction("+ 节点", "在当前 Pipeline JSON 顶层添加节点", { !currentModel.isGenerated && !currentModel.hasSyntaxErrors }) {
             addNode()
         }
+        addAction("重命名", "同步修改项目内引用、任务入口和 Anchor 目标", {
+            !currentModel.isGenerated && !currentModel.hasSyntaxErrors && nodeList.selectedIndex >= 0
+        }) {
+            renameSelectedNode()
+        }
         addAction("− 节点", "删除当前节点，并提示已知引用", { !currentModel.isGenerated && nodeList.selectedIndex >= 0 }) {
             removeSelectedNode()
         }
@@ -2389,6 +2394,136 @@ internal class PipelineFlowPanel(
             "MaaPipeline JSON Execution Lens",
             Runnable { editor.document.replaceString(edit.range.startOffset, edit.range.endOffset, edit.replacement) },
         )
+    }
+
+    private fun renameSelectedNode() {
+        val node = currentModel.nodes.getOrNull(nodeList.selectedIndex) ?: return
+        if (!ensureEditable()) return
+        val newName = Messages.showInputDialog(
+            project,
+            "输入新的节点名称。插件会同步更新当前项目中可定位的引用和任务关系：",
+            "重命名 Pipeline 节点",
+            null,
+            node.name,
+            null,
+        )?.trim().orEmpty()
+        if (newName.isEmpty() || newName == node.name) return
+        if (newName.any { it == '"' || it == '\n' || it == '\r' }) {
+            Messages.showWarningDialog(project, "节点名称不能包含引号或换行。", "无法重命名 Pipeline 节点")
+            return
+        }
+        if (currentModel.projectNodes.any { it.name == newName && it.name != node.name }) {
+            Messages.showWarningDialog(project, "项目索引中已经存在节点：$newName", "无法重命名 Pipeline 节点")
+            return
+        }
+
+        val sourceFiles = (currentModel.indexedVersions.keys +
+            currentModel.pipelineOverrides.map { it.file } +
+            currentModel.pipelineEntries.map { it.file } +
+            currentModel.projectNodes.mapNotNull { it.sourceFile } +
+            listOf(file)).distinct()
+        val textByFile = sourceFiles.mapNotNull { sourceFile ->
+            documentFor(sourceFile)?.let { sourceFile to it.text }
+        }.toMap()
+        if (textByFile.size != sourceFiles.size) {
+            Messages.showWarningDialog(project, "项目中有文件无法加载为可编辑文档，已取消重命名。", "无法重命名 Pipeline 节点")
+            return
+        }
+        val generatedFile = textByFile.entries.firstOrNull { (sourceFile, text) ->
+            currentModel.generatedFiles.contains(sourceFile) || hasGeneratedHeader(text)
+        }?.key
+        if (generatedFile != null) {
+            Messages.showWarningDialog(
+                project,
+                "重命名会影响生成文件：${displayPath(generatedFile)}\n插件不会直接修改生成文件。",
+                "无法重命名 Pipeline 节点",
+            )
+            return
+        }
+        if (sourceFiles.any { !it.isWritable }) {
+            Messages.showWarningDialog(project, "重命名涉及不可写文件，已取消操作。", "无法重命名 Pipeline 节点")
+            return
+        }
+
+        val plan = PipelineNodeRenamePlanner.build(currentModel, node, newName, textByFile)
+        if (plan.conflicts.isNotEmpty()) {
+            Messages.showWarningDialog(
+                project,
+                "以下关系无法安全定位，插件不会进行部分重命名：\n\n${plan.conflicts.take(12).joinToString("\n")}",
+                "无法重命名 Pipeline 节点",
+            )
+            return
+        }
+        if (plan.files.isEmpty()) return
+        val documents = plan.files.associate { it.file to (documentFor(it.file) ?: return) }
+        val snapshots = plan.files.associate { filePlan ->
+            filePlan.file to PipelineEditSnapshot(
+                documents.getValue(filePlan.file).modificationStamp,
+                documents.getValue(filePlan.file).text,
+            )
+        }
+        val preview = buildRenamePreview(plan)
+        val accepted = Messages.showYesNoDialog(
+            project,
+            preview,
+            "重命名 Pipeline 节点",
+            "应用",
+            "取消",
+            Messages.getQuestionIcon(),
+        ) == Messages.YES
+        if (!accepted) return
+        if (plan.files.any { filePlan ->
+                val document = documents.getValue(filePlan.file)
+                !snapshots.getValue(filePlan.file).matches(document.modificationStamp, document.text)
+            }) {
+            Messages.showWarningDialog(project, "确认期间文件发生变化，插件不会覆盖外部修改。请重新执行重命名。", "重命名已取消")
+            refreshFromDocument(editor.document)
+            return
+        }
+        WriteCommandAction.runWriteCommandAction(
+            project,
+            "重命名 Pipeline 节点",
+            "MaaPipeline JSON Execution Lens",
+            Runnable {
+                plan.files.forEach { filePlan ->
+                    val document = documents.getValue(filePlan.file)
+                    filePlan.edits.sortedByDescending { it.range.startOffset }.forEach { edit ->
+                        document.replaceString(edit.range.startOffset, edit.range.endOffset, edit.replacement)
+                    }
+                }
+            },
+        )
+        refreshFromDocument(editor.document)
+    }
+
+    private fun buildRenamePreview(plan: PipelineNodeRenamePlan): String = buildString {
+        append("将项目内 Pipeline 节点 ")
+        append(plan.oldName)
+        append(" 重命名为 ")
+        append(plan.newName)
+        append("，共修改 ")
+        append(plan.editCount)
+        append(" 处，涉及 ")
+        append(plan.affectedFileCount)
+        append(" 个文件。\n\n")
+        plan.files.forEach { filePlan ->
+            append("文件：")
+            append(displayPath(filePlan.file))
+            append("（")
+            append(filePlan.edits.size)
+            append(" 处）\n")
+            filePlan.edits.take(8).forEach { edit ->
+                val oldText = filePlan.originalText.substring(edit.range.startOffset, edit.range.endOffset)
+                append("  ")
+                append(previewDocumentText(oldText))
+                append(" → ")
+                append(previewDocumentText(edit.replacement))
+                append('\n')
+            }
+            if (filePlan.edits.size > 8) append("  … 其余 ${filePlan.edits.size - 8} 处\n")
+            append('\n')
+        }
+        append("所有修改会作为一次 IDEA 命令写入，可整体撤销。")
     }
 
     private fun removeSelectedNode() {

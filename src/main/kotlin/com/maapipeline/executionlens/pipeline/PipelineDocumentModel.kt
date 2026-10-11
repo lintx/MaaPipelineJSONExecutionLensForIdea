@@ -101,6 +101,7 @@ data class PipelineAnchorDefinition(
     val isCleared: Boolean,
     val propertyRange: TextRange = range,
     val valueRange: TextRange = range,
+    val targetRange: TextRange? = null,
     val isScalar: Boolean = false,
 )
 
@@ -604,6 +605,7 @@ internal object PipelineDocumentIndexer {
                     isCleared = targetName != null && targetName.isEmpty(),
                     propertyRange = anchorProperty.textRange ?: range,
                     valueRange = anchorProperty.value?.textRange ?: range,
+                    targetRange = anchorProperty.value?.textRange,
                 )
             }
 
