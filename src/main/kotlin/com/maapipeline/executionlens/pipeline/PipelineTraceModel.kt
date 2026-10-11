@@ -31,6 +31,14 @@ internal data class PipelineTraceCandidate(
     val isAnchor: Boolean,
 )
 
+internal enum class PipelineTraceCandidateOutcome(
+    val label: String,
+) {
+    SELECTED("本次运行选择"),
+    SKIPPED("本次运行未选择"),
+    UNOBSERVED("本次运行未观察到"),
+}
+
 internal data class PipelineTraceEvent(
     val lineNumber: Int,
     val timestamp: String?,
@@ -50,6 +58,8 @@ internal class PipelineExecutionTrace(
     val events: List<PipelineTraceEvent>,
     val taskEntries: Map<Long, String>,
 ) {
+    private val scopedEvents = mutableMapOf<String?, List<PipelineTraceEvent>>()
+    private val scopedNodeStates = mutableMapOf<String?, Map<String, PipelineTraceEvent>>()
     val nodeEvents: List<PipelineTraceEvent> = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE }
 
     val latestNodeStates: Map<String, PipelineTraceEvent> = nodeEvents
@@ -64,6 +74,91 @@ internal class PipelineExecutionTrace(
         .toList()
 
     fun eventsForNode(nodeName: String): List<PipelineTraceEvent> = events.filter { it.nodeName == nodeName }
+
+    fun eventsForEntry(entryName: String?): List<PipelineTraceEvent> = scopedEvents.getOrPut(entryName) {
+        pipelineTraceEventsForEntry(events, taskEntries, entryName)
+    }
+
+    fun nodeStatesForEntry(entryName: String?): Map<String, PipelineTraceEvent> = scopedNodeStates.getOrPut(entryName) {
+        eventsForEntry(entryName).filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE && it.nodeName != null }
+            .associateBy { it.nodeName!! }
+    }
+
+    fun latestNextListForNode(nodeName: String, taskId: Long? = null): PipelineTraceEvent? = events
+        .asSequence()
+        .filter {
+            it.kind == PipelineTraceEventKind.NEXT_LIST &&
+                it.nodeName == nodeName &&
+                (taskId == null || it.taskId == taskId)
+        }
+        .lastOrNull()
+
+    fun candidateOutcome(
+        nodeName: String,
+        candidateName: String,
+        taskId: Long? = null,
+    ): PipelineTraceCandidateOutcome {
+        return pipelineTraceCandidateOutcome(events, nodeName, candidateName, taskId)
+    }
+
+    fun candidateOutcomeForEntry(
+        nodeName: String,
+        candidateName: String,
+        entryName: String?,
+    ): PipelineTraceCandidateOutcome {
+        return pipelineTraceCandidateOutcome(eventsForEntry(entryName), nodeName, candidateName)
+    }
+}
+
+internal fun pipelineTraceEventsForEntry(
+    events: List<PipelineTraceEvent>,
+    taskEntries: Map<Long, String>,
+    entryName: String?,
+): List<PipelineTraceEvent> {
+    if (entryName == null) return events
+    val taskIds = taskEntries.filterValues { it == entryName }.keys
+    val latestTaskId = events.lastOrNull {
+        it.taskId in taskIds && it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING
+    }?.taskId ?: events.lastOrNull { it.taskId in taskIds }?.taskId ?: return emptyList()
+    // 同名任务可能运行多次，候选和节点状态必须来自同一个 task_id，不能拼成一条虚假的路径。
+    return events.filter { it.taskId == latestTaskId }
+}
+
+internal fun pipelineTraceCandidateOutcome(
+    events: List<PipelineTraceEvent>,
+    nodeName: String,
+    candidateName: String,
+    taskId: Long? = null,
+): PipelineTraceCandidateOutcome {
+    val nextList = events
+        .asSequence()
+        .filter {
+            it.kind == PipelineTraceEventKind.NEXT_LIST &&
+                it.nodeName == nodeName &&
+                (taskId == null || it.taskId == taskId)
+        }
+        .lastOrNull() ?: return PipelineTraceCandidateOutcome.UNOBSERVED
+    if (nextList.candidates.none { it.name == candidateName }) {
+        return PipelineTraceCandidateOutcome.UNOBSERVED
+    }
+    val nextListIndex = events.indexOfLast { it === nextList }
+    val selectedTarget = events
+        .asSequence()
+        .drop(nextListIndex + 1)
+        .firstOrNull { event ->
+            event.kind == PipelineTraceEventKind.PIPELINE_NODE &&
+                event.status == PipelineTraceStatus.STARTING &&
+                (nextList.taskId == null || event.taskId == nextList.taskId)
+        }
+        ?.nodeName
+    if (selectedTarget == null || nextList.candidates.none { it.name == selectedTarget }) {
+        return PipelineTraceCandidateOutcome.UNOBSERVED
+    }
+    return if (selectedTarget == candidateName) {
+        PipelineTraceCandidateOutcome.SELECTED
+    } else {
+        PipelineTraceCandidateOutcome.SKIPPED
+    }
 }
 
 internal data class PipelineTraceParseResult(
@@ -130,7 +225,7 @@ internal object PipelineTraceParser {
         }
         val nodeName = details.stringValue("name")
         val candidates = if (kind == PipelineTraceEventKind.NEXT_LIST) {
-            details.getAsJsonArray("list")?.mapNotNull { it.asJsonObject.toCandidate() }.orEmpty()
+            details.getAsJsonArray("list")?.mapNotNull { it.toCandidate() }.orEmpty()
         } else {
             emptyList()
         }
@@ -197,12 +292,16 @@ internal object PipelineTraceParser {
         return null
     }
 
-    private fun JsonObject.toCandidate(): PipelineTraceCandidate? {
-        val name = stringValue("name") ?: return null
+    private fun JsonElement.toCandidate(): PipelineTraceCandidate? {
+        if (isJsonPrimitive && asJsonPrimitive.isString) {
+            return PipelineTraceCandidate(asString, isJumpBack = false, isAnchor = false)
+        }
+        val objectValue = takeIf(JsonElement::isJsonObject)?.asJsonObject ?: return null
+        val name = objectValue.stringValue("name") ?: return null
         return PipelineTraceCandidate(
             name = name,
-            isJumpBack = booleanValue("jump_back"),
-            isAnchor = booleanValue("anchor"),
+            isJumpBack = objectValue.booleanValue("jump_back"),
+            isAnchor = objectValue.booleanValue("anchor"),
         )
     }
 
@@ -226,5 +325,6 @@ internal object PipelineTraceParser {
             taskId == other.taskId &&
             nodeName == other.nodeName &&
             nodeId == other.nodeId &&
-            candidates == other.candidates
+            candidates == other.candidates &&
+            anchorName == other.anchorName
 }

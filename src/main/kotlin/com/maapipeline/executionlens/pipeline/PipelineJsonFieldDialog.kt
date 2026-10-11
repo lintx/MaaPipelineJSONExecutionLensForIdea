@@ -3,6 +3,7 @@ package com.maapipeline.executionlens.pipeline
 import com.intellij.json.psi.JsonFile
 import com.intellij.json.JsonFileType
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -48,7 +49,9 @@ internal class PipelineJsonFieldDialog(
         }, BorderLayout.CENTER)
     }
 
-    override fun doValidate(): ValidationInfo? {
+    override fun doValidate(): ValidationInfo? = ReadAction.compute<ValidationInfo?, RuntimeException> { validateValue() }
+
+    private fun validateValue(): ValidationInfo? {
         val psiFile = PsiFileFactory.getInstance(project).createFileFromText(
             "PipelineField.json",
             JsonFileType.INSTANCE,

@@ -82,6 +82,16 @@ internal object PipelineControlFlowExplanation {
                 ),
             )
         }
+        add(
+            PipelineControlFlowLine(
+                kind = PipelineControlFlowLineKind.TERMINAL,
+                text = if (kind == PipelineControlFlowLineKind.SUCCESS_CANDIDATE) {
+                    "否则：所有成功后继均未识别到，按当前执行策略重试或结束。"
+                } else {
+                    "否则：所有错误后继均未成功，按当前执行策略重试或结束。"
+                },
+            ),
+        )
     }
 
     private fun transitionDescription(reference: PipelineReference): String = buildString {
