@@ -729,8 +729,27 @@ internal class PipelineFlowPanel(
         val branchKey = "${logicNodeKey(location.name, location.sourceFile ?: file)}:$fieldName"
         val isError = fieldName == "on_error"
         val title = if (isError) "错误后继 · 识别超时或动作失败" else "成功后继 · 按 JSON 顺序尝试"
-        appendLogicRow(rows, "$branchKey:title", depth) {
-            addLogicLine(title, container = it, emphasis = true)
+        val editableFieldName = fieldName
+            .takeIf { it == "next" || it == "on_error" }
+            ?.takeIf { location.sourceFile == null || location.sourceFile == file }
+            ?.takeIf { !hasTaskOverride(location, it) }
+        val editableField = when (editableFieldName) {
+            "next" -> location.nextField
+            "on_error" -> location.onErrorField
+            else -> null
+        }
+        appendLogicRow(rows, "$branchKey:title", depth) { panel ->
+            val header = JPanel(BorderLayout()).apply { isOpaque = false }
+            addLogicLine(title, container = header, emphasis = true)
+            if (editableField != null && editableFieldName != null) {
+                header.add(JButton("+").apply {
+                    toolTipText = "添加一个${referenceFieldLabel(editableFieldName)}"
+                    isFocusable = false
+                    isEnabled = !currentModel.isGenerated
+                    addActionListener { addReference(editableField, editableFieldName) }
+                }, BorderLayout.EAST)
+            }
+            panel.add(header)
         }
         if (hasTaskOverride(location, fieldName)) {
             appendLogicNote(rows, "$branchKey:override", depth, "字段来自当前任务的 pipeline_override；它替换默认列表。")
@@ -746,17 +765,13 @@ internal class PipelineFlowPanel(
         val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
         references.forEachIndexed { index, reference ->
             val candidateKey = "$branchKey:$index"
-            val editableField = fieldName
-                .takeIf { it == "next" || it == "on_error" }
-                ?.takeIf { location.sourceFile == null || location.sourceFile == file }
-                ?.takeIf { !hasTaskOverride(location, it) }
             appendLogicRow(rows, "$candidateKey:card", depth, 120) {
                 addLogicCandidateCard(
                     index = index,
                     reference = reference,
                     container = it,
                     traceNodeName = location.name,
-                    editableField = editableField,
+                    editableField = editableFieldName,
                     sourceLocation = location,
                     referenceCount = references.size,
                 )
