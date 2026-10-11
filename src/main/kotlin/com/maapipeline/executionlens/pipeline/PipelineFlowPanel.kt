@@ -485,8 +485,8 @@ internal class PipelineFlowPanel(
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             addControlFlowExplanation(effectiveNode(location))
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
-            addReferences("后继", location.next, location.nextField)
-            addReferences("错误后继", location.onError, location.onErrorField)
+            addReferences("后继", location.next, location.nextField, "next")
+            addReferences("错误后继", location.onError, location.onErrorField, "on_error")
             addReferences("嵌套节点引用", location.embeddedReferences)
         }
         detailsPanel.revalidate()
@@ -746,8 +746,20 @@ internal class PipelineFlowPanel(
         val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
         references.forEachIndexed { index, reference ->
             val candidateKey = "$branchKey:$index"
+            val editableField = fieldName
+                .takeIf { it == "next" || it == "on_error" }
+                ?.takeIf { location.sourceFile == null || location.sourceFile == file }
+                ?.takeIf { !hasTaskOverride(location, it) }
             appendLogicRow(rows, "$candidateKey:card", depth, 120) {
-                addLogicCandidateCard(index, reference, it, location.name)
+                addLogicCandidateCard(
+                    index = index,
+                    reference = reference,
+                    container = it,
+                    traceNodeName = location.name,
+                    editableField = editableField,
+                    sourceLocation = location,
+                    referenceCount = references.size,
+                )
             }
             val target = reference.target
             val targetLocation = target?.let { targetNode ->
@@ -837,6 +849,9 @@ internal class PipelineFlowPanel(
         reference: PipelineReference,
         container: JPanel = logicPanel,
         traceNodeName: String? = null,
+        editableField: String? = null,
+        sourceLocation: PipelineNodeLocation? = null,
+        referenceCount: Int = 1,
     ) {
         val traceOutcome = currentTrace?.let { trace ->
             listOf(reference.targetName, reference.displayName)
@@ -868,10 +883,32 @@ internal class PipelineFlowPanel(
             )
             alignmentX = LEFT_ALIGNMENT
         }
-        card.add(
-            createNavigationLabel(heading) { navigateToReference(reference) },
-            BorderLayout.NORTH,
-        )
+        val header = JPanel(BorderLayout()).apply { isOpaque = false }
+        header.add(createNavigationLabel(heading) { navigateToReference(reference) }, BorderLayout.CENTER)
+        if (editableField != null && sourceLocation != null) {
+            val fieldLabel = referenceFieldLabel(editableField)
+            header.add(JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+                isOpaque = false
+                if (reference.isString) {
+                    add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack, !currentModel.isGenerated) {
+                        toggleReferenceMarker(reference, "[JumpBack]", it)
+                    })
+                    add(createMarkerButton("锚", "切换 Anchor 前缀", reference.isAnchor, !currentModel.isGenerated) {
+                        toggleReferenceMarker(reference, "[Anchor]", it)
+                    })
+                }
+                add(createReorderButton("↑", "将此${fieldLabel}前移", index > 0 && !currentModel.isGenerated) {
+                    moveReference(sourceLocation, editableField, index, -1)
+                })
+                add(createReorderButton("↓", "将此${fieldLabel}后移", index < referenceCount - 1 && !currentModel.isGenerated) {
+                    moveReference(sourceLocation, editableField, index, 1)
+                })
+                add(createReorderButton("×", "删除此${fieldLabel}", !currentModel.isGenerated) {
+                    removeReference(sourceLocation, editableField, index)
+                })
+            }, BorderLayout.EAST)
+        }
+        card.add(header, BorderLayout.NORTH)
         val details = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
@@ -1237,6 +1274,7 @@ internal class PipelineFlowPanel(
         title: String,
         references: List<PipelineReference>,
         field: PipelineFieldLocation? = null,
+        fieldName: String? = null,
     ) {
         val body = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -1267,7 +1305,7 @@ internal class PipelineFlowPanel(
                         marker = marker,
                         reference = reference,
                         states = states,
-                        allowReorder = title == "后继",
+                        fieldName = fieldName,
                         referenceCount = references.size,
                     ),
                 )
@@ -1290,10 +1328,10 @@ internal class PipelineFlowPanel(
                 isOpaque = false
                 if (field != null) {
                     add(JButton("+").apply {
-                        toolTipText = "添加一个字符串后继"
+                        toolTipText = "添加一个${referenceFieldLabel(fieldName)}"
                         isFocusable = false
                         isEnabled = !currentModel.isGenerated
-                        addActionListener { addReference(field) }
+                        addActionListener { addReference(field, fieldName) }
                     })
                 }
                 add(foldMarker)
@@ -1307,13 +1345,13 @@ internal class PipelineFlowPanel(
         detailsPanel.add(section)
     }
 
-    private fun addReference(field: PipelineFieldLocation) {
+    private fun addReference(field: PipelineFieldLocation, fieldName: String? = field.name) {
         if (!ensureEditable()) return
         val snapshot = captureEditSnapshot()
         val targetName = Messages.showInputDialog(
             project,
-            "输入要追加的目标节点名（可带 [JumpBack] 或 [Anchor] 前缀）：",
-            "添加 Pipeline 后继",
+            "输入要追加的${referenceFieldLabel(fieldName)}名称（可带 [JumpBack] 或 [Anchor] 前缀）：",
+            "添加 Pipeline ${referenceFieldLabel(fieldName)}",
             null,
             "",
             null,
@@ -1330,11 +1368,11 @@ internal class PipelineFlowPanel(
             "[$currentValue, $quotedName]"
         }
         val edit = PipelineJsonTextEdits.replacementEdit(range, currentValue, replacement)
-        if (!confirmDocumentChange("添加 Pipeline 后继", currentValue, replacement, edits = listOf(edit))) return
+        if (!confirmDocumentChange("添加 Pipeline ${referenceFieldLabel(fieldName)}", currentValue, replacement, edits = listOf(edit))) return
         if (!ensureEditable()) return
         WriteCommandAction.runWriteCommandAction(
             project,
-            "添加 Pipeline 后继",
+            "添加 Pipeline ${referenceFieldLabel(fieldName)}",
             "MaaPipeline JSON Execution Lens",
             Runnable {
                 editor.document.replaceString(edit.range.startOffset, edit.range.endOffset, edit.replacement)
@@ -1347,7 +1385,7 @@ internal class PipelineFlowPanel(
         marker: String,
         reference: PipelineReference,
         states: List<String>,
-        allowReorder: Boolean,
+        fieldName: String?,
         referenceCount: Int,
     ): JComponent {
         val card = JPanel(BorderLayout()).apply {
@@ -1403,7 +1441,8 @@ internal class PipelineFlowPanel(
                 border = JBUI.Borders.emptyTop(2)
             }, BorderLayout.SOUTH)
         }
-        if (allowReorder) {
+        if (fieldName == "next" || fieldName == "on_error") {
+            val fieldLabel = referenceFieldLabel(fieldName)
             val controls = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
                 isOpaque = false
             }
@@ -1415,20 +1454,26 @@ internal class PipelineFlowPanel(
                     toggleReferenceMarker(reference, "[Anchor]", it)
                 })
             }
-            controls.add(createReorderButton("↑", "将此后继前移", index > 0 && !currentModel.isGenerated) {
-                moveNextReference(index, -1)
+            controls.add(createReorderButton("↑", "将此${fieldLabel}前移", index > 0 && !currentModel.isGenerated) {
+                moveReference(fieldName, index, -1)
             })
-            controls.add(createReorderButton("↓", "将此后继后移", index < referenceCount - 1 && !currentModel.isGenerated) {
-                moveNextReference(index, 1)
+            controls.add(createReorderButton("↓", "将此${fieldLabel}后移", index < referenceCount - 1 && !currentModel.isGenerated) {
+                moveReference(fieldName, index, 1)
             })
-            controls.add(createReorderButton("×", "删除此后继", !currentModel.isGenerated) {
-                removeNextReference(index)
+            controls.add(createReorderButton("×", "删除此$fieldLabel", !currentModel.isGenerated) {
+                removeReference(fieldName, index)
             })
             card.add(controls, BorderLayout.EAST)
         }
         // BoxLayout 的纵向布局会按最大高度拉伸组件；卡片高度必须锁定为自身内容高度。
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         return card
+    }
+
+    private fun referenceFieldLabel(fieldName: String?): String = when (fieldName) {
+        "on_error" -> "错误后继"
+        "next" -> "后继"
+        else -> "引用"
     }
 
     private fun createMarkerButton(
@@ -2226,14 +2271,19 @@ internal class PipelineFlowPanel(
         return value
     }
 
-    private fun moveNextReference(index: Int, direction: Int) {
+    private fun moveReference(fieldName: String?, index: Int, direction: Int) {
         val node = currentModel.nodes.getOrNull(nodeList.selectedIndex) ?: return
+        moveReference(node, fieldName, index, direction)
+    }
+
+    private fun moveReference(node: PipelineNodeLocation, fieldName: String?, index: Int, direction: Int) {
+        val references = referencesForField(node, fieldName)
         val targetIndex = index + direction
-        if (targetIndex !in node.next.indices) return
+        if (targetIndex !in references.indices) return
         if (!ensureEditable()) return
 
-        val currentRange = node.next[index].range
-        val targetRange = node.next[targetIndex].range
+        val currentRange = references[index].range
+        val targetRange = references[targetIndex].range
         val lowerRange: TextRange
         val higherRange: TextRange
         if (currentRange.startOffset < targetRange.startOffset) {
@@ -2245,14 +2295,15 @@ internal class PipelineFlowPanel(
         }
         val lowerText = editor.document.getText(lowerRange)
         val higherText = editor.document.getText(higherRange)
-        if (!confirmDocumentChange("调整 Pipeline next 顺序", lowerText + "\n" + higherText, higherText + "\n" + lowerText,
+        val fieldLabel = referenceFieldLabel(fieldName)
+        if (!confirmDocumentChange("调整 Pipeline $fieldLabel 顺序", lowerText + "\n" + higherText, higherText + "\n" + lowerText,
                 edits = listOf(PipelineTextEdit(lowerRange, higherText), PipelineTextEdit(higherRange, lowerText)))) return
         if (!ensureEditable()) return
 
         // 两次替换按源码位置从后往前执行，防止前一个值长度变化使后一个范围失效。
         WriteCommandAction.runWriteCommandAction(
             project,
-            "调整 Pipeline next 顺序",
+            "调整 Pipeline $fieldLabel 顺序",
             "MaaPipeline JSON Execution Lens",
             Runnable {
                 editor.document.replaceString(higherRange.startOffset, higherRange.endOffset, lowerText)
@@ -2261,24 +2312,41 @@ internal class PipelineFlowPanel(
         )
     }
 
-    private fun removeNextReference(index: Int) {
+    private fun removeReference(fieldName: String?, index: Int) {
         val node = currentModel.nodes.getOrNull(nodeList.selectedIndex) ?: return
-        val reference = node.next.getOrNull(index) ?: return
+        removeReference(node, fieldName, index)
+    }
+
+    private fun removeReference(node: PipelineNodeLocation, fieldName: String?, index: Int) {
+        val references = referencesForField(node, fieldName)
+        val reference = references.getOrNull(index) ?: return
         if (!ensureEditable()) return
-        val edits = if (node.nextField?.valueRange == reference.range) {
+        val field = when (fieldName) {
+            "on_error" -> node.onErrorField
+            "next" -> node.nextField
+            else -> null
+        }
+        val edits = if (field?.valueRange == reference.range) {
             listOf(PipelineTextEdit(reference.range, "[]"))
         } else {
             PipelineJsonTextEdits.deletionEdits(editor.document.text, reference.range)
         }
         val oldText = editor.document.getText(reference.range)
-        if (!confirmDocumentChange("删除 Pipeline 后继", oldText, "（删除）", edits = edits)) return
+        val fieldLabel = referenceFieldLabel(fieldName)
+        if (!confirmDocumentChange("删除 Pipeline $fieldLabel", oldText, "（删除）", edits = edits)) return
         if (!ensureEditable()) return
         WriteCommandAction.runWriteCommandAction(
             project,
-            "删除 Pipeline 后继",
+            "删除 Pipeline $fieldLabel",
             "MaaPipeline JSON Execution Lens",
             Runnable { edits.forEach { editor.document.replaceString(it.range.startOffset, it.range.endOffset, it.replacement) } },
         )
+    }
+
+    private fun referencesForField(node: PipelineNodeLocation, fieldName: String?): List<PipelineReference> = when (fieldName) {
+        "on_error" -> node.onError
+        "next" -> node.next
+        else -> emptyList()
     }
 
     private fun addNode() {
