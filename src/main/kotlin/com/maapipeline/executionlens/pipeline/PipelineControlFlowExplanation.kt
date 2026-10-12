@@ -2,6 +2,7 @@ package com.maapipeline.executionlens.pipeline
 
 internal enum class PipelineControlFlowLineKind {
     DESCRIPTION,
+    ACTION,
     RETRY_POLICY,
     SUCCESS_CANDIDATE,
     ERROR_CANDIDATE,
@@ -19,9 +20,12 @@ internal object PipelineControlFlowExplanation {
         add(
             PipelineControlFlowLine(
                 kind = PipelineControlFlowLineKind.DESCRIPTION,
-                text = "当前节点完成后，按后继列表顺序尝试第一个识别成功的候选。",
+                text = "进入条件：${PipelineConditionSummary.entryCondition(node)}。",
             ),
         )
+        PipelineConditionSummary.action(node)?.let { action ->
+            add(PipelineControlFlowLine(PipelineControlFlowLineKind.ACTION, action))
+        }
         if (!node.executionPolicy.isEmpty()) {
             add(
                 PipelineControlFlowLine(
@@ -31,14 +35,14 @@ internal object PipelineControlFlowExplanation {
             )
         }
         addCandidates(
-            references = node.next,
-            kind = PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
-            description = "成功分支",
-        )
-        addCandidates(
             references = node.onError,
             kind = PipelineControlFlowLineKind.ERROR_CANDIDATE,
             description = "错误分支（识别超时或动作失败）",
+        )
+        addCandidates(
+            references = node.next,
+            kind = PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
+            description = "成功分支",
         )
         if (node.next.isEmpty() && node.onError.isEmpty()) {
             add(
@@ -59,25 +63,16 @@ internal object PipelineControlFlowExplanation {
         kind: PipelineControlFlowLineKind,
         description: String,
     ) {
-        if (references.isEmpty()) {
-            add(
-                PipelineControlFlowLine(
-                    kind = PipelineControlFlowLineKind.TERMINAL,
-                    text = "$description：未声明。",
-                ),
-            )
-            return
-        }
+        if (references.isEmpty()) return
         references.forEachIndexed { index, reference ->
-            val branch = when {
-                index == 0 -> "如果"
-                kind == PipelineControlFlowLineKind.SUCCESS_CANDIDATE -> "否则如果"
-                else -> "否则如果"
-            }
+            val branch = PipelineConditionSummary.candidatePrefix(
+                index = index,
+                fieldName = if (kind == PipelineControlFlowLineKind.ERROR_CANDIDATE) "on_error" else "next",
+            )
             add(
                 PipelineControlFlowLine(
                     kind = kind,
-                    text = "${branch}识别到${transitionDescription(reference)} → ${reference.targetName}",
+                    text = "${branch}${PipelineConditionSummary.candidateLabel(reference)} → ${reference.targetName}",
                     reference = reference,
                 ),
             )
@@ -88,18 +83,10 @@ internal object PipelineControlFlowExplanation {
                 text = if (kind == PipelineControlFlowLineKind.SUCCESS_CANDIDATE) {
                     "否则：所有成功后继均未识别到，按当前执行策略重试或结束。"
                 } else {
-                    "否则：所有错误后继均未成功，按当前执行策略重试或结束。"
+                    "否则：失败后继均未成功，按当前执行策略处理。"
                 },
             ),
         )
     }
 
-    private fun transitionDescription(reference: PipelineReference): String = buildString {
-        if (reference.isAnchor) append(" Anchor 动态目标") else append("目标")
-        if (reference.isJumpBack) append("，执行完成后返回父流程")
-        if (reference.isCrossFile) append("，跨文件")
-        if (reference.isAmbiguousTarget) append("，名称不唯一")
-        if (!reference.targetExists && !reference.isAnchor) append("，目标未解析")
-        if (reference.isAnchorUnresolved) append("，Anchor 未解析")
-    }
 }

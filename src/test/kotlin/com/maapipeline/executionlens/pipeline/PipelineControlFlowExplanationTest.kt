@@ -31,19 +31,19 @@ class PipelineControlFlowExplanationTest {
         assertEquals(
             listOf(
                 PipelineControlFlowLineKind.DESCRIPTION,
-                PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
-                PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
-                PipelineControlFlowLineKind.TERMINAL,
                 PipelineControlFlowLineKind.ERROR_CANDIDATE,
+                PipelineControlFlowLineKind.TERMINAL,
+                PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
+                PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
                 PipelineControlFlowLineKind.TERMINAL,
             ),
             lines.map { it.kind },
         )
-        assertEquals("如果识别到目标 → Check", lines[1].text)
-        assertEquals("否则如果识别到目标 → Fallback", lines[2].text)
-        assertEquals("否则：所有成功后继均未识别到，按当前执行策略重试或结束。", lines[3].text)
-        assertEquals("如果识别到目标 → Recover", lines[4].text)
-        assertSame(first, lines[1].reference)
+        assertEquals("失败时如果节点可执行 → Recover", lines[1].text)
+        assertEquals("如果节点可执行 → Check", lines[3].text)
+        assertEquals("否则如果节点可执行 → Fallback", lines[4].text)
+        assertEquals("否则：所有成功后继均未识别到，按当前执行策略重试或结束。", lines[5].text)
+        assertSame(first, lines[3].reference)
     }
 
     @Test
@@ -66,9 +66,9 @@ class PipelineControlFlowExplanationTest {
 
         val lines = PipelineControlFlowExplanation.explain(node)
 
-        assertEquals("如果识别到 Anchor 动态目标，执行完成后返回父流程，跨文件 → Checkpoint", lines[1].text)
+        assertEquals("如果运行时 Anchor Checkpoint 已解析，完成后返回父流程，跨文件 → Checkpoint", lines[1].text)
         assertEquals("否则：所有成功后继均未识别到，按当前执行策略重试或结束。", lines[2].text)
-        assertEquals("错误分支（识别超时或动作失败）：未声明。", lines[3].text)
+        assertEquals(3, lines.size)
     }
 
     @Test

@@ -41,6 +41,7 @@ data class PipelineFieldLocation(
     val valueRange: TextRange = range,
     val isString: Boolean = false,
     val references: List<PipelineReference> = emptyList(),
+    val sourceFile: VirtualFile? = null,
 )
 
 data class PipelineExecutionPolicy(
@@ -511,9 +512,12 @@ internal object PipelineDocumentIndexer {
                         val fields = (targetProperty.value as? JsonObject)
                             ?.propertyList
                             ?.mapNotNull { property ->
-                                property.toFieldLocation()?.let { field ->
+                                property.toContextualField(targetProperty.value as? JsonObject)?.let { field ->
                                     // 覆盖字段的范围属于任务文件，供有效控制流回跳到正确的 JSON 来源。
-                                    field.copy(references = field.references.map { it.copy(sourceFile = taskFile) })
+                                    field.copy(
+                                        references = field.references.map { it.copy(sourceFile = taskFile) },
+                                        sourceFile = taskFile,
+                                    )
                                 }
                             }
                             .orEmpty()
@@ -561,8 +565,8 @@ internal object PipelineDocumentIndexer {
         if (valueObject == null) return this
         return copy(
             description = valueObject.findProperty("desc")?.value?.let(::scalarText),
-            recognition = valueObject.findProperty("recognition")?.toFieldLocation(),
-            action = valueObject.findProperty("action")?.toFieldLocation(),
+            recognition = valueObject.findProperty("recognition")?.toContextualField(valueObject),
+            action = valueObject.findProperty("action")?.toContextualField(valueObject),
             nextField = valueObject.findProperty("next")?.toFieldLocation(),
             next = valueObject.findProperty("next")?.toReferences(PipelineReferenceKind.NEXT).orEmpty(),
             onErrorField = valueObject.findProperty("on_error")?.toFieldLocation(),
@@ -627,13 +631,22 @@ internal object PipelineDocumentIndexer {
         }
     }
 
-    private fun JsonProperty.toFieldLocation(): PipelineFieldLocation? {
+    private fun JsonProperty.toContextualField(owner: JsonObject?): PipelineFieldLocation? {
+        val summary = when (name) {
+            "recognition" -> summarizeRecognition(value, owner)
+            "action" -> summarizeAction(value, owner)
+            else -> null
+        }
+        return toFieldLocation(summary)
+    }
+
+    private fun JsonProperty.toFieldLocation(summaryOverride: String? = null): PipelineFieldLocation? {
         val value = value ?: return null
         val range = textRange ?: return null
         val valueRange = value.textRange ?: range
         return PipelineFieldLocation(
             name = name,
-            summary = summarizeValue(value),
+            summary = summaryOverride ?: summarizeValue(value),
             range = range,
             valueRange = valueRange,
             isString = value.text.trim().let { it.startsWith("\"") && it.endsWith("\"") },
@@ -643,6 +656,72 @@ internal object PipelineDocumentIndexer {
                 else -> emptyList()
             },
         )
+    }
+
+    private fun summarizeRecognition(value: JsonValue?, owner: JsonObject?): String? =
+        summarizeTypedCondition(value, owner, isAction = false)
+
+    private fun summarizeAction(value: JsonValue?, owner: JsonObject?): String? =
+        summarizeTypedCondition(value, owner, isAction = true)
+
+    private fun summarizeTypedCondition(value: JsonValue?, owner: JsonObject?, isAction: Boolean): String? {
+        value ?: return null
+        val valueObject = value as? JsonObject
+        val type = valueObject?.findProperty("type")?.value?.let(::scalarText)
+            ?: scalarText(value.text)
+        if (type.isEmpty()) return null
+
+        val parameterObject = valueObject?.findProperty("param")?.value as? JsonObject
+        val detailOwner = parameterObject ?: owner
+        val details = mutableListOf<String>()
+        if (isAction) {
+            addSummaryDetail(details, owner, "custom_action", "实现")
+            addSummaryDetail(details, owner, "custom_action_param", "参数")
+            listOf("target", "begin", "end", "duration", "index", "contact").forEach { key ->
+                addSummaryDetail(details, detailOwner, key, key)
+            }
+        } else {
+            val allOf = owner?.findProperty("all_of")?.value as? JsonArray
+            val anyOf = owner?.findProperty("any_of")?.value as? JsonArray
+            when {
+                allOf != null -> details += "全部满足：${summarizeConditionList(allOf)}"
+                anyOf != null -> details += "任一满足：${summarizeConditionList(anyOf)}"
+                else -> {
+                    addSummaryDetail(details, detailOwner, "expected", "文本")
+                    addSummaryDetail(details, detailOwner, "template", "模板")
+                    addSummaryDetail(details, detailOwner, "roi", "区域")
+                    addSummaryDetail(details, detailOwner, "roi_offset", "区域偏移")
+                    addSummaryDetail(details, owner, "custom_recognition", "实现")
+                    addSummaryDetail(details, owner, "custom_recognition_param", "参数")
+                    addSummaryDetail(details, detailOwner, "threshold", "阈值")
+                    addSummaryDetail(details, detailOwner, "box_index", "框")
+                }
+            }
+        }
+        return if (details.isEmpty()) type else compactSummary("$type（${details.joinToString("，")}）")
+    }
+
+    private fun summarizeConditionList(array: JsonArray): String = array.valueList
+        .take(4)
+        .joinToString("；") { item ->
+            val objectValue = item as? JsonObject
+            val nested = objectValue?.findProperty("recognition")
+            if (nested != null) {
+                summarizeTypedCondition(nested.value, objectValue, isAction = false) ?: summarizeInlineValue(item)
+            } else {
+                summarizeInlineValue(item)
+            }
+        }
+        .let { summary -> if (array.valueList.size > 4) "$summary；…" else summary }
+
+    private fun addSummaryDetail(
+        details: MutableList<String>,
+        owner: JsonObject?,
+        propertyName: String,
+        label: String,
+    ) {
+        val value = owner?.findProperty(propertyName)?.value ?: return
+        details += "$label=${summarizeInlineValue(value)}"
     }
 
     private fun JsonProperty.toReferences(kind: PipelineReferenceKind): List<PipelineReference> {
@@ -735,15 +814,54 @@ internal object PipelineDocumentIndexer {
     private fun summarizeValue(value: com.intellij.json.psi.JsonValue): String {
         val objectValue = value as? JsonObject
         val type = objectValue?.findProperty("type")?.value?.let(::scalarText)
-        if (type != null) return type
         if (objectValue != null) {
-            return objectValue.propertyList.joinToString(", ") { property ->
-                val propertyValue = property.value?.let(::scalarText) ?: ""
-                "${property.name} → $propertyValue"
-            }.ifEmpty { "{}" }
+            val properties = objectValue.propertyList
+                .filterNot { it.name == "type" }
+                .take(4)
+                .joinToString(", ") { property ->
+                    "${property.name}=${summarizeInlineValue(property.value)}"
+                }
+            return compactSummary(when {
+                type == null && properties.isEmpty() -> "{}"
+                type == null -> properties
+                properties.isEmpty() -> type
+                else -> "$type（$properties）"
+            })
         }
-        return scalarText(value.text)
+        return compactSummary(scalarText(value.text))
     }
+
+    private fun summarizeInlineValue(value: JsonValue?, depth: Int = 0): String = when (value) {
+        null -> ""
+        is JsonObject -> {
+            val type = value.findProperty("type")?.value?.let(::scalarText)
+            if (depth >= 2) {
+                if (type.isNullOrEmpty()) "{…}" else type
+            } else {
+                val visibleProperties = value.propertyList.filterNot { it.name == "type" }.take(3)
+                val properties = visibleProperties.joinToString(", ") { property ->
+                    "${property.name}=${summarizeInlineValue(property.value, depth + 1)}"
+                }
+                val suffix = if (value.propertyList.count { it.name != "type" } > visibleProperties.size) ", …" else ""
+                when {
+                    type != null && properties.isNotEmpty() -> "$type{$properties$suffix}"
+                    type != null -> type
+                    properties.isNotEmpty() -> "{$properties$suffix}"
+                    else -> "{}"
+                }
+            }
+        }
+
+        is JsonArray -> {
+            val values = value.valueList.take(3).joinToString(", ") { item -> summarizeInlineValue(item, depth + 1) }
+            if (value.valueList.size > 3) "[$values, …]" else "[$values]"
+        }
+
+        else -> scalarText(value.text)
+    }
+
+    private fun compactSummary(value: String): String =
+        value.take(180).let { if (it.length < value.length) "$it…" else it }
 
     private fun scalarText(value: JsonValue): String = scalarText(value.text)
 
