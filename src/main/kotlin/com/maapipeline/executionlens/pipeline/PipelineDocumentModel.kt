@@ -49,7 +49,11 @@ data class PipelineFieldLocation(
     val references: List<PipelineReference> = emptyList(),
     val sourceFile: VirtualFile? = null,
     val isDerived: Boolean = false,
+    val readingSummary: String? = null,
+    val readingDetails: List<PipelineConditionDetail> = emptyList(),
 )
+
+data class PipelineConditionDetail(val text: String, val depth: Int = 0)
 
 data class PipelineExecutionPolicy(
     val timeout: PipelineFieldLocation? = null,
@@ -101,6 +105,8 @@ data class PipelineNodeTarget(
     val recognitionSummary: String?,
     val actionSummary: String?,
     val nextCount: Int,
+    val recognitionCondition: String? = null,
+    val recognitionDetails: List<PipelineConditionDetail> = emptyList(),
 )
 
 data class PipelineAnchorDefinition(
@@ -373,7 +379,8 @@ internal object PipelineDocumentIndexer {
             fun field(name: String, parsed: PipelineFieldLocation?, original: PipelineFieldLocation?): PipelineFieldLocation? {
                 if (parsed == null) return null
                 val source = changedFields[name] ?: original ?: changedFields.values.lastOrNull() ?: return parsed
-                return source.copy(name = name, summary = parsed.summary, isDerived = true)
+                return source.copy(name = name, summary = parsed.summary, readingSummary = parsed.readingSummary,
+                    readingDetails = parsed.readingDetails, isDerived = true)
             }
             fun references(name: String, original: List<PipelineReference>): List<PipelineReference> =
                 changedFields[name]?.references ?: original
@@ -439,6 +446,8 @@ internal object PipelineDocumentIndexer {
             nameRange = node.nameRange,
             description = node.description,
             recognitionSummary = node.recognition?.summary,
+            recognitionCondition = node.recognition?.readingSummary,
+            recognitionDetails = node.recognition?.readingDetails.orEmpty(),
             actionSummary = node.action?.summary,
             nextCount = node.next.size,
         )
@@ -806,7 +815,10 @@ internal object PipelineDocumentIndexer {
             "action" -> summarizeAction(value, owner)
             else -> null
         }
-        return toFieldLocation(summary)
+        return toFieldLocation(summary)?.let { field ->
+            if (name == "recognition") field.copy(readingSummary = summarizeRecognitionForFlow(value, owner),
+                readingDetails = recognitionDetails(value, owner)) else field
+        }
     }
 
     private fun JsonProperty.toFieldLocation(summaryOverride: String? = null): PipelineFieldLocation? {
@@ -830,8 +842,90 @@ internal object PipelineDocumentIndexer {
     private fun summarizeRecognition(value: JsonValue?, owner: JsonObject?): String? =
         summarizeTypedCondition(value, owner, isAction = false)
 
+    private fun summarizeRecognitionForFlow(value: JsonValue?, owner: JsonObject?, depth: Int = 0): String {
+        val typed = value as? JsonObject
+        val type = typed?.findProperty("type")?.value?.let(::scalarText)
+            ?: value?.let(::scalarText) ?: "DirectHit"
+        val parameters = typed?.findProperty("param")?.value as? JsonObject
+        fun parameter(name: String): JsonValue? =
+            parameters?.findProperty(name)?.value ?: typed?.findProperty(name)?.value ?: owner?.findProperty(name)?.value
+        val condition = when (type) {
+            "DirectHit" -> "无条件执行"
+            "Custom" -> parameter("custom_recognition")?.let(::scalarText)
+                ?.let { "自定义(${it.take(40)}${if (it.length > 40) "…" else ""})" } ?: "自定义"
+            "And", "Or" -> {
+                val children = parameter(if (type == "And") "all_of" else "any_of") as? JsonArray
+                if (depth >= 3) "$type(…)" else children?.valueList?.let { values ->
+                    val parts = values.take(4).map { child ->
+                        val childObject = child as? JsonObject
+                        val recognition = childObject?.findProperty("recognition")?.value
+                        when {
+                            recognition != null -> summarizeRecognitionForFlow(recognition, childObject, depth + 1)
+                            childObject?.findProperty("type") != null -> summarizeRecognitionForFlow(child, childObject, depth + 1)
+                            childObject != null -> summarizeRecognitionForFlow(null, childObject, depth + 1)
+                            else -> "引用(${scalarText(child).take(32)})"
+                        }
+                    } + if (values.size > 4) listOf("…") else emptyList()
+                    "$type(${parts.joinToString(", ")})"
+                } ?: "$type(?)"
+            }
+            else -> type.take(48)
+        }
+        return if (parameter("inverse")?.text == "true") "Not($condition)" else condition
+    }
+
     private fun summarizeAction(value: JsonValue?, owner: JsonObject?): String? =
         summarizeTypedCondition(value, owner, isAction = true)
+
+    private fun recognitionDetails(value: JsonValue?, owner: JsonObject?): List<PipelineConditionDetail> = buildList {
+        fun short(text: String): String = text.take(110) + if (text.length > 110) "…" else ""
+        fun visit(current: JsonValue?, context: JsonObject?, depth: Int) {
+            if (size >= 11) {
+                if (size == 11) add(PipelineConditionDetail("…其余条件见详情"))
+                return
+            }
+            val typed = current as? JsonObject
+            val type = typed?.findProperty("type")?.value?.let(::scalarText) ?: current?.let(::scalarText) ?: "DirectHit"
+            val parameters = typed?.findProperty("param")?.value as? JsonObject
+            fun parameter(name: String): JsonValue? =
+                parameters?.findProperty(name)?.value ?: typed?.findProperty(name)?.value ?: context?.findProperty(name)?.value
+            val title = if (type == "DirectHit") "无条件执行" else if (type == "Custom") "自定义" else type
+            val heading = if (parameter("inverse")?.text == "true") "Not($title)" else title
+            if (type == "And" || type == "Or") {
+                add(PipelineConditionDetail("$heading（${if (type == "And") "全部满足" else "任一满足"}）", depth))
+                val children = parameter(if (type == "And") "all_of" else "any_of") as? JsonArray
+                if (depth >= 3) {
+                    add(PipelineConditionDetail("…展开条件见详情", depth + 1))
+                    return
+                }
+                children?.valueList?.take(4)?.forEach { child ->
+                    val childObject = child as? JsonObject
+                    when {
+                        childObject?.findProperty("recognition") != null -> visit(childObject.findProperty("recognition")?.value, childObject, depth + 1)
+                        childObject?.findProperty("type") != null -> visit(child, childObject, depth + 1)
+                        childObject != null -> visit(null, childObject, depth + 1)
+                        size < 11 -> add(PipelineConditionDetail(short("引用：${scalarText(child)}"), depth + 1))
+                    }
+                }
+                if (children != null && children.valueList.size > 4 && size < 12) {
+                    add(PipelineConditionDetail("…另有 ${children.valueList.size - 4} 项，见详情", depth + 1))
+                }
+            } else {
+                val keys = when (type) {
+                    "OCR" -> listOf("expected" to "文本", "roi" to "区域")
+                    "TemplateMatch", "FeatureMatch" -> listOf("template" to "模板", "threshold" to "阈值", "roi" to "区域")
+                    "ColorMatch" -> listOf("lower" to "下限", "upper" to "上限", "roi" to "区域")
+                    "Custom" -> listOf("custom_recognition" to "实现")
+                    else -> listOf("model" to "模型", "expected" to "期望", "threshold" to "阈值")
+                }
+                val parametersText = keys.mapNotNull { (key, label) ->
+                    parameter(key)?.let { "$label=${summarizeInlineValue(it)}" }
+                }
+                add(PipelineConditionDetail(short((listOf(heading) + parametersText).joinToString(" · ")), depth))
+            }
+        }
+        visit(value, owner, 0)
+    }
 
     private fun summarizeTypedCondition(value: JsonValue?, owner: JsonObject?, isAction: Boolean): String? {
         value ?: return null

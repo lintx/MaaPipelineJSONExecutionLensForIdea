@@ -60,7 +60,7 @@ internal object PipelineControlFlowExplanation {
             add(
                 PipelineControlFlowLine(
                     kind = kind,
-                    text = "${branch}${PipelineConditionSummary.candidateLabel(reference)} → ${reference.targetName}",
+                    text = "$branch ${PipelineConditionSummary.candidateLabel(reference, fieldName = if (kind == PipelineControlFlowLineKind.ERROR_CANDIDATE) "on_error" else "next")} → ${reference.targetName}",
                     reference = reference,
                 ),
             )

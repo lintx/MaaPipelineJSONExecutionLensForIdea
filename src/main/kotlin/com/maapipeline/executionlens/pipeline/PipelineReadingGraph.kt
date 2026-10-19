@@ -11,6 +11,10 @@ internal class PipelineReadingGraph(
     private var cachedRoot: String? = null
     private var cachedParents: Map<String, Pair<String, String>?> = emptyMap()
     val anchorFlow by lazy { PipelineAnchorFlow(this, effective) }
+    private val referencedAnchors by lazy {
+        nodes.flatMap { node -> effective(node).let { it.next + it.onError + it.embeddedReferences } }
+            .filter { it.isAnchor }.mapTo(mutableSetOf()) { it.targetName }
+    }
     private val anchors by lazy {
         nodes.flatMap { owner -> effective(owner).anchorDefinitions.map { owner to it } }.groupBy { it.second.name }
     }
@@ -20,6 +24,9 @@ internal class PipelineReadingGraph(
     fun uniqueNode(name: String): PipelineNodeLocation? = byName[name]?.singleOrNull()
 
     fun anchorDefinitions(name: String): List<Pair<PipelineNodeLocation, PipelineAnchorDefinition>> = anchors[name].orEmpty()
+
+    fun visibleAnchorChanges(node: PipelineNodeLocation): List<PipelineAnchorDefinition> =
+        effective(node).anchorDefinitions.filter { it.name in referencedAnchors }
 
     fun successors(node: PipelineNodeLocation): List<Pair<String, PipelineNodeLocation>> {
         val value = effective(node)

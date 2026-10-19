@@ -38,10 +38,10 @@ class PipelineControlFlowExplanationTest {
             ),
             lines.map { it.kind },
         )
-        assertEquals("失败时如果节点可执行 → Recover", lines[1].text)
+        assertEquals("on_error: if 无条件执行 → Recover", lines[1].text)
         assertEquals("重试匹配后继（超时 20000ms，轮次间隔至少 1000ms）", lines[2].text)
-        assertEquals("如果节点可执行 → Check", lines[3].text)
-        assertEquals("否则如果节点可执行 → Fallback", lines[4].text)
+        assertEquals("if 无条件执行 → Check", lines[3].text)
+        assertEquals("else if 无条件执行 → Fallback", lines[4].text)
         assertSame(first, lines[3].reference)
     }
 
@@ -65,7 +65,7 @@ class PipelineControlFlowExplanationTest {
 
         val lines = PipelineControlFlowExplanation.explain(node)
 
-        assertEquals("如果运行时 Anchor Checkpoint 已解析，完成后返回父流程，跨文件 → Checkpoint", lines[2].text)
+        assertEquals("if 运行时 Anchor Checkpoint 已解析，子链结束后从父 next 首项重试，跨文件 → Checkpoint", lines[2].text)
         assertEquals("重试匹配后继（超时 20000ms，轮次间隔至少 1000ms）", lines[1].text)
         assertEquals(3, lines.size)
     }

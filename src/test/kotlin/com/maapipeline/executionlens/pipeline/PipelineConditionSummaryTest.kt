@@ -87,7 +87,7 @@ class PipelineConditionSummaryTest {
             ),
         )
 
-        assertEquals("节点可执行", PipelineConditionSummary.candidateCondition(reference))
+        assertEquals("无条件执行", PipelineConditionSummary.candidateCondition(reference))
     }
 
     @Test
@@ -106,9 +106,53 @@ class PipelineConditionSummaryTest {
 
     @Test
     fun distinguishesErrorCandidatesFromSuccessCandidates() {
-        assertEquals("如果", PipelineConditionSummary.candidatePrefix(0, "next"))
-        assertEquals("否则如果", PipelineConditionSummary.candidatePrefix(1, "next"))
-        assertEquals("失败时如果", PipelineConditionSummary.candidatePrefix(0, "on_error"))
-        assertEquals("失败时否则如果", PipelineConditionSummary.candidatePrefix(1, "on_error"))
+        assertEquals("if", PipelineConditionSummary.candidatePrefix(0, "next"))
+        assertEquals("else if", PipelineConditionSummary.candidatePrefix(1, "next"))
+        assertEquals("on_error: if", PipelineConditionSummary.candidatePrefix(0, "on_error"))
+        assertEquals("on_error: else if", PipelineConditionSummary.candidatePrefix(1, "on_error"))
+    }
+
+    @Test
+    fun flowConditionsAreCompactAndUnconditionalBranchesDoNotPretendToTestAnything() {
+        val node = PipelineNodeLocation("Move", TextRange(0, 1), TextRange(0, 1))
+        assertEquals("无条件执行", PipelineConditionSummary.flowCondition(node))
+        val direct = node.copy(recognition = PipelineFieldLocation("recognition", "DirectHit", TextRange(0, 1)))
+        assertEquals("无条件执行", PipelineConditionSummary.flowCondition(direct))
+        assertEquals("无条件执行", PipelineConditionSummary.entryCondition(direct))
+        val conditional = node.copy(recognition = PipelineFieldLocation("recognition", "And（很长的完整参数）", TextRange(0, 1),
+            readingSummary = "And(OCR, TemplateMatch)"))
+        assertEquals("And(OCR, TemplateMatch)", PipelineConditionSummary.flowCondition(conditional))
+        assertEquals("if And(OCR, TemplateMatch)", PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(conditional)))
+        assertEquals("无条件执行", PipelineConditionSummary.flowBranch(0, "next", "无条件执行"))
+        assertEquals("else 无条件执行", PipelineConditionSummary.flowBranch(1, "next", "无条件执行"))
+        assertEquals("on_error: else if OCR", PipelineConditionSummary.flowBranch(1, "on_error", "OCR"))
+    }
+
+    @Test
+    fun jumpBackExplainsRestartingTheParentsListAndDoesNotApplyToAnErrorChain() {
+        val hint = PipelineConditionSummary.jumpBackHint("Parent", "next")
+        kotlin.test.assertTrue(hint.contains("Parent 的 next 第一项重新尝试"))
+        kotlin.test.assertTrue(hint.contains("不重新执行父节点动作"))
+        kotlin.test.assertTrue(PipelineConditionSummary.jumpBackHint("Parent", "on_error").contains("不触发回跳"))
+        val reference = PipelineReference("Target", "Target", TextRange(0, 1), true, false, targetExists = true)
+        kotlin.test.assertFalse(PipelineConditionSummary.candidateLabel(reference, fieldName = "on_error").contains("重试"))
+    }
+
+    @Test
+    fun optionalAnchorAddsAnEntryGuardAndCertainBindingsStayCompact() {
+        assertEquals("Resume 已绑定", PipelineConditionSummary.anchorCondition("无条件执行", "Resume", true))
+        assertEquals("Resume 已绑定 && And(OCR, TemplateMatch)",
+            PipelineConditionSummary.anchorCondition("And(OCR, TemplateMatch)", "Resume", true))
+        assertEquals("无条件执行", PipelineConditionSummary.anchorCondition("无条件执行", "Resume", false))
+        assertEquals("OCR", PipelineConditionSummary.anchorCondition("OCR", "Resume", false))
+    }
+
+    @Test
+    fun anchorStatementsDistinguishBindingSelfBindingAndClearing() {
+        val range = TextRange(0, 1)
+        val definition = PipelineAnchorDefinition("Resume", range, "Target", false)
+        assertEquals("绑定 Anchor：Resume → Target", PipelineConditionSummary.anchorChange(definition, "Owner"))
+        assertEquals("绑定 Anchor：Resume → Owner", PipelineConditionSummary.anchorChange(definition.copy(targetNodeName = null), "Owner"))
+        assertEquals("清除 Anchor：Resume", PipelineConditionSummary.anchorChange(definition.copy(targetNodeName = null, isCleared = true), "Owner"))
     }
 }

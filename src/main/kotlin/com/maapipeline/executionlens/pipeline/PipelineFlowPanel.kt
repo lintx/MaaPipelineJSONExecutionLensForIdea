@@ -993,7 +993,8 @@ internal class PipelineFlowPanel(
         val isCollapsed = instanceKey in collapsedLogicNodes || nodeKey in collapsedLogicNodes
         val effective = effectiveNode(location)
         val bindings = currentReadingGraph().anchorFlow.afterNode(location, anchorContext)
-        val hasBody = effective.action != null || effective.description != null ||
+        val anchorChanges = currentReadingGraph().visibleAnchorChanges(location)
+        val hasBody = effective.action != null || effective.description != null || anchorChanges.isNotEmpty() ||
             !effective.executionPolicy.isEmpty() || effective.next.isNotEmpty() || effective.onError.isNotEmpty() ||
             effective.embeddedReferences.any { it.kind == PipelineReferenceKind.SUBTASK }
         val previousRow = activeLogicRows.put(nodeKey, "$instanceKey:header")
@@ -1004,7 +1005,7 @@ internal class PipelineFlowPanel(
         logicRowByNode.putIfAbsent(nodeKey, "$instanceKey:header")
         val traceState = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)
         appendLogicRow(rows, "$instanceKey:header", depth, 32,
-            revision = listOf(effectiveNode(location), incoming, isCollapsed, currentTrace, traceState)) { panel ->
+            revision = listOf(effectiveNode(location), incoming, isCollapsed, currentTrace, traceState, hasBody)) { panel ->
             val traceSuffix = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)?.let {
                 " · 本次运行：${it.status.label}"
             }.orEmpty()
@@ -1015,21 +1016,17 @@ internal class PipelineFlowPanel(
                     reference = it.reference,
                     traceNodeName = it.sourceLocation.name,
                     showTargetName = true,
-                    recognitionSummary = effectiveNode(location).recognition?.summary,
+                    conditionSummary = PipelineConditionSummary.flowCondition(effectiveNode(location)),
                     fieldName = it.fieldName,
                     boundTargetName = location.name.takeIf { _ -> it.reference.isAnchor },
+                    anchorMayBeUnset = it.anchorMayBeUnset,
                 )
-            } ?: "如果 ${PipelineConditionSummary.entryCondition(effectiveNode(location))} → ${location.name}$traceSuffix"
-            header.add(createFlowSelectionLabel(headerText + if (hasBody && !isCollapsed) " {" else "", location, incoming?.fieldName == "on_error").apply {
-                font = font.deriveFont(Font.BOLD)
-                incoming?.anchorHint?.let { toolTipText += "；$it" }
-            }, BorderLayout.CENTER)
-            if (sourceFile != file) {
-                header.add(JBLabel(" · ${sourceFile.name}").apply {
-                    foreground = UIUtil.getContextHelpForeground()
-                    toolTipText = displayPath(sourceFile)
-                }, BorderLayout.EAST)
-            }
+            } ?: "${PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(effectiveNode(location)))} → ${location.name}$traceSuffix"
+            header.add(createLogicHeading(
+                headerText + if (hasBody && !isCollapsed) " {" else "", location,
+                incoming?.reference, incoming?.fieldName ?: "next", incoming?.sourceLocation?.name,
+                incoming?.anchorHint, bold = true,
+            ), BorderLayout.CENTER)
             header.add(createFoldMarker(!isCollapsed, location.name) { isExpanded ->
                 if (isExpanded) { collapsedLogicNodes -= instanceKey; collapsedLogicNodes -= nodeKey }
                 else collapsedLogicNodes += instanceKey
@@ -1054,6 +1051,20 @@ internal class PipelineFlowPanel(
         if (isCollapsed) return
         PipelineConditionSummary.action(effective)?.let { action ->
             appendLogicNote(rows, "$instanceKey:action", depth + 1, action)
+        }
+        anchorChanges.forEach { definition ->
+            val text = PipelineConditionSummary.anchorChange(definition, location.name)
+            appendLogicRow(rows, "$instanceKey:anchor:${definition.name}", depth + 1, revision = text) { panel ->
+                panel.add(JBLabel(text).apply {
+                    foreground = UIUtil.getLabelForeground()
+                    border = JBUI.Borders.empty(0, 4)
+                    toolTipText = PipelineFlowTooltip.render(listOf(
+                        PipelineConditionDetail("动作完成后应用 Anchor"),
+                        PipelineConditionDetail("动作成功或失败都会应用。", 1),
+                        PipelineConditionDetail("重试父 next 不会重新应用父节点设置。", 1),
+                    ), getFontMetrics(UIUtil.getLabelFont()))
+                })
+            }
         }
         effective.description?.let { appendLogicNote(rows, "$instanceKey:description", depth + 1, "说明：$it") }
         if (!effective.executionPolicy.isEmpty()) {
@@ -1200,6 +1211,7 @@ internal class PipelineFlowPanel(
                         fieldName = fieldName,
                         referenceCount = references.size,
                         anchorHint = anchorResolution?.hint(),
+                        anchorMayBeUnset = anchorResolution?.value?.mayBeUnset == true,
                     ),
                 )
             }
@@ -1321,10 +1333,11 @@ internal class PipelineFlowPanel(
                 reference = reference,
                 traceNodeName = traceNodeName,
                 showTargetName = showTargetName,
-                recognitionSummary = targetLocation?.let { effectiveNode(it).recognition?.summary },
+                conditionSummary = targetLocation?.let { PipelineConditionSummary.flowCondition(effectiveNode(it)) },
                 fieldName = fieldName,
                 boundTargetName = targetLocation?.name.takeIf { reference.isAnchor },
                 clearedAnchor = anchorResolution?.isCleared == true,
+                anchorMayBeUnset = anchorResolution?.value?.mayBeUnset == true,
             )
         val card = JPanel(BorderLayout()).apply {
             isOpaque = false
@@ -1337,9 +1350,8 @@ internal class PipelineFlowPanel(
             else -> ""
         }
         card.add(
-            createFlowReferenceLabel(heading + boundaryLabel, reference, targetLocation, fieldName == "on_error").apply {
-                anchorResolution?.let { toolTipText = it.hint() }
-            },
+            createLogicHeading(heading + boundaryLabel, targetLocation, reference, fieldName, traceNodeName,
+                anchorResolution?.hint()),
             BorderLayout.CENTER,
         )
         if (editableField != null && sourceLocation != null) {
@@ -1362,21 +1374,20 @@ internal class PipelineFlowPanel(
         reference: PipelineReference,
         traceNodeName: String?,
         showTargetName: Boolean,
-        recognitionSummary: String? = null,
+        conditionSummary: String? = null,
         fieldName: String = "next",
         boundTargetName: String? = null,
         clearedAnchor: Boolean = false,
+        anchorMayBeUnset: Boolean = false,
     ): String {
-        if (fieldName == "subtask") return "${index + 1}. 调用子任务 → ${reference.targetName}"
+        if (fieldName == "subtask") return "${index + 1}. call → ${reference.targetName}"
         if (fieldName == "anchor_candidate") return "可能目标（运行时绑定） → ${reference.targetName}"
+        val jumpBack = if (reference.isJumpBack) {
+            if (fieldName == "on_error") "[JumpBack] " else "[↶ 执行后重试] "
+        } else ""
         if (reference.isAnchor && boundTargetName == null) {
-            return "${index + 1}. ${if (clearedAnchor) "跳过" else PipelineConditionSummary.candidatePrefix(index, fieldName)} ${reference.targetName} · 运行时绑定"
+            return "${index + 1}. $jumpBack${if (clearedAnchor) "skip" else PipelineConditionSummary.candidatePrefix(index, fieldName)} ${reference.targetName}${if (clearedAnchor) "（已清除）" else " 已绑定"} · 运行时绑定"
         }
-        val presentation = if (boundTargetName == null) reference else reference.copy(
-            targetName = boundTargetName, isAnchor = false, targetExists = true,
-            target = null,
-            isAnchorUnresolved = false, isAmbiguousTarget = false, isCrossFile = false, isJumpBack = false,
-        )
         val traceOutcome = currentTrace?.let { trace ->
             listOf(reference.targetName, reference.displayName)
                 .asSequence()
@@ -1391,16 +1402,52 @@ internal class PipelineFlowPanel(
         }
         return buildString {
             append("${index + 1}. ")
-            append(PipelineConditionSummary.candidatePrefix(index, fieldName))
-            append(" ")
-            append(PipelineConditionSummary.candidateLabel(presentation, recognitionSummary))
+            append(jumpBack)
+            val condition = PipelineConditionSummary.flowCandidateCondition(reference, conditionSummary)
+            append(PipelineConditionSummary.flowBranch(index, fieldName,
+                if (reference.isAnchor) PipelineConditionSummary.anchorCondition(condition, reference.targetName, anchorMayBeUnset) else condition))
             append(if (showTargetName) " → ${boundTargetName ?: reference.targetName}" else " →")
             if (boundTargetName != null) {
                 append(" · 运行时绑定")
-                if (reference.isJumpBack) append(" · ↩ 返回")
             }
             traceOutcome?.let { append(" · ${it.label}") }
         }
+    }
+
+    private fun createLogicHeading(
+        text: String,
+        location: PipelineNodeLocation?,
+        reference: PipelineReference? = null,
+        fieldName: String = "next",
+        parentName: String? = null,
+        anchorHint: String? = null,
+        bold: Boolean = false,
+    ): JComponent {
+        val recognition = location?.let { effectiveNode(it).recognition }
+        val conditionDetails = if (location != null) recognition?.readingDetails?.takeIf { it.isNotEmpty() }
+            ?: listOf(PipelineConditionDetail(PipelineConditionSummary.flowCondition(effectiveNode(location))))
+            else if (reference?.isAnchor == true) emptyList()
+            else reference?.target?.recognitionDetails?.takeIf { it.isNotEmpty() }
+                ?: listOf(PipelineConditionDetail(reference?.target?.recognitionSummary ?: "目标尚未解析"))
+        val tooltip = PipelineFlowTooltip.render(
+            conditionDetails, getFontMetrics(UIUtil.getLabelFont()),
+            jumpBack = reference?.isJumpBack == true, parentName = parentName, fieldName = fieldName,
+            anchorHint = anchorHint, sourcePath = (location?.sourceFile ?: reference?.target?.file)?.let(::displayPath),
+            operationHint = if (location != null) "点击查看详情 · Ctrl+点击跳转源码" else "目标暂时无法在流程索引中展开",
+        )
+        fun label(part: String): JComponent {
+            val component = if (location != null) createFlowSelectionLabel(part, location, fieldName == "on_error")
+                else reference?.let { createFlowReferenceLabel(part, it, null, fieldName == "on_error") } ?: JBLabel(part)
+            if (bold) component.font = component.font.deriveFont(Font.BOLD)
+            component.toolTipText = tooltip
+            return component
+        }
+        val arrow = text.lastIndexOf(" → ")
+        if (arrow < 0) return label(text)
+        val opensBlock = text.endsWith(" {")
+        val target = text.substring(arrow + 1).removeSuffix(" {")
+        return PipelineFlowHeading(label(text.substring(0, arrow)), label(target),
+            if (opensBlock) label("{") else JPanel().apply { isOpaque = false; preferredSize = Dimension(0, 0) })
     }
 
     private fun addLogicCandidateControls(
@@ -1450,6 +1497,7 @@ internal class PipelineFlowPanel(
         val fieldName: String,
         val referenceCount: Int,
         val anchorHint: String? = null,
+        val anchorMayBeUnset: Boolean = false,
     )
 
     private fun addLogicNote(text: String, container: JPanel = logicPanel) {
@@ -1907,7 +1955,7 @@ internal class PipelineFlowPanel(
         }
         card.add(
             createNavigationLabel(
-                "$marker${index + 1}. $branchPrefix ${PipelineConditionSummary.candidateLabel(reference, targetRecognitionSummary)}$targetSuffix $state",
+                "$marker${index + 1}. $branchPrefix ${PipelineConditionSummary.candidateLabel(reference, targetRecognitionSummary, fieldName ?: "next")}$targetSuffix $state",
             ) { navigateToReference(reference) },
         )
         reference.target?.let { target ->

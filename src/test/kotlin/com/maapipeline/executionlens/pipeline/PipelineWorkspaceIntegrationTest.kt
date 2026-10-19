@@ -39,6 +39,63 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         """.trimIndent())
     }
 
+    fun testFlowConditionSummariesKeepTypesCompositionAndCustomNamesWithoutParameters() {
+        val file = fixture()
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {
+              "Start":{"recognition":"And","all_of":[
+                {"recognition":"OCR","expected":["很长的退出确认文字"],"roi":[350,250,550,100]},
+                {"recognition":{"type":"TemplateMatch","param":{"template":"private/path/button.png"}}}
+              ],"next":["Nested","Move"]},
+              "Nested":{"recognition":{"type":"Or","param":{"any_of":[
+                {"recognition":"ColorMatch","lower":[0,0,0]},
+                {"recognition":"Custom","custom_recognition":"SceneCheck","custom_recognition_param":{"secret":"not for header"}},
+                {"recognition":"OCR","inverse":true},
+                "ReferencedCondition"
+              ]}}},
+              "Move":{}, "Direct":{"recognition":"DirectHit"},
+              "Feature":{"recognition":"FeatureMatch"},
+              "Classify":{"recognition":"NeuralNetworkClassify"},
+              "Detect":{"recognition":"NeuralNetworkDetect"},
+              "Inverted":{"recognition":{"type":"DirectHit","param":{"inverse":true}}}
+            }
+        """.trimIndent())
+        replaceFixtureFile("assets/tasks/Tasks.json", """
+            {"task":[{"name":"Transfer","entry":"Start","pipeline_override":{
+              "Start":{"recognition":{"type":"Custom","param":{"custom_recognition":"OverrideCheck"}}}
+            }}]}
+        """.trimIndent())
+        ReadAction.run<RuntimeException> {
+            val model = PipelineDocumentIndexer.index(project, file)
+            fun node(name: String) = model.nodes.single { it.name == name }
+            assertEquals("And(OCR, TemplateMatch)", PipelineConditionSummary.flowCondition(node("Start")))
+            assertEquals("Or(ColorMatch, 自定义(SceneCheck), Not(OCR), 引用(ReferencedCondition))",
+                PipelineConditionSummary.flowCondition(node("Nested")))
+            assertEquals("无条件执行", PipelineConditionSummary.flowCondition(node("Move")))
+            assertEquals("无条件执行", PipelineConditionSummary.flowCondition(node("Direct")))
+            assertEquals("Not(无条件执行)", PipelineConditionSummary.flowCondition(node("Inverted")))
+            listOf("Feature" to "FeatureMatch", "Classify" to "NeuralNetworkClassify", "Detect" to "NeuralNetworkDetect")
+                .forEach { (name, expected) -> assertEquals(expected, PipelineConditionSummary.flowCondition(node(name))) }
+            assertTrue(node("Start").recognition!!.summary.contains("很长的退出确认文字"))
+            assertTrue(node("Start").recognition!!.summary.contains("350"))
+            val details = node("Start").recognition!!.readingDetails
+            assertEquals(listOf(0, 1, 1), details.map { it.depth })
+            assertEquals("And（全部满足）", details.first().text)
+            assertTrue(details[1].text.startsWith("OCR · 文本="))
+            assertTrue(details[1].text.contains("350"))
+            assertTrue(details[2].text.contains("button.png"))
+            assertEquals("Or(ColorMatch, 自定义(SceneCheck), Not(OCR), 引用(ReferencedCondition))",
+                PipelineConditionSummary.flowCandidateCondition(node("Start").next.first()))
+            val entry = model.pipelineEntries.single()
+            val overrides = PipelineTaskContext.activeOverrides(entry, model.pipelineOverrides, emptyMap())
+            val effective = PipelineDocumentIndexer.effectiveNodes(project, model, overrides, emptyMap(), entry.taskOptions)
+            assertEquals("自定义(OverrideCheck)", PipelineConditionSummary.flowCondition(effective.getValue("${file.url}#Start")))
+            assertEquals(listOf(PipelineConditionDetail("自定义 · 实现=OverrideCheck")),
+                effective.getValue("${file.url}#Start").recognition!!.readingDetails)
+            assertEquals(node("Nested").recognition!!.readingDetails, node("Start").next.first().target!!.recognitionDetails)
+        }
+    }
+
     fun testTaskCatalogKeepsMetadataMissingEntriesAndSelectedOverridesSeparate() {
         val file = fixture()
         val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
@@ -403,9 +460,10 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val openBefore = manager.openFiles.toSet()
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text.contains("个可能目标") }.doClick()
             PlatformTestUtil.waitWithEventsDispatching("候选未展开", {
-                labels().any { it.text.startsWith("可能目标（运行时绑定）") && it.text.contains("Target") }
+                labels().any { it.text == "→ Target" }
             }, 30)
-            val label = labels().single { it.text.startsWith("可能目标（运行时绑定）") && it.text.contains("Target") }
+            val label = labels().single { it.text == "→ Target" }
+            assertTrue(descendants(label.parent).filterIsInstance<javax.swing.JLabel>().any { it.text == "可能目标（运行时绑定）" })
             val click = java.awt.event.MouseEvent(label, java.awt.event.MouseEvent.MOUSE_CLICKED,
                 System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
             label.mouseListeners.forEach { it.mouseClicked(click) }
@@ -415,10 +473,10 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals(2, source.editorFor(other).editor.caretModel.logicalPosition.line)
             assertEquals(openBefore, manager.openFiles.toSet())
             assertTrue(labels().none { it.text.contains("本轮没有成功后继") || it.text.startsWith("否则：") })
-            assertEquals(labels().count { it.text.endsWith(" {") }, labels().count { it.text == "}" })
+            assertEquals(labels().count { it.text == "{" }, labels().count { it.text == "}" })
             assertTrue(logic.componentCount < 60)
             val cycle = labels().single { it.text.contains("· ↩ 循环") }
-            val header = cycle.parent as javax.swing.JPanel
+            val header = cycle.parent.parent as javax.swing.JPanel
             val controls = (header.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.SOUTH)
             assertNotNull("循环候选应和普通节点一样把按钮放在标题下方", controls)
             header.setSize(700, header.preferredSize.height)
@@ -444,11 +502,14 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
     fun testKnownAnchorUsesAnOrdinaryInlineNodeAndKeepsTheOriginalEditableReference() {
         val file = fixture()
         replaceFixtureFile("assets/resource/pipeline/Main.json", """
-            {"Start":{"anchor":{"Resume":"Target"},"next":["[JumpBack][Anchor]Resume","Done"]},"Done":{}}
+            {"Start":{"recognition":"And","all_of":[
+               {"recognition":"OCR","expected":["退出确认"],"roi":[350,250,550,100]},
+               {"recognition":"TemplateMatch","template":"some/long/path.png"}],
+               "anchor":{"Resume":"Target","Unused":"Done"},"next":["[JumpBack][Anchor]Resume","Done"]},"Done":{}}
         """.trimIndent())
         val other = myFixture.addFileToProject("assets/resource/pipeline/Other.json", """
             {"Target":{"action":"TouchMove","anchor":{"Resume":""}},
-             "Elsewhere":{"anchor":{"Resume":"Different"}},"Different":{}}
+             "Elsewhere":{"anchor":{"Resume":"Different"}},"Different":{"anchor":{"Resume":""}}}
         """.trimIndent()).virtualFile
         val catalog = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
         val entry = catalog.pipelineEntries.single { it.taskId == "Transfer" }
@@ -472,9 +533,20 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             }, 30)
             val label = labels().single { it.text.contains("→ Target · 运行时绑定") }
             assertTrue(label.toolTipText.contains("清除时跳过"))
+            assertTrue(label.toolTipText.startsWith("<html>"))
+            assertTrue(label.toolTipText.contains("父 next 第一项重试"))
+            assertTrue(label.toolTipText.contains("父节点：Start"))
+            assertTrue(labels().any { it.text == "if And(OCR, TemplateMatch)" })
+            assertTrue(descendants(label.parent).filterIsInstance<javax.swing.JLabel>()
+                .any { it.text == "1. [↶ 执行后重试] if Resume 已绑定" })
+            assertTrue(labels().any { it.text == "绑定 Anchor：Resume → Target" })
+            val clearLabel = labels().single { it.text == "清除 Anchor：Resume" }
+            val actionIndex = labels().indexOfFirst { it.text.startsWith("执行动作 TouchMove") }
+            assertTrue(actionIndex >= 0 && labels().indexOf(clearLabel) > actionIndex)
+            assertTrue(labels().none { it.text.contains("Unused") })
             assertTrue(labels().none { it.text.contains("可能目标") || it.text.contains("设置 Anchor") || it.text.contains("存在清除") })
             assertTrue(descendants(logic).filterIsInstance<javax.swing.JButton>().none { it.text.contains("可能目标") })
-            val header = label.parent as javax.swing.JPanel
+            val header = label.parent.parent as javax.swing.JPanel
             val markers = descendants(header).filterIsInstance<javax.swing.JToggleButton>()
             assertTrue(markers.single { it.text == "锚" }.isSelected)
             val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
@@ -485,6 +557,14 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             label.mouseListeners.forEach { it.mouseClicked(click) }
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals(other, source.currentFile)
+            val target = catalog.projectNodes.single { it.name == "Target" }
+            val sourceEditor = source.editorFor(other).editor
+            sourceEditor.caretModel.moveToOffset(0)
+            val navigate = java.awt.event.MouseEvent(label, java.awt.event.MouseEvent.MOUSE_CLICKED,
+                System.currentTimeMillis(), java.awt.event.InputEvent.CTRL_DOWN_MASK, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
+            label.mouseListeners.forEach { it.mouseClicked(navigate) }
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals(target.nameRange.startOffset, sourceEditor.caretModel.offset)
             val document = source.editorFor(file).editor.document
             val previousDialog = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.YES }
             try { markers.single { it.text == "回" }.doClick() }
@@ -500,6 +580,11 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 labels().any { it.text.contains("→ Different · 运行时绑定") } &&
                     labels().none { it.text.contains("→ Target · 运行时绑定") }
             }, 30)
+            assertTrue(labels().any { it.text == "清除 Anchor：Resume" })
+            val different = labels().single { it.text.contains("→ Different · 运行时绑定") }
+            assertTrue(descendants(different.parent).filterIsInstance<javax.swing.JLabel>().any { it.text == "{" })
+            assertTrue(descendants(different.parent).filterIsInstance<javax.swing.JLabel>()
+                .any { it.text == "1. 无条件执行" })
         } finally {
             if (attach) logic.removeNotify()
             manager.closeFile(workspace.file)

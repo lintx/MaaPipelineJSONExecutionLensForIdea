@@ -66,6 +66,22 @@ class PipelineAnchorFlowTest {
     }
 
     @Test
+    fun nodeEffectsShowOnlyReferencedAnchorsAndClearingDisablesTheNextAttempt() {
+        val source = node("Source", "Target", next = listOf(anchor.copy(isJumpBack = true))).let {
+            it.copy(anchorDefinitions = it.anchorDefinitions + definition("Hidden").copy(name = "Unused"))
+        }
+        val clear = node("Target", "")
+        val graph = PipelineReadingGraph(listOf(source, clear))
+        assertEquals(listOf("X"), graph.visibleAnchorChanges(source).map { it.name })
+        assertEquals(listOf("X"), graph.visibleAnchorChanges(clear).map { it.name })
+        val firstAttempt = graph.anchorFlow.afterNode(source, PipelineAnchorContext())
+        assertSame(clear, graph.anchorFlow.resolve(anchor, firstAttempt).inlineTarget)
+        val retry = graph.anchorFlow.afterNode(clear, firstAttempt)
+        assertTrue(graph.anchorFlow.resolve(anchor, retry).isCleared)
+        assertNull(graph.anchorFlow.resolve(anchor, retry).inlineTarget)
+    }
+
+    @Test
     fun jumpBackRebindingRetainsBothTargetsInsteadOfClaimingACertainTarget() {
         val reference = anchor.copy(isJumpBack = true)
         val source = node("Source", "Target", next = listOf(reference))
