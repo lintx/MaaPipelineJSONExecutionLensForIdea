@@ -2,6 +2,19 @@ package com.maapipeline.executionlens.pipeline
 
 import java.awt.Dimension
 import java.awt.Rectangle
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.event.MouseAdapter
+import java.awt.event.MouseEvent
+import java.awt.event.FocusAdapter
+import java.awt.event.FocusEvent
+import java.awt.Component
+import java.awt.Container
+import com.intellij.openapi.editor.colors.EditorColors
+import com.intellij.openapi.editor.colors.EditorColorsManager
+import com.intellij.ui.JBColor
+import com.intellij.ui.paint.LinePainter2D
+import com.intellij.util.ui.JBUI
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
 import javax.swing.JComponent
@@ -14,6 +27,8 @@ import javax.swing.event.ChangeListener
 internal data class PipelineVirtualRow(
     val key: String,
     val estimatedHeight: Int,
+    val revision: Any? = null,
+    val depth: Int = 0,
     val createComponent: () -> JComponent,
 )
 
@@ -44,6 +59,8 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
     private var rows = emptyList<PipelineVirtualRow>()
     private var heights = mutableListOf<Int>()
     private var geometry = PipelineRowGeometry(emptyList())
+    private var indentation = PipelineIndentScopes(emptyList())
+    private var activeRowKey: String? = null
     private val visibleComponents = mutableMapOf<Int, JComponent>()
     private var viewport: JViewport? = null
     private var updateQueued = false
@@ -57,15 +74,32 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
     }
 
     fun setRows(newRows: List<PipelineVirtualRow>) {
+        fun unchanged(previous: PipelineVirtualRow, next: PipelineVirtualRow): Boolean =
+            previous.key == next.key && previous.depth == next.depth && next.revision != null && previous.revision == next.revision
+        if (rows.size == newRows.size && rows.indices.all { unchanged(rows[it], newRows[it]) }) {
+            rows = newRows
+            return
+        }
         val currentY = viewport?.viewPosition?.y ?: 0
         val anchorIndex = geometry.rowAt(currentY)
         val anchorKey = rows.getOrNull(anchorIndex)?.key
         val anchorOffset = if (anchorIndex >= 0) currentY - geometry.top(anchorIndex) else 0
-        val previousHeights = rows.mapIndexed { index, row -> row.key to heights[index] }.toMap()
-        removeAll()
+        val previousIndices = rows.withIndex().associate { it.value.key to it.index }
+        val retained = mutableMapOf<Int, JComponent>()
+        val newHeights = newRows.mapIndexed { index, row ->
+            val previousIndex = previousIndices[row.key]
+            if (previousIndex != null && unchanged(rows[previousIndex], row)) {
+                visibleComponents.remove(previousIndex)?.let { retained[index] = it }
+                heights[previousIndex]
+            } else row.estimatedHeight.coerceAtLeast(1)
+        }.toMutableList()
+        // 版本包含展示内容和导航范围，只有未变化的行才能保留组件及其事件回调。
+        visibleComponents.values.forEach(::remove)
         visibleComponents.clear()
+        visibleComponents.putAll(retained)
         rows = newRows
-        heights = rows.map { previousHeights[it.key] ?: it.estimatedHeight.coerceAtLeast(1) }.toMutableList()
+        indentation = PipelineIndentScopes(rows.map { it.depth })
+        heights = newHeights
         geometry = PipelineRowGeometry(heights)
         val newAnchor = rows.indexOfFirst { it.key == anchorKey }
         if (newAnchor >= 0) {
@@ -76,11 +110,61 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
         queueUpdate()
     }
 
+    fun scrollAnchor(): Pair<String, Int>? {
+        val position = viewport?.viewPosition?.y ?: return null
+        val index = geometry.rowAt(position)
+        return rows.getOrNull(index)?.key?.let { it to position - geometry.top(index) }
+    }
+
+    fun restoreAnchor(key: String, offset: Int = 0) {
+        val index = rows.indexOfFirst { it.key == key }
+        if (index < 0) return
+        SwingUtilities.invokeLater {
+            val currentIndex = rows.indexOfFirst { it.key == key }
+            if (currentIndex >= 0) viewport?.viewPosition = java.awt.Point(0, geometry.top(currentIndex) + offset.coerceAtLeast(0))
+        }
+    }
+
     override fun addNotify() {
         super.addNotify()
         viewport = SwingUtilities.getAncestorOfClass(JViewport::class.java, this) as? JViewport
         viewport?.addChangeListener(viewportListener)
         queueUpdate()
+    }
+
+    fun activateRow(key: String) {
+        if (key == activeRowKey) return
+        activeRowKey = key
+        repaint()
+    }
+
+    private fun trackActiveRow(component: Component, key: String) {
+        component.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(event: MouseEvent) = activateRow(key)
+        })
+        component.addFocusListener(object : FocusAdapter() {
+            override fun focusGained(event: FocusEvent) = activateRow(key)
+        })
+        if (component is Container) component.components.forEach { trackActiveRow(it, key) }
+    }
+
+    override fun paintComponent(graphics: Graphics) {
+        super.paintComponent(graphics)
+        if (rows.isEmpty()) return
+        val scheme = EditorColorsManager.getInstance().globalScheme
+        val regular = scheme.getColor(EditorColors.INDENT_GUIDE_COLOR) ?: JBColor.border()
+        val selected = scheme.getColor(EditorColors.SELECTED_INDENT_GUIDE_COLOR) ?: regular
+        val active = indentation.at(rows.indexOfFirst { it.key == activeRowKey })
+        val clip = graphics.clipBounds ?: Rectangle(0, 0, width, height)
+        // 整块绘制跨越行间距与虚拟化边界，复用原生编辑器的主题色和 HiDPI 线条绘制。
+        for (scope in indentation.scopes) {
+            val top = geometry.top(scope.firstRow) + geometry.height(scope.firstRow)
+            val bottom = geometry.top(scope.lastRow) + geometry.height(scope.lastRow) / 2
+            if (bottom < clip.y || top > clip.y + clip.height) continue
+            val guideX = JBUI.scale(16 + (scope.depth - 1) * 12 + 8)
+            graphics.color = if (scope == active) selected else regular
+            LinePainter2D.paint(graphics as Graphics2D, guideX.toDouble(), top.toDouble(), guideX.toDouble(), bottom.toDouble())
+        }
     }
 
     override fun removeNotify() {
@@ -110,7 +194,9 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
         }
         var resized = false
         for (index in visibleRange) {
-            val component = visibleComponents.getOrPut(index) { rows[index].createComponent().also { add(it) } }
+            val component = visibleComponents.getOrPut(index) {
+                rows[index].createComponent().also { trackActiveRow(it, rows[index].key); add(it) }
+            }
             val measuredHeight = component.preferredSize.height.coerceAtLeast(1)
             if (heights[index] != measuredHeight) {
                 heights[index] = measuredHeight

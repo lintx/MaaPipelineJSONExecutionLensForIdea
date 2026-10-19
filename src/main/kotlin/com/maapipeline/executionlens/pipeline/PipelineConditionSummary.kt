@@ -1,8 +1,22 @@
 package com.maapipeline.executionlens.pipeline
 
 internal object PipelineConditionSummary {
+    fun successorLoop(node: PipelineNodeLocation): String? {
+        if (node.next.isEmpty()) return null
+        val policy = node.executionPolicy
+        val timeout = policy.timeout?.summary ?: "20000"
+        val interval = policy.rateLimit?.summary ?: "1000"
+        val limit = when (timeout.toLongOrNull()) {
+            -1L -> "不限时"
+            0L -> return "匹配后继（不等待重试）"
+            null -> "超时 $timeout"
+            else -> "超时 ${timeout}ms"
+        }
+        return "重试匹配后继（$limit，轮次间隔至少 ${interval}ms）"
+    }
+
     fun entryCondition(node: PipelineNodeLocation): String =
-        node.recognition?.summary?.let { "识别 $it 成功" } ?: "节点可执行"
+        if (!node.enabled) "已禁用（enabled=false）" else node.recognition?.summary?.let { "识别 $it 成功" } ?: "节点可执行"
 
     fun action(node: PipelineNodeLocation): String? =
         node.action?.summary?.let { "执行动作 $it" }

@@ -6,6 +6,25 @@ import kotlin.test.assertEquals
 
 class PipelineConditionSummaryTest {
     @Test
+    fun emptySuccessorsDoNotRetryEvenWithAnExecutionPolicy() {
+        val node = PipelineNodeLocation("End", TextRange(0, 1), TextRange(0, 1),
+            executionPolicy = PipelineExecutionPolicy(timeout = PipelineFieldLocation("timeout", "5000", TextRange(0, 1))))
+        assertEquals(null, PipelineConditionSummary.successorLoop(node))
+    }
+
+    @Test
+    fun successorLoopDistinguishesDefaultInfiniteAndImmediateTimeouts() {
+        val reference = PipelineReference("Next", "Next", TextRange(0, 1), false, false)
+        val node = PipelineNodeLocation("Start", TextRange(0, 1), TextRange(0, 1), next = listOf(reference))
+        assertEquals("重试匹配后继（超时 20000ms，轮次间隔至少 1000ms）", PipelineConditionSummary.successorLoop(node))
+        fun withTimeout(timeout: String) = node.copy(executionPolicy = PipelineExecutionPolicy(
+            timeout = PipelineFieldLocation("timeout", timeout, TextRange(0, 1)),
+            rateLimit = PipelineFieldLocation("rate_limit", "100", TextRange(0, 1))))
+        assertEquals("重试匹配后继（不限时，轮次间隔至少 100ms）", PipelineConditionSummary.successorLoop(withTimeout("-1")))
+        assertEquals("匹配后继（不等待重试）", PipelineConditionSummary.successorLoop(withTimeout("0")))
+    }
+
+    @Test
     fun describesNodeEntryAndActionBeforeSuccessBranches() {
         val node = PipelineNodeLocation(
             name = "Open",

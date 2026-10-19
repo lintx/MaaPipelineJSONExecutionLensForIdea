@@ -11,6 +11,7 @@ import com.intellij.openapi.actionSystem.ex.ActionUtil
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.EditorFactory
 import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.editor.event.DocumentEvent
@@ -37,6 +38,9 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.openapi.vfs.newvfs.BulkFileListener
+import com.intellij.openapi.vfs.newvfs.events.VFileEvent
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.ModalityState
 import com.intellij.util.concurrency.AppExecutorUtil
@@ -65,6 +69,7 @@ import javax.swing.JComboBox
 import javax.swing.JButton
 import javax.swing.JCheckBox
 import javax.swing.JToggleButton
+import javax.swing.JTabbedPane
 import javax.swing.DefaultListModel
 import javax.swing.DefaultListCellRenderer
 import javax.swing.JComponent
@@ -81,7 +86,8 @@ internal class PipelineFlowPanel(
     private val project: Project,
     private val file: VirtualFile,
     private val editor: Editor,
-    private val showSourceForNavigation: () -> Unit,
+    private val source: PipelineWorkspaceSource,
+    private val workspace: PipelineWorkspaceState,
 ) : JPanel(BorderLayout()), Disposable {
     private companion object {
         // 逻辑视图只负责帮助理解当前路径；对大型项目设置上限，避免一次创建过多 Swing 组件。
@@ -90,9 +96,30 @@ internal class PipelineFlowPanel(
 
     private val nodeListModel = DefaultListModel<String>()
     private val nodeList = JBList(nodeListModel)
-    private val nodeSelector = JComboBox<String>()
+    private val nodeSelector = JComboBox<PipelineNodeLocation>()
     private val summaryLabel = JBLabel()
-    private val entrySelector = JComboBox<PipelineEntryLocation>()
+    private val entrySelector = JButton("搜索任务…")
+    private val optionsButton = JButton("任务选项…")
+    private val rightTabs = JTabbedPane()
+    private lateinit var contentSplit: OnePixelSplitter
+    private var contextKey = ""
+    private var standaloneRoot: PipelineNodeLocation? = null
+    private var effectiveNodes: Map<String, PipelineNodeLocation> = emptyMap()
+    @Volatile private var effectiveGeneration = 0L
+    private var selectedOverrides: List<PipelineOverrideLocation> = emptyList()
+    private var contextLoading = false
+    private var restoring = false
+    private var pendingSource: Pair<VirtualFile, Int>? = null
+    private var sourceRequestGeneration = 0L
+    private val expandedBranches = linkedSetOf<String>()
+    private var nodeBudget = MAX_LOGIC_NODES
+    private var restoreScroll = false
+    private var logicBuildQueue: ArrayDeque<() -> Unit>? = null
+    private var renderedNodeCount = 0
+    private val logicRowByNode = linkedMapOf<String, String>()
+    private val activeLogicRows = mutableMapOf<String, String>()
+    private val readingHistory = ArrayDeque<Pair<String, Int>>()
+    private val session: PipelineReadingState get() = workspace.reading(contextKey)
     private val entryStatusLabel = JBLabel("未检测到任务入口")
     private val traceButton = JButton("加载运行日志")
     private val clearTraceButton = JButton("清除日志")
@@ -112,6 +139,11 @@ internal class PipelineFlowPanel(
         override fun getScrollableTracksViewportHeight(): Boolean = false
     }
     private var currentModel = PipelineDocumentModel(file, -1L, emptyList(), hasSyntaxErrors = true)
+    private var sourceNodes: Map<VirtualFile?, List<PipelineNodeLocation>> = emptyMap()
+    private var readingGraph: PipelineReadingGraph? = null
+    private var detailsDirty = true
+    private var renderedContext: String? = null
+    private val refreshAlarm = com.intellij.util.Alarm(com.intellij.util.Alarm.ThreadToUse.SWING_THREAD, this)
     private var currentTrace: PipelineExecutionTrace? = null
     private var traceSourceVersions: Map<VirtualFile, Long> = emptyMap()
     private var traceLoadGeneration = 0L
@@ -123,7 +155,9 @@ internal class PipelineFlowPanel(
     private var selectingFromSource = false
     private var inspectedLogicNode: PipelineNodeLocation? = null
     private var selectedEntry: PipelineEntryLocation? = null
-    private var refreshGeneration = 0L
+    @Volatile private var refreshGeneration = 0L
+    private val pendingChangedFiles = linkedSetOf<VirtualFile>()
+    private var fullRefreshRequired = true
     private val collapsedLogicNodes = linkedSetOf<String>()
     private val documentListener = object : DocumentListener {
         override fun documentChanged(event: DocumentEvent) {
@@ -135,11 +169,11 @@ internal class PipelineFlowPanel(
         border = JBUI.Borders.empty(8)
         nodeList.selectionMode = ListSelectionModel.SINGLE_SELECTION
         nodeList.addListSelectionListener { event ->
-            if (!event.valueIsAdjusting) {
+            if (!event.valueIsAdjusting && !refreshing) {
                 inspectedLogicNode = null
                 syncNodeSelector()
                 renderSelectedNode()
-                if (!refreshing && !selectingFromSource) navigateToSelectedNode()
+                if (!refreshing && !selectingFromSource) saveSession()
             }
         }
         nodeSelector.renderer = object : DefaultListCellRenderer() {
@@ -151,44 +185,18 @@ internal class PipelineFlowPanel(
                 cellHasFocus: Boolean,
             ): Component {
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
-                text = nodeDisplayText(value as? String)
+                val node = value as? PipelineNodeLocation
+                text = node?.let { "${it.name} · ${it.sourceFile?.name.orEmpty()}" }.orEmpty()
                 return this
             }
         }
-        nodeSelector.toolTipText = "选择节点，并同步逻辑视图、详情和源码位置"
+        nodeSelector.toolTipText = "查看项目节点详情，不改变当前流程根"
         nodeSelector.addActionListener {
             if (syncingNodeSelector) return@addActionListener
-            val index = nodeSelector.selectedIndex
-            if (index < 0 || index >= nodeListModel.size) return@addActionListener
-            if (nodeList.selectedIndex == index) {
-                renderSelectedNode()
-                navigateToSelectedNode()
-            } else {
-                nodeList.selectedIndex = index
-            }
+            val location = nodeSelector.selectedItem as? PipelineNodeLocation ?: return@addActionListener
+            inspectNode(location)
         }
-        entrySelector.renderer = object : DefaultListCellRenderer() {
-            override fun getListCellRendererComponent(
-                list: javax.swing.JList<*>,
-                value: Any?,
-                index: Int,
-                isSelected: Boolean,
-                cellHasFocus: Boolean,
-            ): Component {
-                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
-                val entry = value as? PipelineEntryLocation
-                text = entry?.let {
-                    val targetSuffix = it.targetFile
-                        ?.takeIf { targetFile -> targetFile != file }
-                        ?.let { targetFile -> " [${pipelinePath(targetFile)}]" }
-                        .orEmpty()
-                    "${displayPath(it.file)} → ${it.entryName}$targetSuffix"
-                } ?: "（无任务入口）"
-                return this
-            }
-        }
-        entrySelector.toolTipText = "选择任务入口，并定位到对应 Pipeline 节点"
-        entrySelector.isVisible = false
+        entrySelector.toolTipText = "按任务 ID、名称、注释、UI 文本搜索；最近任务优先"
         entryStatusLabel.foreground = UIUtil.getContextHelpForeground()
         overrideToggle.apply {
             isOpaque = false
@@ -196,38 +204,14 @@ internal class PipelineFlowPanel(
             toolTipText = "切换默认 Pipeline 值与当前任务 pipeline_override 的有效值"
             addActionListener {
                 updateSummary()
-                renderSelectedNode()
+                if (!restoring) rebuildEffectiveContext()
             }
         }
         entrySelector.addActionListener {
-            if (syncingEntrySelector) return@addActionListener
-            val entry = entrySelector.selectedItem as? PipelineEntryLocation ?: return@addActionListener
-            selectedEntry = entry
-            nodeList.repaint()
-            nodeSelector.repaint()
-            val entryTargetsCurrentFile = entry.targetFile == null || entry.targetFile == file
-            val index = if (entryTargetsCurrentFile) {
-                currentModel.nodes.indexOfFirst { it.name == entry.entryName }
-            } else {
-                -1
-            }
-            if (index < 0) {
-                renderSelectedNode()
-                val target = entryRootNode(entry)
-                if (target != null) {
-                    navigateToFileRange(target.sourceFile ?: file, target.nameRange)
-                } else {
-                    navigateToFileRange(entry.file, entry.range)
-                }
-                return@addActionListener
-            }
-            if (nodeList.selectedIndex == index) {
-                renderSelectedNode()
-                navigateToSelectedNode()
-            } else {
-                nodeList.selectedIndex = index
-            }
+            val dialog = PipelineTaskChooserDialog(project, currentModel.pipelineEntries, workspace.data.recentTasks)
+            if (dialog.showAndGet()) dialog.selectedEntry?.let(::activateTask)
         }
+        optionsButton.addActionListener { showTaskOptions() }
         nodeList.cellRenderer = object : DefaultListCellRenderer() {
             override fun getListCellRendererComponent(
                 list: javax.swing.JList<*>,
@@ -275,7 +259,7 @@ internal class PipelineFlowPanel(
                 traceButton.isEnabled = true
                 updateSummary()
                 nodeList.repaint()
-                renderSelectedNode()
+                renderSelectedNode(updateFlow = true)
             }
         }
         val summaryBar = JPanel(BorderLayout()).apply {
@@ -289,27 +273,42 @@ internal class PipelineFlowPanel(
                 isOpaque = false
                 alignmentX = LEFT_ALIGNMENT
                 maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(30))
-                add(JBLabel("任务入口："), BorderLayout.WEST)
+                add(JBLabel("任务："), BorderLayout.WEST)
                 entrySelector.minimumSize = Dimension(JBUI.scale(180), JBUI.scale(28))
                 entrySelector.preferredSize = Dimension(JBUI.scale(360), JBUI.scale(28))
                 add(entrySelector, BorderLayout.CENTER)
-                add(entryStatusLabel, BorderLayout.EAST)
+                add(optionsButton, BorderLayout.EAST)
             }
             val nodePanel = JPanel(BorderLayout()).apply {
                 isOpaque = false
                 alignmentX = LEFT_ALIGNMENT
                 maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(30))
-                add(JBLabel("节点："), BorderLayout.WEST)
+                add(JBLabel("查看节点："), BorderLayout.WEST)
                 nodeSelector.minimumSize = Dimension(JBUI.scale(180), JBUI.scale(28))
                 nodeSelector.preferredSize = Dimension(JBUI.scale(360), JBUI.scale(28))
                 add(nodeSelector, BorderLayout.CENTER)
             }
             navigationPanel.add(entryPanel)
-            navigationPanel.add(nodePanel)
+            rightTabs.addTab("节点详情", JPanel(BorderLayout()).apply {
+                add(nodePanel, BorderLayout.NORTH)
+                add(details, BorderLayout.CENTER)
+            })
+            rightTabs.addTab("原始 JSON", source)
+            rightTabs.addChangeListener {
+                if (!restoring && rightTabs.selectedIndex == 1) selectedDetail()?.let {
+                    source.showFile(it.sourceFile ?: file, it.nameRange, false)
+                }
+                if (!restoring && rightTabs.selectedIndex == 0 && detailsDirty) renderSelectedNode()
+                if (!restoring) saveSession()
+            }
             val statusPanel = JPanel(BorderLayout()).apply {
                 isOpaque = false
                 add(overrideToggle, BorderLayout.WEST)
-                add(summaryLabel, BorderLayout.CENTER)
+                add(JPanel(BorderLayout()).apply {
+                    isOpaque = false
+                    add(entryStatusLabel, BorderLayout.NORTH)
+                    add(summaryLabel, BorderLayout.CENTER)
+                }, BorderLayout.CENTER)
                 add(JPanel(FlowLayout(FlowLayout.RIGHT, 2, 0)).apply {
                     isOpaque = false
                     add(traceButton)
@@ -319,19 +318,56 @@ internal class PipelineFlowPanel(
             add(navigationPanel, BorderLayout.NORTH)
             add(statusPanel, BorderLayout.CENTER)
         }
-        val contentSplit = OnePixelSplitter(false, 0.68f).apply {
+        contentSplit = OnePixelSplitter(false, 0.68f).apply {
             firstComponent = logic
-            secondComponent = details
+            secondComponent = rightTabs
             border = JBUI.Borders.emptyTop(2)
         }
         add(summaryBar, BorderLayout.NORTH)
         add(contentSplit, BorderLayout.CENTER)
-        editor.document.addDocumentListener(documentListener, this)
-        editor.caretModel.addCaretListener(object : CaretListener {
-            override fun caretPositionChanged(event: CaretEvent) {
-                selectNodeAtOffset(event.caret.offset)
+        logic.viewport.addChangeListener { if (!restoring) saveSession() }
+        contentSplit.addPropertyChangeListener("proportion") { if (!restoring) saveSession() }
+        EditorFactory.getInstance().eventMulticaster.addDocumentListener(object : DocumentListener {
+            override fun documentChanged(event: DocumentEvent) {
+                val changed = FileDocumentManager.getInstance().getFile(event.document) ?: return
+                if (changed in currentModel.indexedVersions || changed == file ||
+                    changed in currentModel.pipelineEntries.map { it.file } ||
+                    changed.path.contains("/locales/")) refreshFromDocument(event.document)
             }
         }, this)
+        source.onCaret = { sourceFile, offset ->
+            if (!restoring) {
+                if (!restoreScroll && contextKey.isNotEmpty()) {
+                    session.sourceUrl = sourceFile.url
+                    session.sourceOffset = offset
+                }
+                val selected = selectedDetail()
+                if (selected?.sourceFile != sourceFile || !selected.propertyRange.containsOffset(offset)) {
+                    val nodes = sourceNodes[sourceFile].orEmpty()
+                    val index = nodes.binarySearchBy(offset) { it.propertyRange.startOffset }
+                        .let { if (it >= 0) it else -it - 2 }
+                    nodes.getOrNull(index)?.takeIf { it.propertyRange.containsOffset(offset) }
+                        ?.let { inspectNode(it, syncSource = false) }
+                }
+            }
+        }
+        project.messageBus.connect(this).subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+            override fun after(events: List<VFileEvent>) {
+                val relevant = events.filter { event ->
+                    if (event is com.intellij.openapi.vfs.newvfs.events.VFileContentChangeEvent && event.isFromSave) return@filter false
+                    event.file in currentModel.indexedVersions || event.path.startsWith(project.basePath.orEmpty()) &&
+                        (event.path.contains("/pipeline/") || event.path.contains("/tasks/") ||
+                            event.path.contains("/locales/") || event.path.endsWith("/interface.json"))
+                }
+                if (relevant.isNotEmpty()) ApplicationManager.getApplication().invokeLater {
+                    if (!disposed) {
+                        pendingChangedFiles += relevant.mapNotNull { it.file }
+                        refreshFromDocument(editor.document,
+                            relevant.any { it !is com.intellij.openapi.vfs.newvfs.events.VFileContentChangeEvent })
+                    }
+                }
+            }
+        })
         refreshFromDocument(editor.document)
     }
 
@@ -346,6 +382,224 @@ internal class PipelineFlowPanel(
         } finally {
             selectingFromSource = false
         }
+    }
+
+    private fun currentRoot(): PipelineNodeLocation? = selectedEntry?.let(::entryRootNode) ?: standaloneRoot
+
+    private fun selectedDetail(): PipelineNodeLocation? = inspectedLogicNode ?: currentRoot()
+
+    private fun inspectNode(location: PipelineNodeLocation, syncSource: Boolean = true) {
+        if (selectedDetail() == location) {
+            if (syncSource && rightTabs.selectedIndex == 1) source.showFile(location.sourceFile ?: file, location.nameRange, false)
+            return
+        }
+        inspectedLogicNode = location
+        refreshing = true
+        try {
+            nodeList.selectedIndex = currentModel.nodes.indexOfFirst {
+                it.name == location.name && it.sourceFile == location.sourceFile
+            }
+        } finally { refreshing = false }
+        inspectedLogicNode = location
+        renderSelectedNode()
+        if (syncSource && rightTabs.selectedIndex == 1) source.showFile(location.sourceFile ?: file, location.nameRange, false)
+        saveSession()
+    }
+
+    private fun updateTaskControls() {
+        entrySelector.text = selectedEntry?.let { "${it.label} · ${it.taskId}" } ?: "搜索任务…"
+        entrySelector.isEnabled = currentModel.pipelineEntries.isNotEmpty()
+        entrySelector.toolTipText = selectedEntry?.description?.takeIf(String::isNotBlank)
+            ?: "搜索任务 ID、名称、注释、UI 文本或入口"
+        optionsButton.isEnabled = selectedEntry?.optionNames?.isNotEmpty() == true
+        overrideToggle.isEnabled = selectedEntry != null
+    }
+
+    internal fun activateTask(entry: PipelineEntryLocation) {
+        sourceRequestGeneration++
+        saveSession()
+        selectedEntry = entry
+        standaloneRoot = null
+        contextKey = entry.stableId
+        workspace.data.lastContext = contextKey
+        workspace.rememberTask(contextKey)
+        inspectedLogicNode = currentModel.projectNodes.firstOrNull {
+            logicNodeKey(it.name, it.sourceFile ?: file) == session.selectedNode
+        }
+        restoreSession()
+        entryStatusLabel.text = entry.issue.orEmpty()
+        updateTaskControls()
+        rebuildEffectiveContext()
+    }
+
+    internal fun openFromSource(sourceFile: VirtualFile, offset: Int) {
+        if (currentModel.version < 0) { pendingSource = sourceFile to offset; return }
+        workspace.clearSourceRequest()
+        val nodes = currentModel.projectNodes.filter { it.sourceFile == sourceFile }
+        val node = nodes.firstOrNull { offset in it.propertyRange.startOffset..it.propertyRange.endOffset }
+            ?: nodes.firstOrNull()
+        if (node == null) {
+            entryStatusLabel.text = "当前资源域未索引该文件：${sourceFile.name}"
+            return
+        }
+        if (currentRoot() != null && (staticPathTo(node) != null || currentRoot() == node)) {
+            inspectNode(node)
+            return
+        }
+        val generation = ++sourceRequestGeneration
+        val snapshot = currentModel
+        val readings = workspace.data.sessions.mapValues { (_, reading) -> reading.selections.mapValues { it.value.toList() } to reading.inputs.toMap() }
+        entryStatusLabel.text = "正在查找关联任务…"
+        ReadAction.nonBlocking<List<PipelineEntryLocation>> {
+            snapshot.pipelineEntries.filter { entry ->
+                com.intellij.openapi.progress.ProgressManager.checkCanceled()
+                if (entry.issue != null) return@filter false
+                val root = snapshot.projectNodes.singleOrNull { it.sourceFile == entry.targetFile && it.name == entry.entryName }
+                    ?: return@filter false
+                val (selections, inputs) = readings[entry.stableId] ?: (emptyMap<String, List<String>>() to emptyMap())
+                val overrides = PipelineTaskContext.activeOverrides(entry, snapshot.pipelineOverrides, selections)
+                val effective = PipelineDocumentIndexer.effectiveNodes(project, snapshot, overrides, inputs, entry.taskOptions)
+                val graph = PipelineReadingGraph(snapshot.projectNodes) { effective[PipelineReadingGraph.key(it)] ?: it }
+                graph.path(root, node) != null
+            }
+        }.expireWith(this).finishOnUiThread(ModalityState.any()) { candidates ->
+            if (disposed || generation != sourceRequestGeneration || currentModel !== snapshot) return@finishOnUiThread
+            openSourceContext(node, sourceFile, candidates)
+        }.submit(AppExecutorUtil.getAppExecutorService())
+    }
+
+    private fun openSourceContext(node: PipelineNodeLocation, sourceFile: VirtualFile, candidates: List<PipelineEntryLocation>) {
+        entryStatusLabel.text = selectedEntry?.issue.orEmpty()
+        if (candidates.size == 1) {
+            activateTask(candidates.single())
+        } else if (candidates.size > 1) {
+            val dialog = PipelineTaskChooserDialog(project, candidates, workspace.data.recentTasks)
+            if (!dialog.showAndGet()) return
+            dialog.selectedEntry?.let(::activateTask)
+        } else {
+            saveSession()
+            selectedEntry = null
+            standaloneRoot = node
+            inspectedLogicNode = node
+            contextKey = "node:${logicNodeKey(node.name, sourceFile)}"
+            workspace.data.lastContext = contextKey
+            restoreSession()
+            session.rootNode = logicNodeKey(node.name, sourceFile)
+            entryStatusLabel.text = "从节点查看 · 未应用任务覆盖"
+            updateTaskControls()
+            rebuildEffectiveContext()
+        }
+        inspectNode(node)
+    }
+
+    private fun saveSession() {
+        if (restoring || restoreScroll || contextLoading || contextKey.isEmpty() || currentModel.version < 0) return
+        session.rootNode = currentRoot()?.let { logicNodeKey(it.name, it.sourceFile ?: file) }.orEmpty()
+        session.selectedNode = selectedDetail()?.let { logicNodeKey(it.name, it.sourceFile ?: file) }.orEmpty()
+        session.collapsed = collapsedLogicNodes.toMutableList()
+        session.expandedBranches = expandedBranches.toMutableList()
+        session.nodeBudget = nodeBudget
+        session.rightTab = rightTabs.selectedIndex
+        session.splitProportion = contentSplit.proportion
+        session.applyOverrides = overrideToggle.isSelected
+        logicPanel.scrollAnchor()?.let { (key, offset) -> session.rowKey = key; session.rowOffset = offset }
+        source.currentFile?.let { current ->
+            session.sourceUrl = current.url
+            session.sourceOffset = source.editorFor(current).editor.caretModel.offset
+        }
+        workspace.data.lastSourceUrl = currentRoot()?.sourceFile?.url ?: file.url
+    }
+
+    private fun restoreSession() {
+        restoring = true
+        try {
+            collapsedLogicNodes.clear()
+            collapsedLogicNodes += session.collapsed
+            expandedBranches.clear()
+            expandedBranches += session.expandedBranches
+            nodeBudget = session.nodeBudget.coerceAtLeast(MAX_LOGIC_NODES)
+            rightTabs.selectedIndex = session.rightTab.coerceIn(0, 1)
+            contentSplit.proportion = session.splitProportion.coerceIn(0.15f, 0.9f)
+            overrideToggle.isSelected = session.applyOverrides
+            restoreScroll = true
+        } finally { restoring = false }
+    }
+
+    private fun currentOverrides(): List<PipelineOverrideLocation> = selectedEntry?.let {
+        selectedOverrides
+    }.orEmpty()
+
+    private fun rebuildEffectiveContext() {
+        saveSession()
+        val generation = ++effectiveGeneration
+        val snapshot = currentModel
+        selectedEntry?.let { entry ->
+            val valid = PipelineTaskContext.validSelections(entry.taskOptions, session.selections)
+            if (valid != session.selections) {
+                session.selections = valid.mapValues { it.value.toMutableList() }.toMutableMap()
+                entryStatusLabel.text = "部分已保存选项不存在，已恢复声明的默认值"
+            }
+        }
+        selectedOverrides = selectedEntry?.let {
+            PipelineTaskContext.activeOverrides(it, currentModel.pipelineOverrides, session.selections)
+        }.orEmpty()
+        val overrides = if (overrideToggle.isSelected) selectedOverrides else emptyList()
+        effectiveNodes = emptyMap()
+        readingGraph = null
+        contextLoading = overrides.isNotEmpty()
+        if (overrides.isEmpty()) {
+            effectiveNodes = emptyMap()
+            renderSelectedNode(updateFlow = true)
+            restoreReadingPosition()
+            return
+        }
+        renderSelectedNode(updateFlow = true)
+        val inputs = session.inputs.toMap()
+        val taskOptions = selectedEntry?.taskOptions.orEmpty()
+        ReadAction.nonBlocking<Map<String, PipelineNodeLocation>> {
+            PipelineDocumentIndexer.effectiveNodes(project, snapshot, overrides, inputs, taskOptions)
+        }.expireWith(this).finishOnUiThread(ModalityState.any()) { nodes ->
+            if (disposed || generation != effectiveGeneration || currentModel !== snapshot) return@finishOnUiThread
+            contextLoading = false
+            effectiveNodes = nodes
+            readingGraph = null
+            renderSelectedNode(updateFlow = true)
+            restoreReadingPosition()
+        }.expireWhen { generation != effectiveGeneration }
+            .coalesceBy(this, "pipeline-effective")
+            .submit(AppExecutorUtil.getAppExecutorService())
+    }
+
+    private fun restoreReadingPosition() {
+        val generation = effectiveGeneration
+        val restoredContext = contextKey
+        val sourceUrl = session.sourceUrl
+        val sourceOffset = session.sourceOffset
+        val shouldRestoreSource = restoreScroll
+        if (restoreScroll) {
+            logicPanel.restoreAnchor(session.rowKey, session.rowOffset)
+        }
+        if (rightTabs.selectedIndex == 1 && shouldRestoreSource) {
+            val savedSource = if (shouldRestoreSource) com.intellij.openapi.vfs.VirtualFileManager.getInstance()
+                .findFileByUrl(sourceUrl)?.takeIf { it.isValid } else null
+            if (savedSource != null) source.showFile(savedSource, TextRange(sourceOffset, sourceOffset), false)
+            else selectedDetail()?.let { source.showFile(it.sourceFile ?: file, it.nameRange, false) }
+        }
+        if (shouldRestoreSource) ApplicationManager.getApplication().invokeLater {
+            if (!disposed && effectiveGeneration == generation && contextKey == restoredContext) {
+                restoreScroll = false
+                saveSession()
+            }
+        } else saveSession()
+    }
+
+    private fun showTaskOptions() {
+        val entry = selectedEntry ?: return
+        val dialog = PipelineTaskOptionsDialog(project, entry, session.selections, session.inputs)
+        if (!dialog.showAndGet()) return
+        session.selections = dialog.selections.mapValues { it.value.toMutableList() }.toMutableMap()
+        session.inputs = dialog.inputs.toMutableMap()
+        rebuildEffectiveContext()
     }
 
     private fun nodeDisplayText(nodeName: String?): String {
@@ -371,99 +625,114 @@ internal class PipelineFlowPanel(
         if (syncingNodeSelector) return
         syncingNodeSelector = true
         try {
-            nodeSelector.selectedIndex = nodeList.selectedIndex
+            nodeSelector.selectedItem = selectedDetail()
         } finally {
             syncingNodeSelector = false
         }
     }
 
-    private fun refreshFromDocument(document: Document) {
+    private fun refreshFromDocument(document: Document, fullRefresh: Boolean = false) {
+        FileDocumentManager.getInstance().getFile(document)?.let(pendingChangedFiles::add)
+        fullRefreshRequired = fullRefreshRequired || fullRefresh
         val generation = ++refreshGeneration
-        PsiDocumentManager.getInstance(project).performWhenAllCommitted {
-            if (disposed || generation != refreshGeneration) return@performWhenAllCommitted
-            val requestedStamp = document.modificationStamp
-            ReadAction.nonBlocking<PipelineDocumentModel> {
-                PipelineDocumentIndexer.index(project, file)
-            }.expireWith(this).finishOnUiThread(ModalityState.any()) { model ->
-                if (
-                    disposed ||
-                    generation != refreshGeneration ||
-                    document.modificationStamp != requestedStamp ||
-                    model.version != document.modificationStamp
-                ) {
-                    return@finishOnUiThread
-                }
-                val selectedIndex = nodeList.selectedIndex
-                val previousNodeName = currentModel.nodes.getOrNull(selectedIndex)?.name
-                val previousEntry = selectedEntry ?: (entrySelector.selectedItem as? PipelineEntryLocation)
-                refreshing = true
-                inspectedLogicNode = null
-                currentModel = model
-                nodeListModel.removeAllElements()
-                model.nodes.forEach { nodeListModel.addElement(it.name) }
-                syncingNodeSelector = true
-                try {
-                    nodeSelector.removeAllItems()
-                    model.nodes.forEach { nodeSelector.addItem(it.name) }
-                    nodeSelector.isEnabled = model.nodes.isNotEmpty()
-                } finally {
-                    syncingNodeSelector = false
-                }
-                val restoredEntry = previousEntry?.let { previous ->
-                    model.pipelineEntries.firstOrNull { entry ->
-                        entry.file == previous.file &&
-                            entry.entryName == previous.entryName &&
-                            entry.range == previous.range
-                    }
-                } ?: model.pipelineEntries.firstOrNull { it.entryName == previousNodeName }
-                    ?: model.pipelineEntries.firstOrNull()
-                syncingEntrySelector = true
-                try {
-                    entrySelector.removeAllItems()
-                    model.pipelineEntries.forEach(entrySelector::addItem)
-                    val hasEntries = model.pipelineEntries.isNotEmpty()
-                    entrySelector.isEnabled = hasEntries
-                    entrySelector.isVisible = hasEntries
-                    entryStatusLabel.isVisible = !hasEntries
-                    selectedEntry = restoredEntry
-                    if (restoredEntry != null) {
-                        entrySelector.selectedItem = restoredEntry
-                    }
-                } finally {
-                    syncingEntrySelector = false
-                }
-                val preferredNodeName = restoredEntry
-                    ?.takeIf { it.targetFile == null || it.targetFile == file }
-                    ?.entryName
-                    ?: previousNodeName
-                val preferredIndex = preferredNodeName?.let { name ->
-                    model.nodes.indexOfFirst { it.name == name }
-                } ?: -1
-                if (model.nodes.isNotEmpty()) {
-                    nodeList.selectedIndex = when {
-                        preferredIndex >= 0 -> preferredIndex
-                        else -> selectedIndex.coerceIn(0, model.nodes.lastIndex)
-                    }
-                }
-                syncNodeSelector()
-                updateSummary()
-                nodeList.repaint()
-                nodeSelector.repaint()
-                refreshing = false
-                renderSelectedNode()
-            }
-                .submit(AppExecutorUtil.getAppExecutorService())
-        }
+        effectiveGeneration++
+        refreshAlarm.cancelAllRequests()
+        refreshAlarm.addRequest({ indexDocument(generation) }, 40)
     }
 
-    private fun renderSelectedNode() {
+    private fun indexDocument(generation: Long) {
+        if (disposed || generation != refreshGeneration) return
+        val previous = currentModel.takeUnless { fullRefreshRequired || it.version < 0 }
+        val changedFiles = pendingChangedFiles.toSet()
+        val documents = ReadAction.compute<List<Document>, RuntimeException> {
+            val files = if (previous == null) PipelineProjectFiles.pipelineFiles(project, file) +
+                PipelineProjectFiles.taskFiles(project, file) + PipelineProjectFiles.translationFiles(project, file)
+                else changedFiles.toList()
+            files.mapNotNull { FileDocumentManager.getInstance().getCachedDocument(it) }.distinct()
+        }
+        val psiDocuments = PsiDocumentManager.getInstance(project)
+        // 只提交本次依赖文件，不等待整个项目其他编辑器的未提交文档。
+        documents.forEach { if (!psiDocuments.isCommitted(it)) psiDocuments.commitDocument(it) }
+        val document = editor.document
+        val requestedStamp = document.modificationStamp
+        ReadAction.nonBlocking<PipelineDocumentModel> {
+            PipelineDocumentIndexer.index(project, file, previous, changedFiles)
+        }.expireWith(this).finishOnUiThread(ModalityState.any()) { model ->
+            if (
+                disposed ||
+                generation != refreshGeneration ||
+                document.modificationStamp != requestedStamp ||
+                model.version != document.modificationStamp
+            ) {
+                return@finishOnUiThread
+            }
+            saveSession()
+            pendingChangedFiles.clear()
+            fullRefreshRequired = false
+            val initialSnapshot = currentModel.version < 0
+            val previousEntryId = selectedEntry?.stableId ?: workspace.data.lastContext
+            val previousDetail = selectedDetail()?.let { logicNodeKey(it.name, it.sourceFile ?: file) }
+            refreshing = true
+            currentModel = model
+            sourceNodes = model.projectNodes.groupBy { it.sourceFile }.mapValues { (_, nodes) ->
+                nodes.sortedBy { it.propertyRange.startOffset }
+            }
+            readingGraph = null
+            nodeListModel.removeAllElements()
+            model.nodes.forEach { nodeListModel.addElement(it.name) }
+            syncingNodeSelector = true
+            try {
+                nodeSelector.model = javax.swing.DefaultComboBoxModel(model.projectNodes.toTypedArray())
+                nodeSelector.isEnabled = model.projectNodes.isNotEmpty()
+            } finally {
+                syncingNodeSelector = false
+            }
+            selectedEntry = model.pipelineEntries.firstOrNull { it.stableId == previousEntryId }
+            contextKey = selectedEntry?.stableId ?: workspace.data.lastContext
+            standaloneRoot = model.projectNodes.firstOrNull { contextKey.startsWith("node:") &&
+                logicNodeKey(it.name, it.sourceFile ?: file) == workspace.reading(contextKey).rootNode
+            }
+            inspectedLogicNode = model.projectNodes.firstOrNull {
+                logicNodeKey(it.name, it.sourceFile ?: file) == (previousDetail ?: session.selectedNode)
+            }
+            if (initialSnapshot) restoreSession()
+            entryStatusLabel.text = when {
+                selectedEntry?.issue != null -> selectedEntry?.issue
+                previousEntryId.isNotEmpty() && selectedEntry == null && standaloneRoot == null -> "上次任务或流程已不存在，请重新选择"
+                else -> ""
+            }
+            updateTaskControls()
+            syncNodeSelector()
+            updateSummary()
+            nodeList.repaint()
+            nodeSelector.repaint()
+            refreshing = false
+            val request = pendingSource
+            if (request != null) {
+                pendingSource = null
+                openFromSource(request.first, request.second)
+            } else rebuildEffectiveContext()
+        }
+            .expireWhen { generation != refreshGeneration }
+            .coalesceBy(this, "pipeline-index")
+            .submit(AppExecutorUtil.getAppExecutorService())
+    }
+
+    private fun renderSelectedNode(updateFlow: Boolean = false) {
+        if (updateFlow && (!contextLoading || renderedContext != contextKey)) renderLogicView(currentRoot())
+        syncNodeSelector()
+        // 源码光标只改变选中节点；隐藏的详情在切回页签时才构建，流程不跟随光标重建。
+        detailsDirty = true
+        if (rightTabs.selectedIndex != 0) return
+        detailsDirty = false
         detailsPanel.removeAll()
-        val selectedLocation = currentModel.nodes.getOrNull(nodeList.selectedIndex)
+        val selectedLocation = currentRoot()
         val location = inspectedLogicNode ?: selectedLocation
         // 中间流程保持任务入口或列表选中的根节点，右侧详情可以独立查看流程树中的任意目标。
-        renderLogicView(selectedLocation)
-        if (location == null) {
-            detailsPanel.add(JBLabel("请选择一个节点查看语义摘要"))
+        if (contextLoading) {
+            detailsPanel.add(JBLabel("正在应用任务选项…"))
+        } else if (location == null) {
+            detailsPanel.add(JBLabel("选择任务或从源码节点打开流程"))
         } else {
             detailsPanel.add(JBLabel(location.name).apply {
                 font = font.deriveFont(Font.BOLD)
@@ -513,9 +782,8 @@ internal class PipelineFlowPanel(
 
     private fun updateSummary() {
         val suffix = if (currentModel.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
-        val generatedSuffix = if (currentModel.isGenerated) "（生成文件，编辑已禁用）" else ""
         summaryLabel.text = buildString {
-            append("当前文件：${currentModel.nodes.size} 个 Pipeline 节点 $suffix$generatedSuffix")
+            append("项目资源：${currentModel.projectNodes.size} 个节点 $suffix")
             if (selectedEntry != null && overrideToggle.isSelected) append("　已应用任务覆盖")
             currentTrace?.let { trace ->
                 val events = trace.eventsForEntry(selectedEntry?.entryName)
@@ -531,11 +799,13 @@ internal class PipelineFlowPanel(
 
     private fun renderLogicView(location: PipelineNodeLocation?) {
         val rows = mutableListOf<PipelineVirtualRow>()
-        if (location == null) {
-            appendLogicNote(rows, "empty", 0, "请选择一个节点查看逻辑控制流")
+        if (contextLoading) {
+            appendLogicNote(rows, "loading", 0, "正在应用当前任务与选项…")
+        } else if (location == null) {
+            appendLogicNote(rows, "empty", 0, selectedEntry?.issue ?: "搜索并选择任务，或在 JSON 中右键“从此处查看流程”")
         } else {
             val entry = selectedEntry
-            appendLogicRow(rows, "task", 0) { panel ->
+            appendLogicRow(rows, "task", 0, revision = listOf(entry?.file, entry?.range, entry?.entryName)) { panel ->
                 val label = if (entry == null) JBLabel("task（未指定入口）") else {
                     createNavigationLabel("task ${entry.entryName}") { navigateToFileRange(entry.file, entry.range) }
                 }
@@ -547,14 +817,23 @@ internal class PipelineFlowPanel(
             } else {
                 "当前任务：${displayPath(entry.file)} · 控制流按该任务的有效字段解释"
             })
-            appendLogicRow(rows, "toolbar", 0, 34) { addLogicToolbar(it) }
+            appendLogicRow(rows, "toolbar", 0, 34, revision = "toolbar") { addLogicToolbar(it) }
             appendTraceReplay(rows)
-            val root = entry?.let(::entryRootNode) ?: location
+            val root = location
             val rootKey = logicNodeKey(root.name, root.sourceFile ?: file)
-            appendLogicNote(rows, "limit", 0, "从 ${root.name} 展开静态控制流；循环、共享节点和动态 Anchor 保留边界。组件按可视区域创建，最多展开 $MAX_LOGIC_NODES 个唯一节点。")
-            appendVirtualLogicNode(root, rows, 0, setOf(rootKey), linkedSetOf(rootKey))
+            appendLogicNote(rows, "limit", 0, "从 ${root.name} 查看流程；共享和循环可在流程内定位，动态目标按候选查看。")
+            logicRowByNode.clear()
+            activeLogicRows.clear()
+            renderedNodeCount = 0
+            val work = ArrayDeque<() -> Unit>()
+            logicBuildQueue = work
+            try {
+                work.addLast { appendVirtualLogicNode(root, rows, 0, setOf(rootKey), linkedSetOf(rootKey)) }
+                while (work.isNotEmpty()) work.removeLast().invoke()
+            } finally { logicBuildQueue = null }
         }
         logicPanel.setRows(rows)
+        renderedContext = contextKey
     }
 
     private fun traceSourceChanged(): Boolean = ReadAction.compute<Boolean, RuntimeException> {
@@ -572,11 +851,11 @@ internal class PipelineFlowPanel(
             return
         }
         val replay = trace.replayForEntry(entry)
-        appendLogicRow(rows, "trace:header", 0, 30) { panel ->
+        appendLogicRow(rows, "trace:header", 0, 30, revision = listOf(trace, entry, traceReplayExpanded)) { panel ->
             val header = JPanel(BorderLayout()).apply { isOpaque = false }
             header.add(createFoldMarker(traceReplayExpanded, "本次运行日志回放") { expanded ->
                 traceReplayExpanded = expanded
-                renderLogicView(currentModel.nodes.getOrNull(nodeList.selectedIndex))
+                renderLogicView(currentRoot())
             }, BorderLayout.WEST)
             header.add(JBLabel("本次运行 · ${replay.steps.size} 条观察 · ${replay.calls.size} 次 JumpBack 推断").apply {
                 font = font.deriveFont(Font.BOLD)
@@ -596,10 +875,10 @@ internal class PipelineFlowPanel(
         appendLogicNote(rows, "trace:version", 0, "日志未提供源码版本指纹；回放仅展示观察和明确标注的推断。点击行末可定位原始日志。")
         replay.warnings.forEachIndexed { index, warning -> appendLogicNote(rows, "trace:warning:$index", 0, "⚠ $warning") }
         replay.steps.forEachIndexed { index, step ->
-            appendLogicRow(rows, "trace:step:$index", step.depth, 26) { panel ->
+            val target = step.nodeName?.let { name -> currentModel.projectNodes.ifEmpty { currentModel.nodes }.singleOrNull { it.name == name } }
+            appendLogicRow(rows, "trace:step:$index", step.depth, 26, revision = listOf(trace.file, entry, step, target)) { panel ->
                 val line = JPanel(BorderLayout()).apply { isOpaque = false }
                 val task = step.event.taskId?.let { "[任务 $it] " }.orEmpty().takeIf { entry == null }.orEmpty()
-                val target = step.nodeName?.let { name -> currentModel.projectNodes.ifEmpty { currentModel.nodes }.singleOrNull { it.name == name } }
                 val label = if (target == null) JBLabel(task + step.text) else {
                     createNavigationLabel(task + step.text) { navigateToLogicNode(target) }
                 }
@@ -615,9 +894,10 @@ internal class PipelineFlowPanel(
         key: String,
         depth: Int,
         estimatedHeight: Int = 24,
+        revision: Any? = null,
         build: (JPanel) -> Unit,
     ) {
-        rows += PipelineVirtualRow(key, JBUI.scale(estimatedHeight)) {
+        rows += PipelineVirtualRow(key, JBUI.scale(estimatedHeight), revision?.let { listOf(contextKey, depth, currentModel.isGenerated, it) }, depth) {
             val content = JPanel().apply {
                 layout = BoxLayout(this, BoxLayout.Y_AXIS)
                 isOpaque = false
@@ -625,27 +905,20 @@ internal class PipelineFlowPanel(
             build(content)
             JPanel(BorderLayout()).apply {
                 isOpaque = false
-                border = JBUI.Borders.empty(2, 16, 2, 16)
-                if (depth > 0) {
-                    add(PipelineIndentGuide(depth), BorderLayout.WEST)
-                }
+                border = JBUI.Borders.empty(2, 16 + depth * 12, 2, 16)
                 add(content, BorderLayout.CENTER)
             }
         }
     }
 
     private fun appendLogicNote(rows: MutableList<PipelineVirtualRow>, key: String, depth: Int, text: String) {
-        appendLogicRow(rows, key, depth) { addLogicNote(text, it) }
+        appendLogicRow(rows, key, depth, revision = text) { addLogicNote(text, it) }
     }
 
     private fun entryRootNode(entry: PipelineEntryLocation): PipelineNodeLocation? {
-        val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
+        if (entry.issue != null) return null
         val targetFile = entry.targetFile ?: file
-        return indexedNodes.firstOrNull { node ->
-            (node.sourceFile ?: file) == targetFile && node.name == entry.entryName
-        } ?: indexedNodes.firstOrNull { node ->
-            node.name == entry.entryName
-        }
+        return currentReadingGraph().node(targetFile, entry.entryName) ?: currentReadingGraph().uniqueNode(entry.entryName)
     }
 
     private fun addLogicToolbar(container: JPanel) {
@@ -665,25 +938,32 @@ internal class PipelineFlowPanel(
                 override fun actionPerformed(event: AnActionEvent) = action()
             })
         }
-        addAction("+ 节点", "在当前 Pipeline JSON 顶层添加节点", { !currentModel.isGenerated && !currentModel.hasSyntaxErrors }) {
-            addNode()
-        }
-        addAction("重命名", "同步修改项目内引用、任务入口和 Anchor 目标", {
-            !currentModel.isGenerated && !currentModel.hasSyntaxErrors && nodeList.selectedIndex >= 0
-        }) {
-            renameSelectedNode()
-        }
-        addAction("− 节点", "删除当前节点，并提示已知引用", { !currentModel.isGenerated && nodeList.selectedIndex >= 0 }) {
-            removeSelectedNode()
-        }
         addAction("全部展开", "展开当前流程树中的所有节点") {
             collapsedLogicNodes.clear()
-            renderLogicView(currentModel.nodes.getOrNull(nodeList.selectedIndex))
+            renderLogicView(currentRoot())
+        }
+        addAction("返回阅读位置", "返回流程内定位之前的阅读位置", { readingHistory.isNotEmpty() }) {
+            readingHistory.removeLastOrNull()?.let { (key, offset) -> logicPanel.restoreAnchor(key, offset) }
+        }
+        addAction("从所选节点查看", "显式更换流程根，不改变普通节点点击行为", { selectedDetail() != null }) {
+            val node = selectedDetail() ?: return@addAction
+            saveSession()
+            selectedEntry = null
+            standaloneRoot = node
+            contextKey = "node:${logicNodeKey(node.name, node.sourceFile ?: file)}"
+            workspace.data.lastContext = contextKey
+            restoreSession()
+            updateTaskControls()
+            rebuildEffectiveContext()
+        }
+        addAction("在 IDE 打开源码", "在普通文件标签中打开选中节点的原始 JSON", { selectedDetail() != null }) {
+            val node = selectedDetail() ?: return@addAction
+            OpenFileDescriptor(project, node.sourceFile ?: file, node.nameRange.startOffset).navigate(true)
         }
         addAction("全部收起", "收起当前流程中的节点内容") {
             val nodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
             collapsedLogicNodes += nodes.map { logicNodeKey(it.name, it.sourceFile ?: file) }
-            renderLogicView(currentModel.nodes.getOrNull(nodeList.selectedIndex))
+            renderLogicView(currentRoot())
         }
         addAction("Anchor", "查看项目级 Anchor 定义、引用和运行时设置点") { showAnchorManager() }
         val actionToolbar = ActionManager.getInstance().createActionToolbar("MaaPipeline.Logic", actions, true)
@@ -705,16 +985,31 @@ internal class PipelineFlowPanel(
         ancestors: Set<String>,
         expandedNodes: MutableSet<String>,
         incoming: LogicIncomingBranch? = null,
+        instanceKey: String = logicNodeKey(location.name, location.sourceFile ?: file),
+        anchorContext: PipelineAnchorContext = PipelineAnchorContext(),
     ) {
         val sourceFile = location.sourceFile ?: file
         val nodeKey = logicNodeKey(location.name, sourceFile)
-        val isCollapsed = nodeKey in collapsedLogicNodes
-        appendLogicRow(rows, "$nodeKey:header", depth, 32) { panel ->
+        val isCollapsed = instanceKey in collapsedLogicNodes || nodeKey in collapsedLogicNodes
+        val effective = effectiveNode(location)
+        val bindings = currentReadingGraph().anchorFlow.afterNode(location, anchorContext)
+        val hasBody = effective.action != null || effective.description != null ||
+            !effective.executionPolicy.isEmpty() || effective.next.isNotEmpty() || effective.onError.isNotEmpty() ||
+            effective.embeddedReferences.any { it.kind == PipelineReferenceKind.SUBTASK }
+        val previousRow = activeLogicRows.put(nodeKey, "$instanceKey:header")
+        scheduleLogic {
+            if (previousRow == null) activeLogicRows.remove(nodeKey) else activeLogicRows[nodeKey] = previousRow
+        }
+        renderedNodeCount++
+        logicRowByNode.putIfAbsent(nodeKey, "$instanceKey:header")
+        val traceState = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)
+        appendLogicRow(rows, "$instanceKey:header", depth, 32,
+            revision = listOf(effectiveNode(location), incoming, isCollapsed, currentTrace, traceState)) { panel ->
             val traceSuffix = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)?.let {
                 " · 本次运行：${it.status.label}"
             }.orEmpty()
             val header = JPanel(BorderLayout()).apply { isOpaque = false }
-            val headerText = incoming?.let {
+            val headerText = if (!effectiveNode(location).enabled) "已禁用（enabled=false） → ${location.name}" else incoming?.let {
                     logicCandidateHeading(
                     index = it.index,
                     reference = it.reference,
@@ -722,10 +1017,12 @@ internal class PipelineFlowPanel(
                     showTargetName = true,
                     recognitionSummary = effectiveNode(location).recognition?.summary,
                     fieldName = it.fieldName,
+                    boundTargetName = location.name.takeIf { _ -> it.reference.isAnchor },
                 )
             } ?: "如果 ${PipelineConditionSummary.entryCondition(effectiveNode(location))} → ${location.name}$traceSuffix"
-            header.add(createFlowSelectionLabel(headerText, location, incoming?.fieldName == "on_error").apply {
+            header.add(createFlowSelectionLabel(headerText + if (hasBody && !isCollapsed) " {" else "", location, incoming?.fieldName == "on_error").apply {
                 font = font.deriveFont(Font.BOLD)
+                incoming?.anchorHint?.let { toolTipText += "；$it" }
             }, BorderLayout.CENTER)
             if (sourceFile != file) {
                 header.add(JBLabel(" · ${sourceFile.name}").apply {
@@ -734,8 +1031,10 @@ internal class PipelineFlowPanel(
                 }, BorderLayout.EAST)
             }
             header.add(createFoldMarker(!isCollapsed, location.name) { isExpanded ->
-                if (isExpanded) collapsedLogicNodes -= nodeKey else collapsedLogicNodes += nodeKey
-                renderLogicView(currentModel.nodes.getOrNull(nodeList.selectedIndex))
+                if (isExpanded) { collapsedLogicNodes -= instanceKey; collapsedLogicNodes -= nodeKey }
+                else collapsedLogicNodes += instanceKey
+                renderLogicView(currentRoot())
+                saveSession()
             }, BorderLayout.WEST)
             incoming?.let {
                 it.editableField?.let { fieldName ->
@@ -753,19 +1052,32 @@ internal class PipelineFlowPanel(
             panel.add(header)
         }
         if (isCollapsed) return
-        val effective = effectiveNode(location)
         PipelineConditionSummary.action(effective)?.let { action ->
-            appendLogicNote(rows, "$nodeKey:action", depth + 1, action)
+            appendLogicNote(rows, "$instanceKey:action", depth + 1, action)
         }
-        effective.description?.let { appendLogicNote(rows, "$nodeKey:description", depth + 1, "说明：$it") }
-        PipelineConditionSummary.anchor(effective)?.let { anchor ->
-            appendLogicNote(rows, "$nodeKey:anchor", depth + 1, anchor)
-        }
+        effective.description?.let { appendLogicNote(rows, "$instanceKey:description", depth + 1, "说明：$it") }
         if (!effective.executionPolicy.isEmpty()) {
-            appendLogicNote(rows, "$nodeKey:policy", depth + 1, "执行策略：${effective.executionPolicy.summary()}")
+            appendLogicNote(rows, "$instanceKey:policy", depth + 1, "执行策略：${effective.executionPolicy.summary()}")
         }
-        appendVirtualLogicBranch(location, effective.onError, "on_error", rows, depth + 1, ancestors, expandedNodes)
-        appendVirtualLogicBranch(location, effective.next, "next", rows, depth + 1, ancestors, expandedNodes)
+        if (hasBody) scheduleLogic {
+            appendLogicRow(rows, "$instanceKey:close", depth, 22, revision = "}") { panel ->
+                panel.add(JBLabel("}").apply {
+                    alignmentX = LEFT_ALIGNMENT
+                    border = JBUI.Borders.empty(0, 4)
+                    foreground = UIUtil.getContextHelpForeground()
+                })
+            }
+        }
+        scheduleLogic { appendVirtualLogicBranch(location, effective.next, "next", rows, depth + 1, ancestors, expandedNodes, instanceKey, bindings) }
+        scheduleLogic { appendVirtualLogicBranch(location, effective.onError, "on_error", rows, depth + 1, ancestors, expandedNodes, instanceKey, bindings) }
+        val subTasks = effective.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }
+        if (subTasks.isNotEmpty()) scheduleLogic {
+            appendVirtualLogicBranch(location, subTasks, "subtask", rows, depth + 1, ancestors, expandedNodes, instanceKey, bindings)
+        }
+    }
+
+    private fun scheduleLogic(action: () -> Unit) {
+        logicBuildQueue?.addLast(action) ?: action()
     }
 
     private fun appendVirtualLogicBranch(
@@ -776,50 +1088,52 @@ internal class PipelineFlowPanel(
         depth: Int,
         ancestors: Set<String>,
         expandedNodes: MutableSet<String>,
+        instanceKey: String,
+        anchorContext: PipelineAnchorContext,
+        candidateAnchor: String? = null,
     ) {
-        val branchKey = "${logicNodeKey(location.name, location.sourceFile ?: file)}:$fieldName"
-        val isError = fieldName == "on_error"
+        val branchKey = "$instanceKey:$fieldName"
         val editableFieldName = fieldName
             .takeIf { it == "next" || it == "on_error" }
             ?.takeIf { location.sourceFile == null || location.sourceFile == file }
             ?.takeIf { !hasTaskOverride(location, it) }
-        val editableField = when (editableFieldName) {
-            "next" -> location.nextField
-            "on_error" -> location.onErrorField
-            else -> null
-        }
-        if (references.isEmpty() && isError) return
+        if (references.isEmpty()) return
+        val bindings = currentReadingGraph().anchorFlow.forBranch(references, fieldName, anchorContext)
         // 分支类型已经写进候选标题，省略独立的 on_error 容器，避免同一目标多出一层空壳。
         if (hasTaskOverride(location, fieldName)) {
             appendLogicNote(rows, "$branchKey:override", depth, "字段来自当前任务的 pipeline_override；它替换默认列表。")
         }
-        if (references.isEmpty()) {
-            appendLogicNote(rows, "$branchKey:empty", depth, if (isError) {
-                "未声明错误后继，失败后按当前节点策略处理。"
-            } else {
-                "本轮没有成功后继，按当前节点策略重试或结束。"
-            })
-            return
+        if (fieldName == "next") {
+            PipelineConditionSummary.successorLoop(effectiveNode(location))?.let {
+                appendLogicNote(rows, "$branchKey:retry", depth, it)
+            }
         }
-        val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
-        references.forEachIndexed { index, reference ->
+        for (index in references.indices.reversed()) scheduleLogic {
+            val reference = references[index]
             val candidateKey = "$branchKey:$index"
             val target = reference.target
-            val targetLocation = target?.let { targetNode ->
-                indexedNodes.firstOrNull { (it.sourceFile ?: file) == targetNode.file && it.name == targetNode.name }
+            val anchorResolution = reference.takeIf { it.isAnchor }?.let { currentReadingGraph().anchorFlow.resolve(it, bindings) }
+            val targetLocation = if (reference.isAnchor) anchorResolution?.inlineTarget else target?.let { targetNode ->
+                currentReadingGraph().node(targetNode.file, targetNode.name)
             }
             val targetKey = targetLocation?.let { logicNodeKey(it.name, it.sourceFile ?: file) }
+            val targetRow = activeLogicRows[targetKey] ?: logicRowByNode[targetKey]
+            val expansionBoundary = targetKey?.let {
+                PipelineExpansionPolicy.boundary(it, ancestors, expandedNodes, candidateKey in expandedBranches,
+                    renderedNodeCount, nodeBudget)
+            }
             val boundary = when {
-                reference.isAnchor -> "动态 Anchor 不在静态视图中展开，请点击候选卡片查看定义。"
-                target == null -> "目标 ${reference.targetName} 未解析，保留为边界。"
-                targetLocation == null -> "跨文件目标未在当前项目索引中展开：${displayPath(target.file)} → ${target.name}。"
-                targetKey in ancestors -> "↩ 循环回到 ${targetLocation.name}，停止继续展开。"
-                targetKey in expandedNodes -> "⇉ 共享节点 ${targetLocation.name} 已在上方展开，当前分支保留为链接。"
-                expandedNodes.size >= MAX_LOGIC_NODES -> "已达到静态展开上限（$MAX_LOGIC_NODES 个唯一节点），当前目标保留为链接：${targetLocation.name}。"
+                reference.isAnchor && targetLocation == null -> "运行时绑定"
+                target == null && targetLocation == null -> "目标 ${reference.targetName} 未解析，保留为边界。"
+                targetLocation == null && target != null -> "跨文件目标未在当前项目索引中展开：${displayPath(target.file)} → ${target.name}。"
+                expansionBoundary == PipelineExpansionBoundary.CYCLE -> "↩ 循环"
+                expansionBoundary == PipelineExpansionBoundary.SHARED -> "⇉ 共享"
+                expansionBoundary == PipelineExpansionBoundary.BUDGET -> "后续流程尚未展开，可继续加载下一批。"
                 else -> null
             }
             if (boundary != null) {
-                appendLogicRow(rows, "$candidateKey:card", depth, 52) {
+                appendLogicRow(rows, "$candidateKey:card", depth, 52,
+                    revision = listOf(reference, location, targetLocation?.let(::effectiveNode), editableFieldName, fieldName, index, references.size, currentTrace, expansionBoundary, anchorResolution)) {
                     addLogicCandidateCard(
                         index = index,
                         reference = reference,
@@ -831,9 +1145,43 @@ internal class PipelineFlowPanel(
                         referenceCount = references.size,
                         targetLocation = targetLocation,
                         showTargetName = true,
+                        boundaryKind = expansionBoundary,
+                        anchorResolution = anchorResolution,
                     )
                 }
-                appendLogicNote(rows, "$candidateKey:boundary", depth, boundary)
+                if (!reference.isAnchor && expansionBoundary != PipelineExpansionBoundary.CYCLE && expansionBoundary != PipelineExpansionBoundary.SHARED) {
+                    appendLogicNote(rows, "$candidateKey:boundary", depth, boundary)
+                }
+                if (reference.isAnchor && targetLocation == null) {
+                    appendAnchorCandidates(location, reference, candidateKey, rows, depth, ancestors, expandedNodes, bindings, anchorResolution!!)
+                } else if (targetLocation != null) {
+                    appendLogicRow(rows, "$candidateKey:continue", depth, 30,
+                        revision = listOf(targetLocation, targetRow, candidateKey, expansionBoundary)) { panel ->
+                        if (expansionBoundary == PipelineExpansionBoundary.CYCLE || expansionBoundary == PipelineExpansionBoundary.SHARED) {
+                            panel.add(JButton(if (expansionBoundary == PipelineExpansionBoundary.CYCLE) "↩ 回到此层" else "定位流程中的节点").apply {
+                                isFocusable = false
+                                alignmentX = LEFT_ALIGNMENT
+                                addActionListener {
+                                    logicPanel.scrollAnchor()?.let(readingHistory::addLast)
+                                    targetRow?.let { logicPanel.restoreAnchor(it); logicPanel.activateRow(it) }
+                                    inspectNode(targetLocation)
+                                }
+                            })
+                        }
+                        if (expansionBoundary != PipelineExpansionBoundary.CYCLE) panel.add(JButton(
+                            if (expansionBoundary == PipelineExpansionBoundary.BUDGET) "继续展开（下一批）" else "在此展开"
+                        ).apply {
+                            isFocusable = false
+                            alignmentX = LEFT_ALIGNMENT
+                            addActionListener {
+                                expandedBranches += candidateKey
+                                if (renderedNodeCount >= nodeBudget) nodeBudget += MAX_LOGIC_NODES
+                                renderLogicView(currentRoot())
+                                saveSession()
+                            }
+                        })
+                    }
+                }
             } else if (targetLocation != null && targetKey != null) {
                 expandedNodes += targetKey
                 appendVirtualLogicNode(
@@ -842,6 +1190,8 @@ internal class PipelineFlowPanel(
                     depth,
                     ancestors + targetKey,
                     expandedNodes,
+                    instanceKey = PipelineExpansionPolicy.instanceKey(candidateKey, targetKey),
+                    anchorContext = candidateAnchor?.let { bindings.bind(it, reference.targetName) } ?: bindings,
                     incoming = LogicIncomingBranch(
                         index = index,
                         reference = reference,
@@ -849,15 +1199,36 @@ internal class PipelineFlowPanel(
                         editableField = editableFieldName,
                         fieldName = fieldName,
                         referenceCount = references.size,
+                        anchorHint = anchorResolution?.hint(),
                     ),
                 )
             }
         }
-        appendLogicNote(rows, "$branchKey:otherwise", depth, if (isError) {
-            "否则：错误分支均未成功，按当前节点策略处理。"
-        } else {
-            "否则：成功候选均未满足，按当前节点策略重试或结束。"
-        })
+    }
+
+    private fun appendAnchorCandidates(location: PipelineNodeLocation, reference: PipelineReference, key: String,
+        rows: MutableList<PipelineVirtualRow>, depth: Int, ancestors: Set<String>, expandedNodes: MutableSet<String>,
+        bindings: PipelineAnchorContext, resolution: PipelineAnchorResolution) {
+        val candidates = resolution.targets.map { target ->
+            reference.copy(targetName = target.name, displayName = target.name, isAnchor = false,
+                targetExists = true, isAnchorUnresolved = false, target = PipelineNodeTarget(target.sourceFile ?: file, target.name, target.nameRange,
+                    target.description, target.recognition?.summary, target.action?.summary, target.next.size))
+        }
+        if (candidates.isEmpty()) return
+        appendLogicRow(rows, "$key:candidates", depth, 30, revision = listOf(candidates, key in expandedBranches)) { panel ->
+            panel.add(JButton(if (key in expandedBranches) "收起候选分支" else "查看 ${candidates.size} 个可能目标").apply {
+                isFocusable = false
+                addActionListener {
+                    if (!expandedBranches.add(key)) expandedBranches.remove(key)
+                    renderLogicView(currentRoot())
+                    saveSession()
+                }
+            })
+        }
+        if (key in expandedBranches) scheduleLogic {
+            appendVirtualLogicBranch(location, candidates, "anchor_candidate", rows, depth + 1,
+                ancestors, expandedNodes, "$key:dynamic", bindings, reference.targetName)
+        }
     }
 
     private fun createFoldMarker(
@@ -930,6 +1301,8 @@ internal class PipelineFlowPanel(
         referenceCount: Int = 1,
         targetLocation: PipelineNodeLocation? = null,
         showTargetName: Boolean = true,
+        boundaryKind: PipelineExpansionBoundary? = null,
+        anchorResolution: PipelineAnchorResolution? = null,
     ) {
         val traceOutcome = currentTrace?.let { trace ->
             listOf(reference.targetName, reference.displayName)
@@ -950,19 +1323,25 @@ internal class PipelineFlowPanel(
                 showTargetName = showTargetName,
                 recognitionSummary = targetLocation?.let { effectiveNode(it).recognition?.summary },
                 fieldName = fieldName,
+                boundTargetName = targetLocation?.name.takeIf { reference.isAnchor },
+                clearedAnchor = anchorResolution?.isCleared == true,
             )
-        val card = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        val card = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = JBUI.Borders.empty(2, 0)
             alignmentX = LEFT_ALIGNMENT
         }
-        val header = JPanel(BorderLayout()).apply { isOpaque = false }
-        header.add(
-            createFlowReferenceLabel(heading, reference, targetLocation, fieldName == "on_error"),
+        val boundaryLabel = when (boundaryKind) {
+            PipelineExpansionBoundary.CYCLE -> " · ↩ 循环"
+            PipelineExpansionBoundary.SHARED -> " · ⇉ 共享"
+            else -> ""
+        }
+        card.add(
+            createFlowReferenceLabel(heading + boundaryLabel, reference, targetLocation, fieldName == "on_error").apply {
+                anchorResolution?.let { toolTipText = it.hint() }
+            },
             BorderLayout.CENTER,
         )
-        card.add(header)
         if (editableField != null && sourceLocation != null) {
             addLogicCandidateControls(
                 container = card,
@@ -971,6 +1350,7 @@ internal class PipelineFlowPanel(
                 sourceLocation = sourceLocation,
                 editableField = editableField,
                 referenceCount = referenceCount,
+                bottomSlot = true,
             )
         }
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
@@ -984,7 +1364,19 @@ internal class PipelineFlowPanel(
         showTargetName: Boolean,
         recognitionSummary: String? = null,
         fieldName: String = "next",
+        boundTargetName: String? = null,
+        clearedAnchor: Boolean = false,
     ): String {
+        if (fieldName == "subtask") return "${index + 1}. 调用子任务 → ${reference.targetName}"
+        if (fieldName == "anchor_candidate") return "可能目标（运行时绑定） → ${reference.targetName}"
+        if (reference.isAnchor && boundTargetName == null) {
+            return "${index + 1}. ${if (clearedAnchor) "跳过" else PipelineConditionSummary.candidatePrefix(index, fieldName)} ${reference.targetName} · 运行时绑定"
+        }
+        val presentation = if (boundTargetName == null) reference else reference.copy(
+            targetName = boundTargetName, isAnchor = false, targetExists = true,
+            target = null,
+            isAnchorUnresolved = false, isAmbiguousTarget = false, isCrossFile = false, isJumpBack = false,
+        )
         val traceOutcome = currentTrace?.let { trace ->
             listOf(reference.targetName, reference.displayName)
                 .asSequence()
@@ -1001,8 +1393,12 @@ internal class PipelineFlowPanel(
             append("${index + 1}. ")
             append(PipelineConditionSummary.candidatePrefix(index, fieldName))
             append(" ")
-            append(PipelineConditionSummary.candidateLabel(reference, recognitionSummary))
-            append(if (showTargetName) " → ${reference.targetName}" else " →")
+            append(PipelineConditionSummary.candidateLabel(presentation, recognitionSummary))
+            append(if (showTargetName) " → ${boundTargetName ?: reference.targetName}" else " →")
+            if (boundTargetName != null) {
+                append(" · 运行时绑定")
+                if (reference.isJumpBack) append(" · ↩ 返回")
+            }
             traceOutcome?.let { append(" · ${it.label}") }
         }
     }
@@ -1053,6 +1449,7 @@ internal class PipelineFlowPanel(
         val editableField: String?,
         val fieldName: String,
         val referenceCount: Int,
+        val anchorHint: String? = null,
     )
 
     private fun addLogicNote(text: String, container: JPanel = logicPanel) {
@@ -1066,12 +1463,10 @@ internal class PipelineFlowPanel(
 
     private fun hasTaskOverride(location: PipelineNodeLocation, fieldName: String): Boolean {
         if (!overrideToggle.isSelected) return false
-        val entry = selectedEntry ?: return false
-        return currentModel.pipelineOverrides
-            .firstOrNull { it.file == entry.file && it.targetName == location.name }
-            ?.fields
-            ?.any { it.name == fieldName }
-            ?: false
+        if (selectedEntry == null) return false
+        return currentOverrides().any { override ->
+            override.targetName == location.name && override.fields.any { it.name == fieldName }
+        }
     }
 
     private fun addControlFlowExplanation(location: PipelineNodeLocation, sourceFile: VirtualFile) {
@@ -1121,7 +1516,8 @@ internal class PipelineFlowPanel(
         if (field != null) {
             row.add(JButton("编辑").apply {
                 toolTipText = if (fieldSourceFile == file) "编辑当前字段" else "该字段来自其它文件，点击内容可打开源文件"
-                isEnabled = !currentModel.isGenerated && fieldSourceFile == file
+                isEnabled = !currentModel.isGenerated && fieldSourceFile == file && !field.isDerived
+                if (field.isDerived) toolTipText = "有效值由多个来源合成，请在下方覆盖来源或原始 JSON 中编辑"
                 isFocusable = false
                 addActionListener {
                     if (field.isString) editStringField(field) else editJsonField(field)
@@ -1140,42 +1536,8 @@ internal class PipelineFlowPanel(
         })
     }
 
-    private fun addFieldSummary(title: String, field: PipelineFieldLocation?, sourceFile: VirtualFile = file) {
-        if (field == null) return
-        val fieldSourceFile = field.sourceFile ?: sourceFile
-        detailsPanel.add(createSectionLabel(title))
-        val row = JPanel(BorderLayout()).apply {
-            isOpaque = false
-            alignmentX = LEFT_ALIGNMENT
-            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
-        }
-        row.add(createNavigationLabel(field.summary) {
-            navigateToFileRange(fieldSourceFile, field.range)
-        }, BorderLayout.CENTER)
-        row.add(JButton("编辑").apply {
-            toolTipText = if (field.isString) {
-                "只替换当前字符串值，保留 JSON 其它内容"
-            } else {
-                "在 JSON 子编辑器中修改当前值"
-            }
-            isEnabled = !currentModel.isGenerated && fieldSourceFile == file
-            if (fieldSourceFile != file) toolTipText = "该字段来自其它文件，当前详情只读；点击内容可打开源文件"
-            isFocusable = false
-            addActionListener {
-                if (field.isString) editStringField(field) else editJsonField(field)
-            }
-        }, BorderLayout.EAST)
-        detailsPanel.add(row)
-    }
-
     private fun addAnchorDefinitions(location: PipelineNodeLocation, sourceFile: VirtualFile = file) {
-        if (location.anchorDefinitions.isEmpty()) {
-            detailsPanel.add(JButton("管理项目 Anchor").apply {
-                isFocusable = false
-                addActionListener { showAnchorManager() }
-            })
-            return
-        }
+        if (location.anchorDefinitions.isEmpty()) return
         detailsPanel.add(createSectionLabel("Anchor 定义"))
         location.anchorDefinitions.forEach { definition ->
             val target = definition.targetNodeName ?: "当前节点（运行时绑定）"
@@ -1189,7 +1551,7 @@ internal class PipelineFlowPanel(
         location.anchor?.let { field ->
             detailsPanel.add(JButton("编辑 Anchor 定义").apply {
                 isFocusable = false
-                isEnabled = !currentModel.isGenerated && sourceFile == file
+                isEnabled = !currentModel.isGenerated && sourceFile == file && !field.isDerived
                 if (sourceFile != file) toolTipText = "跨文件节点详情只读；点击 Anchor 可打开源文件"
                 toolTipText = "编辑当前节点的完整 anchor 字段，保留其它节点和注释"
                 addActionListener {
@@ -1664,28 +2026,19 @@ internal class PipelineFlowPanel(
     }
 
     private fun addNodeDiagnostics(location: PipelineNodeLocation) {
-        val overrides = currentModel.pipelineOverrides.filter { it.targetName == location.name }
         val entries = currentModel.pipelineEntries.filter { it.entryName == location.name }
         val diagnostics = currentModel.diagnostics.filter { diagnostic ->
-            diagnostic.range.startOffset >= location.propertyRange.startOffset &&
+            diagnostic.file == (location.sourceFile ?: file) &&
+                diagnostic.range.startOffset >= location.propertyRange.startOffset &&
                 diagnostic.range.endOffset <= location.propertyRange.endOffset
         }
-        if (entries.isEmpty() && overrides.isEmpty() && diagnostics.isEmpty()) return
+        if (entries.isEmpty() && diagnostics.isEmpty()) return
         detailsPanel.add(createSectionLabel("项目诊断"))
         entries.forEach { entry ->
             detailsPanel.add(
                 createNavigationLabel("任务入口：${displayPath(entry.file)} → ${entry.entryName}") {
                     navigateToFileRange(entry.file, entry.range)
                 },
-            )
-        }
-        overrides.forEach { override ->
-            val fields = override.fields.takeIf { it.isNotEmpty() }?.joinToString(", ") { it.name }.orEmpty()
-            val suffix = fields.takeIf { it.isNotEmpty() }?.let { "（字段：$it）" }.orEmpty()
-            detailsPanel.add(
-                createNavigationLabel(
-                    "pipeline_override：${displayPath(override.file)} → ${override.targetName}$suffix",
-                ) { navigateToFileRange(override.file, override.range) },
             )
         }
         diagnostics.forEach { diagnostic ->
@@ -1703,28 +2056,25 @@ internal class PipelineFlowPanel(
 
     private fun addTaskOverrideSummary(location: PipelineNodeLocation) {
         val entry = selectedEntry ?: return
-        detailsPanel.add(createSectionLabel("任务有效值"))
+        if (!overrideToggle.isSelected) return
+        val overrides = currentOverrides().filter { it.targetName == location.name }
+        if (overrides.isEmpty()) {
+            detailsPanel.add(createOverrideAddButton(location, null))
+            return
+        }
+        detailsPanel.add(createSectionLabel("覆盖来源 · 按生效顺序"))
         detailsPanel.add(
             createNavigationLabel("任务：${displayPath(entry.file)} → ${entry.entryName}") {
                 navigateToFileRange(entry.file, entry.range)
             },
         )
-        if (!overrideToggle.isSelected) {
-            detailsPanel.add(JBLabel("当前未应用任务覆盖，下面字段均为 Pipeline 默认值").apply {
-                foreground = UIUtil.getContextHelpForeground()
-            })
-            return
-        }
-        val override = currentModel.pipelineOverrides.firstOrNull {
-            it.file == entry.file && it.targetName == location.name
-        }
-        if (override == null) {
-            detailsPanel.add(JBLabel("当前任务未覆盖此节点，所有字段使用默认值").apply {
-                foreground = UIUtil.getContextHelpForeground()
-            })
-            detailsPanel.add(createOverrideAddButton(location, null))
-            return
-        }
+        overrides.forEach { addOverrideSource(location, it) }
+    }
+
+    private fun addOverrideSource(location: PipelineNodeLocation, override: PipelineOverrideLocation) {
+        detailsPanel.add(createNavigationLabel("来源：${displayPath(override.file)} ${override.contextPath.substringAfter('#')}") {
+            navigateToFileRange(override.file, override.range)
+        })
         if (override.fields.isEmpty()) {
             detailsPanel.add(JBLabel("当前任务存在覆盖对象，但没有可展示的字段").apply {
                 foreground = UIUtil.getContextHelpForeground()
@@ -1747,7 +2097,7 @@ internal class PipelineFlowPanel(
                 maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
             }
             row.add(
-                createNavigationLabel("覆盖值：${field.summary}") {
+                createNavigationLabel("此处覆盖：${field.summary}") {
                     navigateToFileRange(override.file, field.range)
                 },
                 BorderLayout.CENTER,
@@ -1766,9 +2116,6 @@ internal class PipelineFlowPanel(
                 })
             }, BorderLayout.EAST)
             detailsPanel.add(row)
-            detailsPanel.add(JBLabel("有效值：${field.summary}").apply {
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            })
         }
         detailsPanel.add(createOverrideAddButton(location, override))
     }
@@ -1785,7 +2132,7 @@ internal class PipelineFlowPanel(
 
     private fun addOverrideField(location: PipelineNodeLocation, override: PipelineOverrideLocation?) {
         val entry = selectedEntry ?: return
-        val taskFile = entry.file
+        val taskFile = override?.file ?: entry.file
         val taskDocument = documentFor(taskFile) ?: return
         val expectedVersion = override?.version ?: taskDocument.modificationStamp
         if (!ensureOverrideEditable(taskFile, expectedVersion)) return
@@ -1811,7 +2158,8 @@ internal class PipelineFlowPanel(
         PsiDocumentManager.getInstance(project).commitDocument(taskDocument)
         val insertionPlan = ReadAction.compute<OverrideInsertionPlan?, RuntimeException> {
             val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@compute null
-            val pipelineOverrideProperty = findJsonProperty(jsonFile, "pipeline_override")
+            val owner = taskContextObject(jsonFile, override?.contextPath ?: entry.contextPath) ?: return@compute null
+            val pipelineOverrideProperty = owner.findProperty("pipeline_override")
             val targetProperty = (pipelineOverrideProperty?.value as? JsonObject)
                 ?.propertyList
                 ?.firstOrNull { it.name == location.name }
@@ -1831,7 +2179,7 @@ internal class PipelineFlowPanel(
                     }
                 }
                 else -> {
-                    (jsonFile.topLevelValue as? JsonObject)?.textRange?.let {
+                    owner.textRange?.let {
                         OverrideInsertionPlan(
                             it,
                             "pipeline_override",
@@ -1986,94 +2334,41 @@ internal class PipelineFlowPanel(
 
     private fun effectiveNode(location: PipelineNodeLocation): PipelineNodeLocation {
         if (!overrideToggle.isSelected) return location
-        val entry = selectedEntry ?: return location
-        val override = currentModel.pipelineOverrides.firstOrNull {
-            it.file == entry.file && it.targetName == location.name
-        } ?: return location
-        return override.fields.fold(location) { effective, field ->
-            when (field.name) {
-                "desc" -> effective.copy(description = field.summary)
-                "recognition" -> effective.copy(recognition = field)
-                "action" -> effective.copy(action = field)
-                "anchor" -> effective.copy(anchor = field)
-                "next" -> effective.copy(nextField = field, next = field.references)
-                "on_error" -> effective.copy(onErrorField = field, onError = field.references)
-                "timeout" -> effective.copy(
-                    executionPolicy = effective.executionPolicy.copy(timeout = field),
-                )
+        return effectiveNodes[logicNodeKey(location.name, location.sourceFile ?: file)] ?: location
+    }
 
-                "rate_limit" -> effective.copy(
-                    executionPolicy = effective.executionPolicy.copy(rateLimit = field),
-                )
-
-                "max_hit" -> effective.copy(
-                    executionPolicy = effective.executionPolicy.copy(maxHit = field),
-                )
-
-                else -> effective
-            }
+    private fun taskContextObject(json: JsonFile, context: String): JsonObject? {
+        var value: com.intellij.json.psi.JsonValue = json.topLevelValue ?: return null
+        val pointer = context.substringAfter('#', context)
+        for (part in pointer.split('/').drop(1)) {
+            val key = part.replace("~1", "/").replace("~0", "~")
+            value = when (val owner = value) {
+                is JsonObject -> owner.findProperty(key)?.value
+                is com.intellij.json.psi.JsonArray -> key.toIntOrNull()?.let { owner.valueList.getOrNull(it) }
+                else -> null
+            } ?: return null
         }
+        return value as? JsonObject
     }
 
     private fun reachableNodeNames(): Set<String>? {
-        val entry = selectedEntry ?: return null
-        val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
-        val nodesByKey = indexedNodes.associateBy { node ->
-            logicNodeKey(node.name, node.sourceFile ?: file)
-        }
-        val root = entryRootNode(entry) ?: return emptySet()
-        val reachable = linkedSetOf<String>()
-        val visited = mutableSetOf<String>()
-        fun visit(node: PipelineNodeLocation) {
-            val nodeFile = node.sourceFile ?: file
-            val nodeKey = logicNodeKey(node.name, nodeFile)
-            if (!visited.add(nodeKey)) return
-            if (nodeFile == file) reachable += node.name
-            effectiveNode(node).next
-                .plus(effectiveNode(node).onError)
-                .mapNotNull { reference -> reference.target?.let { target ->
-                    nodesByKey[logicNodeKey(target.name, target.file)]
-                }
-                }
-                .forEach(::visit)
-        }
-        visit(root)
-        return reachable
+        val root = currentRoot() ?: return null
+        val graph = currentReadingGraph()
+        val reachable = graph.reachable(root)
+        return currentModel.nodes.filter { PipelineReadingGraph.key(it) in reachable }.mapTo(linkedSetOf()) { it.name }
     }
 
     private fun staticPathTo(target: PipelineNodeLocation): List<String>? {
-        val entry = selectedEntry ?: return null
-        val indexedNodes = currentModel.projectNodes.ifEmpty { currentModel.nodes }
-        val nodesByKey = indexedNodes.associateBy { node ->
-            logicNodeKey(node.name, node.sourceFile ?: file)
+        val root = currentRoot() ?: return null
+        return currentReadingGraph().path(root, target)?.map { (label, node) ->
+            if (label.isEmpty()) nodePathLabel(node) else "$label → ${nodePathLabel(node)}"
         }
-        val root = entryRootNode(entry) ?: return null
-        val targetKey = logicNodeKey(target.name, target.sourceFile ?: file)
-        val queue = ArrayDeque<Pair<String, List<String>>>()
-        val visited = mutableSetOf<String>()
-        val rootKey = logicNodeKey(root.name, root.sourceFile ?: file)
-        queue.addLast(rootKey to listOf(nodePathLabel(root)))
-        while (queue.isNotEmpty()) {
-            val (currentKey, path) = queue.removeFirst()
-            val current = nodesByKey[currentKey] ?: continue
-            if (currentKey == targetKey) {
-                return path
-            }
-            if (!visited.add(currentKey)) continue
-            listOf(
-                "next" to effectiveNode(current).next,
-                "on_error" to effectiveNode(current).onError,
-            ).forEach { (fieldName, references) ->
-                references.forEach { reference ->
-                    val target = reference.target ?: return@forEach
-                    val nextKey = logicNodeKey(target.name, target.file)
-                    if (nextKey in nodesByKey) {
-                        queue.addLast(nextKey to (path + "$fieldName → ${nodePathLabel(nodesByKey.getValue(nextKey))}"))
-                    }
-                }
-            }
-        }
-        return null
+    }
+
+    private fun currentReadingGraph(): PipelineReadingGraph = readingGraph ?: run {
+        val effective = effectiveNodes
+        PipelineReadingGraph(currentModel.projectNodes) { effective[PipelineReadingGraph.key(it)] ?: it }
+            .also { readingGraph = it }
     }
 
     private fun nodePathLabel(location: PipelineNodeLocation): String {
@@ -2205,7 +2500,7 @@ internal class PipelineFlowPanel(
                 traceSourceVersions = sourceVersions
                 updateSummary()
                 nodeList.repaint()
-                renderSelectedNode()
+                renderSelectedNode(updateFlow = true)
             }
 
             override fun onCancel() {
@@ -2293,6 +2588,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun editStringField(field: PipelineFieldLocation) {
+        if (field.isDerived) return
         if (!ensureEditable()) return
         val snapshot = captureEditSnapshot()
         val newValue = Messages.showInputDialog(
@@ -2326,6 +2622,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun editJsonField(field: PipelineFieldLocation) {
+        if (field.isDerived) return
         if (!ensureEditable()) return
         val snapshot = captureEditSnapshot()
         val range = field.valueRange
@@ -2753,12 +3050,10 @@ internal class PipelineFlowPanel(
             }
 
             override fun mouseClicked(event: MouseEvent) {
-                if (event.button != MouseEvent.BUTTON1) return
                 if (isFlowSourceNavigationGesture(event)) {
                     navigateToFileRange(location.sourceFile ?: file, location.nameRange)
-                } else {
-                    inspectedLogicNode = location
-                    renderSelectedNode()
+                } else if (event.button == MouseEvent.BUTTON1) {
+                    inspectNode(location)
                 }
             }
         })
@@ -2768,32 +3063,22 @@ internal class PipelineFlowPanel(
         val configured = KeymapManager.getInstance().activeKeymap
             .getShortcuts(IdeActions.ACTION_GOTO_DECLARATION)
             .filterIsInstance<MouseShortcut>()
-        if (configured.any { shortcut ->
-                shortcut.button == event.button && configuredMouseModifiersMatch(shortcut.modifiers, event)
-            }) {
-            return true
-        }
+        if (configured.isNotEmpty()) return configured.any { shortcut ->
+                shortcut.button == event.button && shortcut.clickCount == event.clickCount &&
+                    configuredMouseModifiersMatch(shortcut.modifiers, event)
+            }
         // Windows 的 MouseEvent.modifiers 与 IDEA MouseShortcut.modifiers 可能使用不同掩码；
         // 即使当前 keymap 没有暴露鼠标快捷键，也保留 IDEA 通用的 Ctrl/Meta+点击约定。
-        return event.isControlDown || event.isMetaDown
+        return event.button == MouseEvent.BUTTON1 && (event.isControlDown || event.isMetaDown)
     }
 
     private fun configuredMouseModifiersMatch(configured: Int, event: MouseEvent): Boolean {
-        fun configuredMaskDown(legacyMask: Int, extendedMask: Int, actual: Boolean): Boolean =
-            configured and (legacyMask or extendedMask) != 0 && actual
-
-        val controlRequired = configuredMaskDown(InputEvent.CTRL_MASK, InputEvent.CTRL_DOWN_MASK, event.isControlDown)
-        val altRequired = configuredMaskDown(InputEvent.ALT_MASK, InputEvent.ALT_DOWN_MASK, event.isAltDown)
-        val shiftRequired = configuredMaskDown(InputEvent.SHIFT_MASK, InputEvent.SHIFT_DOWN_MASK, event.isShiftDown)
-        val metaRequired = configuredMaskDown(InputEvent.META_MASK, InputEvent.META_DOWN_MASK, event.isMetaDown)
         val hasControl = configured and (InputEvent.CTRL_MASK or InputEvent.CTRL_DOWN_MASK) != 0
         val hasAlt = configured and (InputEvent.ALT_MASK or InputEvent.ALT_DOWN_MASK) != 0
         val hasShift = configured and (InputEvent.SHIFT_MASK or InputEvent.SHIFT_DOWN_MASK) != 0
         val hasMeta = configured and (InputEvent.META_MASK or InputEvent.META_DOWN_MASK) != 0
-        return hasControl == controlRequired &&
-            hasAlt == altRequired &&
-            hasShift == shiftRequired &&
-            hasMeta == metaRequired
+        return hasControl == event.isControlDown && hasAlt == event.isAltDown &&
+            hasShift == event.isShiftDown && hasMeta == event.isMetaDown
     }
 
     private fun createFlowReferenceLabel(
@@ -2840,36 +3125,11 @@ internal class PipelineFlowPanel(
     }
 
     private fun navigateToLogicNode(location: PipelineNodeLocation) {
-        val sourceFile = location.sourceFile ?: file
-        if (sourceFile != file) {
-            navigateToFileRange(sourceFile, location.nameRange)
-            return
-        }
-        val index = currentModel.nodes.indexOfFirst { node -> node.name == location.name }
-        if (index < 0) {
-            navigateToRange(location.nameRange)
-            return
-        }
-        selectingFromSource = true
-        try {
-            nodeList.selectedIndex = index
-        } finally {
-            selectingFromSource = false
-        }
-        renderSelectedNode()
+        inspectNode(location)
     }
 
     private fun navigateToRange(range: TextRange) {
-        if (editor.document.textLength == 0) return
-        showSourceForNavigation()
-        val offset = range.startOffset.coerceIn(0, editor.document.textLength)
-        // 切换标签页后再定位，避免源码组件尚未挂载时光标移动被流程页覆盖。
-        ApplicationManager.getApplication().invokeLater({
-            if (disposed || editor.isDisposed) return@invokeLater
-            editor.caretModel.moveToOffset(offset)
-            editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
-            editor.contentComponent.requestFocusInWindow()
-        }, ModalityState.any())
+        navigateToFileRange(file, range)
     }
 
     private fun navigateToReference(reference: PipelineReference) {
@@ -2893,39 +3153,12 @@ internal class PipelineFlowPanel(
     }
 
     private fun navigateToFileRange(targetFile: com.intellij.openapi.vfs.VirtualFile, range: TextRange) {
-        if (targetFile == file) {
-            navigateToRange(range)
-            return
-        }
-
-        val requestedOffset = range.startOffset.coerceAtLeast(0)
-        ReadAction.nonBlocking<NavigationPosition?> {
-            val targetDocument = FileDocumentManager.getInstance().getDocument(targetFile)
-            if (targetDocument == null) {
-                null
-            } else {
-                val offset = requestedOffset.coerceIn(0, targetDocument.textLength)
-                val line = targetDocument.getLineNumber(offset)
-                NavigationPosition(offset, line, offset - targetDocument.getLineStartOffset(line))
-            }
-        }.expireWith(this).finishOnUiThread(ModalityState.any()) { position ->
-            if (disposed || !targetFile.isValid) return@finishOnUiThread
-            val descriptor = if (position == null) {
-                OpenFileDescriptor(project, targetFile, requestedOffset)
-            } else {
-                OpenFileDescriptor(project, targetFile, position.line, position.column)
-            }
-            val targetEditors = FileEditorManager.getInstance(project).openFile(targetFile, true)
-            val pipelineEditor = targetEditors
-                .filterIsInstance<PipelineFileEditor>()
-                .firstOrNull()
-            if (pipelineEditor != null && position != null) {
-                // 自定义文件编辑器隐藏了 IDEA 默认文本编辑器，必须把偏移继续传入其内部源码编辑器。
-                pipelineEditor.navigateToOffset(position.offset)
-            } else {
-                descriptor.navigate(true)
-            }
-        }.submit(AppExecutorUtil.getAppExecutorService())
+        restoring = true
+        try {
+            rightTabs.selectedIndex = 1
+            source.showFile(targetFile, range, true)
+        } finally { restoring = false }
+        saveSession()
     }
 
     private data class NavigationPosition(
@@ -2935,7 +3168,10 @@ internal class PipelineFlowPanel(
     )
 
     override fun dispose() {
+        saveSession()
         disposed = true
+        refreshing = true
+        source.onCaret = { _, _ -> }
         nodeListModel.clear()
     }
 }

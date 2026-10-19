@@ -32,17 +32,16 @@ class PipelineControlFlowExplanationTest {
             listOf(
                 PipelineControlFlowLineKind.DESCRIPTION,
                 PipelineControlFlowLineKind.ERROR_CANDIDATE,
-                PipelineControlFlowLineKind.TERMINAL,
+                PipelineControlFlowLineKind.RETRY_POLICY,
                 PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
                 PipelineControlFlowLineKind.SUCCESS_CANDIDATE,
-                PipelineControlFlowLineKind.TERMINAL,
             ),
             lines.map { it.kind },
         )
         assertEquals("失败时如果节点可执行 → Recover", lines[1].text)
+        assertEquals("重试匹配后继（超时 20000ms，轮次间隔至少 1000ms）", lines[2].text)
         assertEquals("如果节点可执行 → Check", lines[3].text)
         assertEquals("否则如果节点可执行 → Fallback", lines[4].text)
-        assertEquals("否则：所有成功后继均未识别到，按当前执行策略重试或结束。", lines[5].text)
         assertSame(first, lines[3].reference)
     }
 
@@ -66,8 +65,8 @@ class PipelineControlFlowExplanationTest {
 
         val lines = PipelineControlFlowExplanation.explain(node)
 
-        assertEquals("如果运行时 Anchor Checkpoint 已解析，完成后返回父流程，跨文件 → Checkpoint", lines[1].text)
-        assertEquals("否则：所有成功后继均未识别到，按当前执行策略重试或结束。", lines[2].text)
+        assertEquals("如果运行时 Anchor Checkpoint 已解析，完成后返回父流程，跨文件 → Checkpoint", lines[2].text)
+        assertEquals("重试匹配后继（超时 20000ms，轮次间隔至少 1000ms）", lines[1].text)
         assertEquals(3, lines.size)
     }
 
@@ -88,7 +87,7 @@ class PipelineControlFlowExplanationTest {
         val lines = PipelineControlFlowExplanation.explain(node)
 
         assertEquals(PipelineControlFlowLineKind.RETRY_POLICY, lines[1].kind)
-        assertEquals("执行策略：timeout=5000，rate_limit=100，max_hit=2；无成功候选时由运行策略决定重试或结束。", lines[1].text)
-        assertEquals("没有声明后继，按上述执行策略重试或结束。", lines.last().text)
+        assertEquals("执行策略：timeout=5000，rate_limit=100，max_hit=2", lines[1].text)
+        assertEquals(2, lines.size)
     }
 }

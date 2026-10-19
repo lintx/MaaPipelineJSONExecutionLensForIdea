@@ -1,32 +1,29 @@
 package com.maapipeline.executionlens.pipeline
 
-import com.intellij.ui.JBColor
-import com.intellij.openapi.editor.colors.EditorColors
-import com.intellij.openapi.editor.colors.EditorColorsManager
-import com.intellij.util.ui.JBUI
-import java.awt.Dimension
-import java.awt.Graphics
-import javax.swing.JComponent
+internal data class PipelineIndentScope(val firstRow: Int, val lastRow: Int, val depth: Int)
 
-internal class PipelineIndentGuide(private val depth: Int) : JComponent() {
-    private val step = JBUI.scale(12)
+internal class PipelineIndentScopes(depths: List<Int>) {
+    val scopes: List<PipelineIndentScope>
 
     init {
-        isOpaque = false
-        val width = (depth * step).coerceAtLeast(step)
-        preferredSize = Dimension(width, 1)
-        minimumSize = preferredSize
-        maximumSize = Dimension(width, Int.MAX_VALUE)
+        val completed = mutableListOf<PipelineIndentScope>()
+        val open = ArrayDeque<Pair<Int, Int>>()
+        depths.forEachIndexed { index, depth ->
+            while (open.isNotEmpty() && open.last().second > depth) {
+                val (first, level) = open.removeLast()
+                completed += PipelineIndentScope(first, index, level)
+            }
+            val previous = depths.getOrElse(index - 1) { 0 }
+            for (level in previous + 1..depth) open.addLast((index - 1).coerceAtLeast(0) to level)
+        }
+        while (open.isNotEmpty()) {
+            val (first, level) = open.removeLast()
+            completed += PipelineIndentScope(first, depths.lastIndex, level)
+        }
+        scopes = completed
     }
 
-    override fun paintComponent(graphics: Graphics) {
-        val color = EditorColorsManager.getInstance().globalScheme
-            .getColor(EditorColors.INDENT_GUIDE_COLOR)
-            ?: JBColor.border()
-        graphics.color = color
-        for (level in 0 until depth) {
-            val x = level * step + step / 2
-            graphics.drawLine(x, 0, x, height)
-        }
-    }
+    fun at(row: Int): PipelineIndentScope? = scopes.asSequence()
+        .filter { row in it.firstRow..it.lastRow }
+        .maxByOrNull { it.depth }
 }

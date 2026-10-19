@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
     id("java")
@@ -34,11 +35,14 @@ dependencies {
     intellijPlatform {
         local(file(ideaSdkPath))
         bundledPlugin("com.intellij.modules.json")
+        testFramework(TestFrameworkType.Platform)
     }
 }
 
 dependencies {
     testImplementation(kotlin("test"))
+    testImplementation("junit:junit:4.13.2")
+    testRuntimeOnly("org.junit.vintage:junit-vintage-engine:5.10.2")
 }
 
 intellijPlatform {
@@ -67,4 +71,6 @@ tasks {
 
 tasks.test {
     useJUnitPlatform()
+    systemProperty("idea.load.plugins.id", "com.intellij.modules.json,com.maapipeline.json.execution.lens")
+    maaEndPath?.let { environment("MAAEND_PATH", it) }
 }

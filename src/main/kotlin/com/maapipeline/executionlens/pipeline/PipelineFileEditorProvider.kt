@@ -6,12 +6,13 @@ import com.intellij.openapi.fileEditor.FileEditorPolicy
 import com.intellij.openapi.fileEditor.FileEditorState
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import org.jdom.Element
 
 internal class PipelineFileEditorProvider : FileEditorProvider, DumbAware {
     override fun accept(project: Project, file: VirtualFile): Boolean =
-        PipelineFileDetector.isPipelineFile(file)
+        file is PipelineWorkspaceFile
 
     override fun createEditor(project: Project, file: VirtualFile): FileEditor =
         PipelineFileEditor(project, file)
@@ -19,7 +20,7 @@ internal class PipelineFileEditorProvider : FileEditorProvider, DumbAware {
     override fun getEditorTypeId(): String = EDITOR_TYPE_ID
 
     override fun disposeEditor(editor: FileEditor) {
-        editor.dispose()
+        Disposer.dispose(editor)
     }
 
     override fun readState(sourceElement: Element, project: Project, file: VirtualFile): FileEditorState =

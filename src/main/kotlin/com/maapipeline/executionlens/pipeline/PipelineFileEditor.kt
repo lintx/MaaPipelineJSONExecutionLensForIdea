@@ -1,86 +1,71 @@
 package com.maapipeline.executionlens.pipeline
 
 import com.intellij.openapi.Disposable
-import com.intellij.codeHighlighting.BackgroundEditorHighlighter
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.fileEditor.FileEditor
 import com.intellij.openapi.fileEditor.FileEditorLocation
 import com.intellij.openapi.fileEditor.FileEditorState
-import com.intellij.openapi.fileEditor.TextEditor
-import com.intellij.openapi.fileEditor.impl.text.TextEditorProvider
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.openapi.util.Disposer
-import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.vfs.VirtualFileManager
+import com.intellij.ui.components.JBLabel
+import com.intellij.util.concurrency.AppExecutorUtil
 import java.awt.BorderLayout
 import java.beans.PropertyChangeListener
 import javax.swing.JComponent
 import javax.swing.JPanel
 
-internal class PipelineFileEditor(
-    private val project: Project,
-    private val file: VirtualFile,
-) : UserDataHolderBase(), FileEditor, Disposable {
-    private val sourceEditor: TextEditor =
-        TextEditorProvider.getInstance().createEditor(project, file) as TextEditor
-    private val sourceContainer = JPanel(BorderLayout()).apply {
-        add(sourceEditor.component, BorderLayout.CENTER)
+internal class PipelineFileEditor(private val project: Project, private val file: VirtualFile) :
+    UserDataHolderBase(), FileEditor, Disposable {
+    private val component = JPanel(BorderLayout()).apply {
+        add(JBLabel("正在读取项目任务与 Pipeline…"), BorderLayout.CENTER)
     }
-    private val flowPanel = PipelineFlowPanel(project, file, sourceEditor.editor) {
-        showSourceForNavigation()
-    }
-    private lateinit var views: PipelineEditorViews
+    private val workspace = PipelineWorkspaceState.getInstance(project)
+    private val source = PipelineWorkspaceSource(project)
+    private var flow: PipelineFlowPanel? = null
+    private var disposed = false
 
     init {
-        views = PipelineEditorViews(sourceContainer, flowPanel)
-        Disposer.register(this, flowPanel)
+        Disposer.register(this, source)
+        ReadAction.nonBlocking<VirtualFile?> {
+            workspace.requestedFile
+                ?: VirtualFileManager.getInstance().findFileByUrl(workspace.data.lastSourceUrl)
+                    ?.takeIf { it.isValid && PipelineFileDetector.isPipelineFile(it) }
+                ?: PipelineProjectFiles.pipelineFiles(project).firstOrNull()
+        }.expireWith(this).finishOnUiThread(ModalityState.any()) { seed ->
+            if (disposed) return@finishOnUiThread
+            component.removeAll()
+            if (seed == null) {
+                component.add(JBLabel("未找到 Pipeline。可在 Pipeline JSON 中右键选择“从此处查看流程”。"))
+            } else {
+                val panel = PipelineFlowPanel(project, seed, source.editorFor(seed).editor, source, workspace)
+                flow = panel
+                Disposer.register(this, panel)
+                component.add(panel, BorderLayout.CENTER)
+                acceptSourceRequest()
+            }
+            component.revalidate()
+            component.repaint()
+        }.submit(AppExecutorUtil.getAppExecutorService())
     }
 
-    private fun showSourceForNavigation() {
-        views.showSourceForNavigation()
+    internal fun acceptSourceRequest() {
+        val panel = flow ?: return
+        workspace.requestedFile?.let { panel.openFromSource(it, workspace.requestedOffset) }
     }
 
-    internal fun navigateToOffset(offset: Int) {
-        views.showSourceForNavigation()
-        val safeOffset = offset.coerceIn(0, sourceEditor.editor.document.textLength)
-        ApplicationManager.getApplication().invokeLater({
-            if (sourceEditor.editor.isDisposed) return@invokeLater
-            sourceEditor.editor.caretModel.moveToOffset(safeOffset)
-            sourceEditor.editor.scrollingModel.scrollToCaret(com.intellij.openapi.editor.ScrollType.CENTER)
-            sourceEditor.editor.contentComponent.requestFocusInWindow()
-        }, ModalityState.any())
-    }
-
-    override fun getComponent(): JComponent = views
-
-    override fun getPreferredFocusedComponent(): JComponent? = sourceEditor.preferredFocusedComponent
-
-    override fun getName(): String = "MaaPipeline JSON Execution Lens"
-
-    override fun setState(state: FileEditorState) {
-        sourceEditor.setState(state)
-    }
-
-    override fun isModified(): Boolean = sourceEditor.isModified
-
-    override fun isValid(): Boolean = sourceEditor.isValid
-
-    override fun addPropertyChangeListener(listener: PropertyChangeListener) {
-        sourceEditor.addPropertyChangeListener(listener)
-    }
-
-    override fun removePropertyChangeListener(listener: PropertyChangeListener) {
-        sourceEditor.removePropertyChangeListener(listener)
-    }
-
-    override fun getCurrentLocation(): FileEditorLocation? = sourceEditor.currentLocation
-
-    override fun getBackgroundHighlighter(): BackgroundEditorHighlighter? = sourceEditor.backgroundHighlighter
-
+    override fun getComponent(): JComponent = component
+    override fun getPreferredFocusedComponent(): JComponent = component
+    override fun getName(): String = "Pipeline 流程"
+    override fun setState(state: FileEditorState) = Unit
+    override fun isModified(): Boolean = false
+    override fun isValid(): Boolean = !disposed
+    override fun addPropertyChangeListener(listener: PropertyChangeListener) = Unit
+    override fun removePropertyChangeListener(listener: PropertyChangeListener) = Unit
+    override fun getCurrentLocation(): FileEditorLocation? = null
     override fun getFile(): VirtualFile = file
-
-    override fun dispose() {
-        TextEditorProvider.getInstance().disposeEditor(sourceEditor)
-    }
+    override fun dispose() { disposed = true }
 }

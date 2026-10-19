@@ -19,4 +19,15 @@
                          groupName="MaaPipeline" enabledByDefault="true" level="WARNING"
                          implementationClass="com.maapipeline.executionlens.pipeline.PipelineReferenceInspection"/>
     </extensions>
+    <actions>
+        <action id="MaaPipeline.OpenWorkspace" class="com.maapipeline.executionlens.pipeline.OpenPipelineWorkspaceAction"
+                text="打开 Pipeline 流程" description="在中央编辑器打开独立的 Pipeline 工作区">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="MaaPipeline.OpenFromSource" class="com.maapipeline.executionlens.pipeline.OpenPipelineFromSourceAction"
+                text="从此处查看流程" description="在独立工作区查看当前 Pipeline 节点">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+    </actions>
 </idea-plugin>

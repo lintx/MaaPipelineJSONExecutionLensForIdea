@@ -13,6 +13,10 @@ import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
+import com.intellij.psi.PsiComment
+import com.intellij.psi.PsiFileFactory
+import com.intellij.json.JsonFileType
+import com.google.gson.JsonParser
 import com.intellij.psi.util.PsiTreeUtil
 import java.util.concurrent.ConcurrentHashMap
 
@@ -32,6 +36,8 @@ data class PipelineNodeLocation(
     val anchorDefinitions: List<PipelineAnchorDefinition> = emptyList(),
     val embeddedReferences: List<PipelineReference> = emptyList(),
     val sourceFile: VirtualFile? = null,
+    val enabled: Boolean = true,
+    val rawJson: String = "{}",
 )
 
 data class PipelineFieldLocation(
@@ -42,6 +48,7 @@ data class PipelineFieldLocation(
     val isString: Boolean = false,
     val references: List<PipelineReference> = emptyList(),
     val sourceFile: VirtualFile? = null,
+    val isDerived: Boolean = false,
 )
 
 data class PipelineExecutionPolicy(
@@ -83,6 +90,7 @@ enum class PipelineReferenceKind(
     TARGET("目标"),
     BEGIN("滑动起点"),
     END("滑动终点"),
+    SUBTASK("子任务"),
 }
 
 data class PipelineNodeTarget(
@@ -123,6 +131,8 @@ data class PipelineOverrideLocation(
     val fields: List<PipelineFieldLocation>,
     val valueRange: TextRange = range,
     val version: Long = -1L,
+    val contextPath: String = "",
+    val rawJson: String = "{}",
 )
 
 data class PipelineEntryLocation(
@@ -130,7 +140,17 @@ data class PipelineEntryLocation(
     val entryName: String,
     val range: TextRange,
     val targetFile: VirtualFile? = null,
-)
+    val taskId: String = entryName,
+    val label: String = taskId,
+    val description: String = "",
+    val searchText: String = "",
+    val contextPath: String = "",
+    val optionNames: List<String> = emptyList(),
+    val taskOptions: List<PipelineTaskOption> = emptyList(),
+    val issue: String? = null,
+) {
+    val stableId: String get() = "${file.url}#task:$taskId"
+}
 
 enum class PipelineDiagnosticSeverity {
     ERROR,
@@ -161,6 +181,14 @@ data class PipelineDocumentModel(
     val indexedText: String = "",
     val indexedVersions: Map<VirtualFile, Long> = emptyMap(),
     val generatedFiles: Set<VirtualFile> = emptySet(),
+    val pipelineFiles: Set<VirtualFile> = emptySet(),
+    val graphIndex: PipelineGraphIndex? = null,
+)
+
+data class PipelineGraphIndex(
+    val edges: Map<String, List<String>>,
+    val components: Map<String, Int>,
+    val inboundCounts: Map<String, Int>,
 )
 
 internal object PipelineDocumentIndexer {
@@ -169,7 +197,7 @@ internal object PipelineDocumentIndexer {
 
     fun diagnostics(project: Project, file: VirtualFile): List<PipelineDiagnostic> {
         val parsed = parseFile(project, file)
-        val entries = findPipelineJsonFiles(file).flatMap { candidateFile ->
+        val entries = PipelineProjectFiles.pipelineFiles(project, file).flatMap { candidateFile ->
             ProgressManager.checkCanceled()
             parseFile(project, candidateFile).nodes.map { PipelineNodeEntry(candidateFile, it) }
         }
@@ -190,12 +218,25 @@ internal object PipelineDocumentIndexer {
         return buildDiagnostics(file, nodes)
     }
 
-    fun index(project: Project, file: VirtualFile): PipelineDocumentModel {
+    fun index(project: Project, file: VirtualFile, previous: PipelineDocumentModel? = null,
+        changedFiles: Set<VirtualFile> = emptySet()): PipelineDocumentModel {
         val parsedFile = parseFile(project, file)
-        val parsedFiles = findPipelineJsonFiles(file).map { parseFile(project, it) }
+        val knownContentUpdate = previous != null && previous.file == file && previous.pipelineFiles.isNotEmpty() &&
+            changedFiles.isNotEmpty() && changedFiles.all { it.isValid && it in previous.pipelineFiles }
+        val files = if (knownContentUpdate) previous.pipelineFiles.toList() else PipelineProjectFiles.pipelineFiles(project, file)
+        val parsedFiles = files.map { source ->
+            // 未变文件直接复用已解析快照，不重新加载 Document 或等待它的 PSI 提交。
+            if (knownContentUpdate && source !in changedFiles) parsedFileCache[cacheKey(project, source)]
+                ?.takeIf { it.version == previous.indexedVersions[source] } ?: parseFile(project, source)
+            else parseFile(project, source)
+        }
         val entries = parsedFiles.flatMap { parsed ->
+            ProgressManager.checkCanceled()
             parsed.nodes.map { node -> PipelineNodeEntry(parsed.file, node) }
         }
+        val previousByKey = previous?.projectNodes.orEmpty().associateBy { PipelineReadingGraph.key(it) }
+        val reuseCatalog = knownContentUpdate && entries.mapTo(hashSetOf()) { it.key } == previousByKey.keys
+        val relations = if (reuseCatalog) emptyList() else findTaskRelations(project, file)
         val candidatesByName = entries.groupBy { it.node.name }
         val anchorEntries = entries.flatMap { entry ->
             entry.node.anchorDefinitions.map { definition ->
@@ -204,38 +245,47 @@ internal object PipelineDocumentIndexer {
         }
         val anchorsByName = anchorEntries.groupBy { it.definition.name }
         val graph = entries.associate { entry ->
+            ProgressManager.checkCanceled()
             entry.key to flowReferences(entry.node)
                 .mapNotNull { candidatesByName[it.targetName].orEmpty().singleOrNull()?.key }
         }
-        val inboundCounts = graph.values
-            .flatten()
-            .groupingBy { it }
-            .eachCount()
+        val graphIndex = previous?.graphIndex?.takeIf { it.edges == graph } ?: PipelineGraphIndex(
+            graph, PipelineGraphCycles.components(graph), graph.values.flatten().groupingBy { it }.eachCount())
+        val inboundCounts = graphIndex.inboundCounts
+        val cycleComponents = graphIndex.components
+        val changedNames = parsedFiles.filter { it.file in changedFiles }.flatMap { it.nodes }.mapTo(hashSetOf()) { it.name }
         val resolvedNodesByKey = entries.associate { entry ->
+            ProgressManager.checkCanceled()
             val node = entry.node
-            entry.key to node.copy(
+            val retained = previousByKey[entry.key]?.takeIf {
+                reuseCatalog && entry.file !in changedFiles && graphIndex === previous.graphIndex &&
+                    (node.next + node.onError + node.embeddedReferences).none { it.isAnchor || it.targetName in changedNames }
+            }
+            entry.key to (retained ?: node.copy(
                 sourceFile = entry.file,
-                next = resolveReferences(entry, node.next, candidatesByName, anchorsByName, graph, inboundCounts),
-                onError = resolveReferences(entry, node.onError, candidatesByName, anchorsByName, graph, inboundCounts),
+                next = resolveReferences(entry, node.next, candidatesByName, anchorsByName, cycleComponents, inboundCounts),
+                onError = resolveReferences(entry, node.onError, candidatesByName, anchorsByName, cycleComponents, inboundCounts),
                 embeddedReferences = resolveReferences(
                     entry,
                     node.embeddedReferences,
                     candidatesByName,
                     anchorsByName,
-                    graph,
+                    cycleComponents,
                     inboundCounts,
                 ),
-            )
+            ))
         }
         val nodes = parsedFile.nodes.mapNotNull { node ->
             resolvedNodesByKey["${file.url}#${node.name}"]
         }
         val projectNodes = resolvedNodesByKey.values.toList()
-        val overrides = findPipelineOverrides(project, file, projectNodes.map { it.name }.toSet())
+        val nodeNames = candidatesByName.keys
+        val overrides = if (reuseCatalog) previous.pipelineOverrides else relations.flatMap { it.overrides }
+            .filter { it.targetName in nodeNames }
         val resolvedOverrides = overrides.map { override ->
-            val sourceNode = projectNodes.firstOrNull { node ->
-                (node.sourceFile ?: file) == file && node.name == override.targetName
-            } ?: projectNodes.singleOrNull { node -> node.name == override.targetName }
+            ProgressManager.checkCanceled()
+            val sourceNode = resolvedNodesByKey["${file.url}#${override.targetName}"]
+                ?: candidatesByName[override.targetName]?.singleOrNull()?.let { resolvedNodesByKey[it.key] }
             val sourceFile = sourceNode?.sourceFile ?: file
             if (sourceNode == null) {
                 override
@@ -249,7 +299,7 @@ internal object PipelineDocumentIndexer {
                                     field.references,
                                     candidatesByName,
                                     anchorsByName,
-                                    graph,
+                                    cycleComponents,
                                     inboundCounts,
                                 ),
                             )
@@ -260,7 +310,7 @@ internal object PipelineDocumentIndexer {
                                     field.references,
                                     candidatesByName,
                                     anchorsByName,
-                                    graph,
+                                    cycleComponents,
                                     inboundCounts,
                                 ),
                             )
@@ -271,7 +321,12 @@ internal object PipelineDocumentIndexer {
                 )
             }
         }
-        val diagnostics = buildDiagnostics(file, nodes)
+        val previousDiagnostics = previous?.diagnostics.orEmpty().groupBy { it.file }
+        val diagnostics = projectNodes.groupBy { it.sourceFile ?: file }.flatMap { (source, locations) ->
+            if (reuseCatalog && source !in changedFiles && locations.all { previousByKey[PipelineReadingGraph.key(it)] === it })
+                previousDiagnostics[source].orEmpty()
+            else buildDiagnostics(source, locations)
+        }
         return PipelineDocumentModel(
             file = file,
             version = parsedFile.version,
@@ -279,13 +334,81 @@ internal object PipelineDocumentIndexer {
             hasSyntaxErrors = parsedFile.hasSyntaxErrors,
             isGenerated = parsedFile.isGenerated,
             pipelineOverrides = resolvedOverrides,
-            pipelineEntries = findPipelineEntries(project, file, projectNodes),
+            pipelineEntries = if (reuseCatalog) resolveEntryTargets(previous.pipelineEntries, projectNodes)
+                else findPipelineEntries(relations, projectNodes),
             diagnostics = diagnostics,
             projectNodes = projectNodes,
             indexedText = FileDocumentManager.getInstance().getDocument(file)?.text.orEmpty(),
-            indexedVersions = parsedFiles.associate { it.file to it.version },
+            indexedVersions = parsedFiles.associate { it.file to it.version } + if (reuseCatalog) {
+                previous.indexedVersions.filterKeys { it !in previous.pipelineFiles }
+            } else relations.associate { it.file to it.version } +
+                PipelineProjectFiles.translationFiles(project, file).associateWith(::fileVersion),
             generatedFiles = parsedFiles.filter { it.isGenerated }.map { it.file }.toSet(),
+            pipelineFiles = files.toSet(),
+            graphIndex = graphIndex,
         )
+    }
+
+    fun effectiveNodes(project: Project, model: PipelineDocumentModel, overrides: List<PipelineOverrideLocation>,
+        inputs: Map<String, String>, options: List<PipelineTaskOption> = emptyList()): Map<String, PipelineNodeLocation> {
+        val byName = model.projectNodes.groupBy { it.name }
+        val patches = overrides.groupBy { it.targetName }
+        return model.projectNodes.mapNotNull { node ->
+            ProgressManager.checkCanceled()
+            val changes = patches[node.name] ?: return@mapNotNull null
+            if (byName[node.name].orEmpty().size != 1) return@mapNotNull null
+            var json = try { JsonParser.parseString(node.rawJson) }
+                catch (_: com.google.gson.JsonParseException) { return@mapNotNull null }
+            changes.forEach { override ->
+                val option = options.firstOrNull { it.path == override.contextPath }
+                val raw = try { JsonParser.parseString(override.rawJson) }
+                    catch (_: com.google.gson.JsonParseException) { return@mapNotNull null }
+                val patch = PipelineTaskContext.substituteInputs(raw, option, inputs)
+                json = PipelineTaskContext.merge(json, patch)
+            }
+            val psi = PsiFileFactory.getInstance(project).createFileFromText("effective.json", JsonFileType.INSTANCE,
+                json.toString()) as JsonFile
+            val effective = node.withDetails(psi.topLevelValue as? JsonObject)
+            val changedFields = changes.flatMap { it.fields }.associateBy { it.name }
+            fun field(name: String, parsed: PipelineFieldLocation?, original: PipelineFieldLocation?): PipelineFieldLocation? {
+                if (parsed == null) return null
+                val source = changedFields[name] ?: original ?: changedFields.values.lastOrNull() ?: return parsed
+                return source.copy(name = name, summary = parsed.summary, isDerived = true)
+            }
+            fun references(name: String, original: List<PipelineReference>): List<PipelineReference> =
+                changedFields[name]?.references ?: original
+            val embedded = effective.embeddedReferences.map { reference ->
+                val original = node.embeddedReferences.firstOrNull { it.kind == reference.kind && it.targetName == reference.targetName }
+                val origin = changedFields["custom_action_param"] ?: changedFields["action"]
+                val target = byName[reference.targetName].orEmpty().singleOrNull()
+                if (original != null && origin == null) original else reference.copy(
+                    range = origin?.valueRange ?: node.nameRange,
+                    sourceFile = origin?.sourceFile ?: node.sourceFile,
+                    targetExists = byName[reference.targetName].orEmpty().isNotEmpty(),
+                    target = target?.let { PipelineNodeEntry(it.sourceFile ?: model.file, it).toTarget() },
+                    isAmbiguousTarget = byName[reference.targetName].orEmpty().size > 1,
+                )
+            }
+            val anchorField = changedFields["anchor"]
+            "${node.sourceFile?.url ?: model.file.url}#${node.name}" to effective.copy(
+                recognition = field("recognition", effective.recognition, node.recognition),
+                action = field("action", effective.action, node.action),
+                nextField = changedFields["next"] ?: node.nextField,
+                next = references("next", node.next),
+                onErrorField = changedFields["on_error"] ?: node.onErrorField,
+                onError = references("on_error", node.onError),
+                embeddedReferences = embedded,
+                anchor = field("anchor", effective.anchor, node.anchor),
+                anchorDefinitions = if (anchorField == null) node.anchorDefinitions else effective.anchorDefinitions.map {
+                    it.copy(range = anchorField.valueRange, propertyRange = anchorField.range, valueRange = anchorField.valueRange)
+                },
+                executionPolicy = PipelineExecutionPolicy(
+                    field("timeout", effective.executionPolicy.timeout, node.executionPolicy.timeout),
+                    field("rate_limit", effective.executionPolicy.rateLimit, node.executionPolicy.rateLimit),
+                    field("max_hit", effective.executionPolicy.maxHit, node.executionPolicy.maxHit),
+                ),
+            )
+        }.toMap()
     }
 
     private data class ParsedPipelineFile(
@@ -301,6 +424,7 @@ internal object PipelineDocumentIndexer {
         val version: Long,
         val overrides: List<PipelineOverrideLocation>,
         val entries: List<PipelineEntryLocation>,
+        val options: List<PipelineTaskOption>,
     )
 
     private data class PipelineNodeEntry(
@@ -400,16 +524,18 @@ internal object PipelineDocumentIndexer {
     }
 
     private fun flowReferences(node: PipelineNodeLocation): List<PipelineReference> =
-        (node.next + node.onError).filterNot(PipelineReference::isAnchor)
+        (node.next + node.onError + node.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK })
+            .filterNot(PipelineReference::isAnchor)
 
     private fun resolveReferences(
         source: PipelineNodeEntry,
         references: List<PipelineReference>,
         candidatesByName: Map<String, List<PipelineNodeEntry>>,
         anchorsByName: Map<String, List<PipelineAnchorEntry>>,
-        graph: Map<String, List<String>>,
+        cycleComponents: Map<String, Int>,
         inboundCounts: Map<String, Int>,
     ): List<PipelineReference> = references.map { reference ->
+        ProgressManager.checkCanceled()
         if (reference.isAnchor) {
             val anchorCandidates = anchorsByName[reference.targetName].orEmpty()
             val anchor = anchorCandidates.singleOrNull()
@@ -432,7 +558,7 @@ internal object PipelineDocumentIndexer {
         val targetKey = target?.key
         reference.copy(
             targetExists = candidates.isNotEmpty(),
-            isCycle = targetKey != null && canReach(graph, targetKey, source.key),
+            isCycle = targetKey != null && cycleComponents[targetKey] == cycleComponents[source.key],
             isSharedTarget = targetKey != null && (inboundCounts[targetKey] ?: 0) > 1,
             target = target?.toTarget(),
             isAmbiguousTarget = candidates.size > 1,
@@ -467,35 +593,40 @@ internal object PipelineDocumentIndexer {
         }
     }
 
-    private fun findPipelineOverrides(
-        project: Project,
-        file: VirtualFile,
-        currentNodeNames: Set<String>,
-    ): List<PipelineOverrideLocation> = findTaskRelations(project, file)
-        .flatMap { relations -> relations.overrides }
-        .filter { it.targetName in currentNodeNames }
-
     private fun findPipelineEntries(
-        project: Project,
-        file: VirtualFile,
+        relations: List<TaskFileRelations>,
         projectNodes: List<PipelineNodeLocation>,
     ): List<PipelineEntryLocation> {
-        val nodesByName = projectNodes.groupBy { it.name }
-        return findTaskRelations(project, file)
-        .flatMap { relations -> relations.entries }
-        .mapNotNull { entry ->
+        val sharedOptions = relations.flatMap { it.options }
+        val entries = relations.flatMap { it.entries }.map { entry ->
+            val options = (entry.taskOptions + sharedOptions)
+                .distinctBy { it.name }
+            entry.copy(
+                taskOptions = options,
+                searchText = entry.searchText + "\n" + PipelineTaskContext.optionSearchText(entry.optionNames, options))
+        }
+        return resolveEntryTargets(entries, projectNodes)
+    }
+
+    private fun resolveEntryTargets(entries: List<PipelineEntryLocation>, nodes: List<PipelineNodeLocation>): List<PipelineEntryLocation> {
+        val nodesByName = nodes.groupBy { it.name }
+        return entries.map { entry ->
             val candidates = nodesByName[entry.entryName].orEmpty()
-            val target = candidates.firstOrNull { it.sourceFile == file }
-                ?: candidates.singleOrNull()
-                ?: return@mapNotNull null
-            entry.copy(targetFile = target.sourceFile ?: file)
+            val target = candidates.singleOrNull()?.sourceFile
+            val issue = when {
+                candidates.isEmpty() -> "入口未在当前资源中找到：${entry.entryName}"
+                candidates.size > 1 -> "入口存在重复定义：${entry.entryName}"
+                else -> null
+            }
+            if (entry.targetFile == target && entry.issue == issue) entry else entry.copy(targetFile = target, issue = issue)
         }
     }
 
     private fun findTaskRelations(project: Project, file: VirtualFile): List<TaskFileRelations> {
-        val tasksRoot = findTasksRoot(file) ?: return emptyList()
-        return collectJsonFiles(tasksRoot).mapNotNull { taskFile ->
-            val cacheKey = cacheKey(project, taskFile)
+        val translations = PipelineProjectFiles.translations(project, file)
+        val translationHash = translations.hashCode()
+        return PipelineProjectFiles.taskFiles(project, file).mapNotNull { taskFile ->
+            val cacheKey = "${cacheKey(project, taskFile)}|$translationHash"
             val version = fileVersion(taskFile)
             taskRelationsCache[cacheKey]?.takeIf { it.version == version }?.let { return@mapNotNull it }
 
@@ -503,10 +634,47 @@ internal object PipelineDocumentIndexer {
                 ?: return@mapNotNull null
             val overrides = mutableListOf<PipelineOverrideLocation>()
             val entries = mutableListOf<PipelineEntryLocation>()
+            val definitions = runCatching { PipelineTaskContext.parse(PipelineProjectFiles.text(taskFile)) }
+                .getOrNull() ?: return@mapNotNull null
+            fun localize(value: String): String = translations[value] ?: value
+            fun searchMetadata(values: List<String>): String = values.flatMap {
+                listOf(it, localize(it), translations["$it#search"].orEmpty())
+            }.filter(String::isNotBlank).distinct().joinToString("\n")
+            val options = definitions.options.map { option ->
+                val optionObject = ((jsonFile.topLevelValue as? JsonObject)?.findProperty("option")?.value as? JsonObject)
+                    ?.findProperty(option.name)?.value as? JsonObject
+                val comments = optionObject?.children?.filterIsInstance<PsiComment>().orEmpty().map { it.text }
+                val metadata = listOf(option.name, option.label, option.description) + comments +
+                    option.cases.flatMap { listOf(it.name, it.label, it.description) } +
+                    option.inputs.flatMap { listOf(it.name, it.label, it.description) }
+                option.copy(path = "${taskFile.url}#${option.path}", label = localize(option.label).ifEmpty { option.name },
+                    description = localize(option.description), searchText = searchMetadata(metadata),
+                    cases = option.cases.map { it.copy(path = "${taskFile.url}#${it.path}",
+                        label = localize(it.label).ifEmpty { it.name }, description = localize(it.description)) },
+                    inputs = option.inputs.map { it.copy(label = localize(it.label).ifEmpty { it.name },
+                        description = localize(it.description)) })
+            }
 
-            fun visit(element: PsiElement) {
-                if (element is JsonProperty && element.name == "pipeline_override") {
-                    val overrideObject = element.value as? JsonObject
+            fun visit(element: com.intellij.json.psi.JsonValue, path: String) {
+                if (element is JsonArray) {
+                    element.valueList.forEachIndexed { index, value -> visit(value, "$path/$index") }
+                    return
+                }
+                if (element !is JsonObject) return
+                definitions.tasks.firstOrNull { it.path == path }?.let { task ->
+                    val entryProperty = element.findProperty("entry") ?: return@let
+                    val comments = element.children.filterIsInstance<PsiComment>().joinToString(" ") { it.text }
+                    entries += PipelineEntryLocation(taskFile, task.entry,
+                        entryProperty.value?.textRange ?: entryProperty.textRange,
+                        taskId = task.id, label = localize(task.label).ifEmpty { task.id },
+                        description = localize(task.description), contextPath = "${taskFile.url}#$path",
+                        searchText = listOf(task.id, task.label, localize(task.label), task.description,
+                            localize(task.description), translations["${task.label}#search"].orEmpty(),
+                            translations["${task.description}#search"].orEmpty(), comments, task.entry, taskFile.path).joinToString(" "),
+                        optionNames = task.options, taskOptions = options)
+                }
+                element.findProperty("pipeline_override")?.let { property ->
+                    val overrideObject = property.value as? JsonObject
                     overrideObject?.propertyList.orEmpty().forEach { targetProperty ->
                         val range = targetProperty.nameElement.textRange ?: targetProperty.textRange ?: return@forEach
                         val fields = (targetProperty.value as? JsonObject)
@@ -528,21 +696,20 @@ internal object PipelineDocumentIndexer {
                             fields = fields,
                             valueRange = targetProperty.value?.textRange ?: targetProperty.textRange ?: range,
                             version = version,
+                            contextPath = "${taskFile.url}#$path",
+                            rawJson = targetProperty.value?.text ?: "{}",
                         )
                     }
                 }
-                if (element is JsonProperty && element.name == "entry") {
-                    val entryName = element.value?.let(::scalarText)
-                    val range = element.value?.textRange ?: element.textRange
-                    if (entryName != null && range != null) {
-                        entries += PipelineEntryLocation(taskFile, entryName, range)
+                element.propertyList.forEach { property ->
+                    if (property.name != "pipeline_override") property.value?.let {
+                        visit(it, "$path/${PipelineTaskContext.escape(property.name)}")
                     }
                 }
-                element.children.forEach(::visit)
             }
 
-            visit(jsonFile)
-            TaskFileRelations(taskFile, version, overrides, entries).also {
+            jsonFile.topLevelValue?.let { visit(it, "") }
+            TaskFileRelations(taskFile, version, overrides, entries, options).also {
                 taskRelationsCache[cacheKey] = it
             }
         }
@@ -564,6 +731,8 @@ internal object PipelineDocumentIndexer {
     private fun PipelineNodeLocation.withDetails(valueObject: JsonObject?): PipelineNodeLocation {
         if (valueObject == null) return this
         return copy(
+            rawJson = valueObject.text,
+            enabled = valueObject.findProperty("enabled")?.value?.text != "false",
             description = valueObject.findProperty("desc")?.value?.let(::scalarText),
             recognition = valueObject.findProperty("recognition")?.toContextualField(valueObject),
             action = valueObject.findProperty("action")?.toContextualField(valueObject),
@@ -674,27 +843,31 @@ internal object PipelineDocumentIndexer {
         val parameterObject = valueObject?.findProperty("param")?.value as? JsonObject
         val detailOwner = parameterObject ?: owner
         val details = mutableListOf<String>()
+        fun ownerFor(propertyName: String): JsonObject? = when {
+            detailOwner?.findProperty(propertyName) != null -> detailOwner
+            else -> owner
+        }
         if (isAction) {
-            addSummaryDetail(details, owner, "custom_action", "实现")
-            addSummaryDetail(details, owner, "custom_action_param", "参数")
+            addSummaryDetail(details, ownerFor("custom_action"), "custom_action", "实现")
+            addSummaryDetail(details, ownerFor("custom_action_param"), "custom_action_param", "参数")
             listOf("target", "begin", "end", "duration", "index", "contact").forEach { key ->
-                addSummaryDetail(details, detailOwner, key, key)
+                addSummaryDetail(details, ownerFor(key), key, key)
             }
         } else {
-            val allOf = owner?.findProperty("all_of")?.value as? JsonArray
-            val anyOf = owner?.findProperty("any_of")?.value as? JsonArray
+            val allOf = ownerFor("all_of")?.findProperty("all_of")?.value as? JsonArray
+            val anyOf = ownerFor("any_of")?.findProperty("any_of")?.value as? JsonArray
             when {
                 allOf != null -> details += "全部满足：${summarizeConditionList(allOf)}"
                 anyOf != null -> details += "任一满足：${summarizeConditionList(anyOf)}"
                 else -> {
-                    addSummaryDetail(details, detailOwner, "expected", "文本")
-                    addSummaryDetail(details, detailOwner, "template", "模板")
-                    addSummaryDetail(details, detailOwner, "roi", "区域")
-                    addSummaryDetail(details, detailOwner, "roi_offset", "区域偏移")
-                    addSummaryDetail(details, owner, "custom_recognition", "实现")
-                    addSummaryDetail(details, owner, "custom_recognition_param", "参数")
-                    addSummaryDetail(details, detailOwner, "threshold", "阈值")
-                    addSummaryDetail(details, detailOwner, "box_index", "框")
+                    addSummaryDetail(details, ownerFor("expected"), "expected", "文本")
+                    addSummaryDetail(details, ownerFor("template"), "template", "模板")
+                    addSummaryDetail(details, ownerFor("roi"), "roi", "区域")
+                    addSummaryDetail(details, ownerFor("roi_offset"), "roi_offset", "区域偏移")
+                    addSummaryDetail(details, ownerFor("custom_recognition"), "custom_recognition", "实现")
+                    addSummaryDetail(details, ownerFor("custom_recognition_param"), "custom_recognition_param", "参数")
+                    addSummaryDetail(details, ownerFor("threshold"), "threshold", "阈值")
+                    addSummaryDetail(details, ownerFor("box_index"), "box_index", "框")
                 }
             }
         }
@@ -757,6 +930,15 @@ internal object PipelineDocumentIndexer {
         }
 
         visit(this, "")
+        val action = findProperty("action")?.value as? JsonObject
+        val parameters = action?.findProperty("param")?.value as? JsonObject
+        val actionOwner = parameters ?: this
+        val customName = actionOwner.findProperty("custom_action")?.value?.let(::scalarText)
+        if (customName == "SubTask") {
+            val customParameters = actionOwner.findProperty("custom_action_param")?.value as? JsonObject
+            references += customParameters?.findProperty("sub")?.value
+                ?.toEmbeddedReferences(PipelineReferenceKind.SUBTASK, "custom_action_param.sub").orEmpty()
+        }
         return references
     }
 
@@ -896,17 +1078,4 @@ internal object PipelineDocumentIndexer {
         return ReferenceMarkers(targetName = target, isJumpBack = isJumpBack, isAnchor = isAnchor)
     }
 
-    private fun canReach(
-        graph: Map<String, List<String>>,
-        current: String,
-        target: String,
-        visited: Set<String> = emptySet(),
-    ): Boolean {
-        if (current == target) return true
-        if (current in visited) return false
-        val nextVisited = visited + current
-        return graph[current].orEmpty().any { next ->
-            canReach(graph, next, target, nextVisited)
-        }
-    }
 }
