@@ -15,6 +15,7 @@ import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.ui.JBColor
 import com.intellij.ui.paint.LinePainter2D
 import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
 import java.awt.event.ComponentAdapter
 import java.awt.event.ComponentEvent
 import javax.swing.JComponent
@@ -61,6 +62,8 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
     private var geometry = PipelineRowGeometry(emptyList())
     private var indentation = PipelineIndentScopes(emptyList())
     private var activeRowKey: String? = null
+    private var playbackRowKey: String? = null
+    private var playbackScrollRequest = 0L
     private val visibleComponents = mutableMapOf<Int, JComponent>()
     private var viewport: JViewport? = null
     private var updateQueued = false
@@ -125,6 +128,22 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
         }
     }
 
+    fun followPlaybackRow(key: String?) {
+        val request = ++playbackScrollRequest
+        if (key == null) return
+        SwingUtilities.invokeLater {
+            if (request != playbackScrollRequest) return@invokeLater
+            val currentViewport = viewport ?: return@invokeLater
+            val index = rows.indexOfFirst { it.key == key }
+            if (index < 0) return@invokeLater
+            val viewportHeight = currentViewport.extentSize.height
+            // 使用现有内容的滚动范围，不为靠近开头或结尾的节点制造额外空白。
+            val target = (geometry.top(index) - viewportHeight * 2 / 5)
+                .coerceIn(0, (geometry.totalHeight - viewportHeight).coerceAtLeast(0))
+            currentViewport.viewPosition = java.awt.Point(0, target)
+        }
+    }
+
     override fun addNotify() {
         super.addNotify()
         viewport = SwingUtilities.getAncestorOfClass(JViewport::class.java, this) as? JViewport
@@ -137,6 +156,14 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
         activeRowKey = key
         repaint()
     }
+
+    fun setPlaybackRow(key: String?) {
+        if (playbackRowKey == key) return
+        playbackRowKey = key
+        repaint()
+    }
+
+    fun refreshVisibleContent() = queueUpdate()
 
     private fun trackActiveRow(component: Component, key: String) {
         component.addMouseListener(object : MouseAdapter() {
@@ -156,6 +183,11 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
         val selected = scheme.getColor(EditorColors.SELECTED_INDENT_GUIDE_COLOR) ?: regular
         val active = indentation.at(rows.indexOfFirst { it.key == activeRowKey })
         val clip = graphics.clipBounds ?: Rectangle(0, 0, width, height)
+        val playback = rows.indexOfFirst { it.key == playbackRowKey }
+        if (playback >= 0) {
+            graphics.color = scheme.getColor(EditorColors.CARET_ROW_COLOR) ?: UIUtil.getListSelectionBackground(false)
+            graphics.fillRect(0, geometry.top(playback), width, geometry.height(playback))
+        }
         // 整块绘制跨越行间距与虚拟化边界，复用原生编辑器的主题色和 HiDPI 线条绘制。
         for (scope in indentation.scopes) {
             val top = geometry.top(scope.firstRow) + geometry.height(scope.firstRow)
@@ -168,6 +200,7 @@ internal class PipelineVirtualRowsPanel : JPanel(null), Scrollable {
     }
 
     override fun removeNotify() {
+        playbackScrollRequest++
         viewport?.removeChangeListener(viewportListener)
         viewport = null
         super.removeNotify()

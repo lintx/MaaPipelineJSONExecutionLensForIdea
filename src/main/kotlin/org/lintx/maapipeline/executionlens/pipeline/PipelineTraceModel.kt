@@ -66,6 +66,7 @@ internal class PipelineExecutionTrace(
     private val scopedNodeStates = mutableMapOf<String?, Map<String, PipelineTraceEvent>>()
     private val scopedRounds = mutableMapOf<String?, List<PipelineTraceRound>>()
     private val scopedReplays = mutableMapOf<String?, PipelineTraceReplay>()
+    private val scopedPlayback = mutableMapOf<String?, PipelineLogPlaybackSource>()
     val nodeEvents: List<PipelineTraceEvent> = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE }
 
     val latestNodeStates: Map<String, PipelineTraceEvent> = nodeEvents
@@ -103,6 +104,10 @@ internal class PipelineExecutionTrace(
 
     fun replayForEntry(entryName: String?): PipelineTraceReplay = scopedReplays.getOrPut(entryName) {
         PipelineTraceReplayBuilder.build(eventsForEntry(entryName), roundsForEntry(entryName))
+    }
+
+    fun playbackForEntry(entryName: String?): PipelineLogPlaybackSource = scopedPlayback.getOrPut(entryName) {
+        PipelineLogPlaybackSource(eventsForEntry(entryName), roundsForEntry(entryName), replayForEntry(entryName))
     }
 
     fun latestNextListForNode(nodeName: String, taskId: Long? = null): PipelineTraceEvent? = events

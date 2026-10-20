@@ -13,6 +13,39 @@ import kotlin.test.assertNotSame
 
 class PipelineVirtualRowsPanelTest {
     @Test
+    fun playbackFollowUsesTwoFifthsAndClampsToExistingContent() {
+        lateinit var panel: PipelineVirtualRowsPanel
+        lateinit var viewport: JViewport
+        SwingUtilities.invokeAndWait {
+            panel = PipelineVirtualRowsPanel()
+            viewport = JViewport().apply { extentSize = Dimension(600, 200); setView(panel) }
+            panel.setRows((0 until 100).map { index ->
+                PipelineVirtualRow("row-$index", 20) { JPanel().apply { preferredSize = Dimension(600, 20) } }
+            })
+            panel.addNotify()
+            panel.followPlaybackRow("row-25")
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals(420, viewport.viewPosition.y)
+            panel.followPlaybackRow("row-1")
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals(0, viewport.viewPosition.y)
+            panel.followPlaybackRow("row-99")
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals(1800, viewport.viewPosition.y)
+            panel.followPlaybackRow("row-25")
+            panel.followPlaybackRow(null)
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals(1800, viewport.viewPosition.y)
+            assertEquals(2000, panel.preferredSize.height)
+            panel.removeNotify()
+        }
+    }
+
+    @Test
     fun semanticUpdatesOnlyReplaceChangedVisibleRowsAndKeepScrollAnchor() {
         lateinit var panel: PipelineVirtualRowsPanel
         lateinit var viewport: JViewport

@@ -17,6 +17,75 @@ import javax.swing.JComboBox
 import javax.swing.JTabbedPane
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    fun testPlaybackUpdatesHistoryAndDetailsWithoutRebuildingFlowAndStopsOnClear() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """{"Start":{"next":["Child"]},"Child":{}}""")
+        replaceFixtureFile("assets/tasks/Tasks.json", """{"task":[{"name":"Transfer","entry":"Start"}]}""")
+        val log = myFixture.addFileToProject("debug/replay.log", """
+            [t0] [msg=Tasker.Task.Starting] [details={"entry":"Start","task_id":1}]
+            [t1] [msg=Node.PipelineNode.Starting] [details={"name":"Start","task_id":1}]
+            [t2] [msg=Node.NextList.Starting] [details={"name":"Start","task_id":1,"list":["Child"]}]
+            [t3] [msg=Node.Recognition.Succeeded] [details={"name":"Child","task_id":1}]
+            [t4] [msg=Node.PipelineNode.Starting] [details={"name":"Child","task_id":1}]
+            [t5] [msg=Tasker.Task.Succeeded] [details={"entry":"Start","task_id":1}]
+        """.trimIndent()).virtualFile
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single().stableId
+        workspace.data.lastSourceUrl = file.url
+        val before = ReadAction.compute<String, RuntimeException> { PipelineProjectFiles.text(file) }
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
+            PlatformTestUtil.waitWithEventsDispatching("任务尚未加载", {
+                (field("currentModel").get(panel) as PipelineDocumentModel).projectNodes.size == 2
+            }, 30)
+            field("currentTrace").set(panel, PipelineTraceParser.parse(log))
+            PipelineFlowPanel::class.java.getDeclaredMethod("rebuildEffectiveContext").apply { isAccessible = true }.invoke(panel)
+            val controls = field("playbackToolbar").get(panel) as PipelinePlaybackToolbar
+            assertTrue(controls.isVisible)
+            val cursor = controls.session!!
+            val source = cursor.source as PipelineLogPlaybackSource
+            val logic = field("logicPanel").get(panel) as PipelineVirtualRowsPanel
+            val rowsField = PipelineVirtualRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+            val rows = rowsField.get(logic)
+            controls.seek(2)
+            assertEquals("Child", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            assertNotNull(source.nodeState("Child", cursor.eventIndex))
+            controls.seek(1)
+            assertEquals("Start", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            assertNull(source.nodeState("Child", cursor.eventIndex))
+            assertSame(rows, rowsField.get(logic))
+            PipelinePlaybackToolbar::class.java.getDeclaredField("follow").apply { isAccessible = true }.setBoolean(controls, false)
+            controls.seek(2)
+            assertEquals("Child", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            assertSame(rows, rowsField.get(logic))
+            PipelinePlaybackToolbar::class.java.getDeclaredField("follow").apply { isAccessible = true }.setBoolean(controls, true)
+            controls.seek(1)
+            @Suppress("UNCHECKED_CAST")
+            val collapsed = field("collapsedLogicNodes").get(panel) as MutableSet<String>
+            collapsed.add("${file.url}#Start")
+            val renderFlow = PipelineFlowPanel::class.java.getDeclaredMethod("renderLogicView", PipelineNodeLocation::class.java)
+                .apply { isAccessible = true }
+            renderFlow.invoke(panel, model.projectNodes.single { it.name == "Start" })
+            controls.seek(2)
+            assertFalse(collapsed.contains("${file.url}#Start"))
+            assertEquals("Child", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            val timer = PipelinePlaybackToolbar::class.java.getDeclaredField("timer").apply { isAccessible = true }
+                .get(controls) as javax.swing.Timer
+            timer.start()
+            (field("clearTraceButton").get(panel) as javax.swing.JButton).doClick()
+            assertFalse(timer.isRunning)
+            assertFalse(controls.isVisible)
+            assertNull(controls.session)
+            assertEquals(before, ReadAction.compute<String, RuntimeException> { PipelineProjectFiles.text(file) })
+        } finally { manager.closeFile(workspace.file) }
+    }
+
     fun testGenericProjectsKeepStandardOverridesButDoNotInterpretCustomSubTaskNames() {
         val file = fixture(maaEnd = false)
         val generic = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }

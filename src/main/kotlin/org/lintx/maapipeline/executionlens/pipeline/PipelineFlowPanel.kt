@@ -146,8 +146,12 @@ internal class PipelineFlowPanel(
     private val refreshAlarm = com.intellij.util.Alarm(com.intellij.util.Alarm.ThreadToUse.SWING_THREAD, this)
     private var currentTrace: PipelineExecutionTrace? = null
     private var traceSourceVersions: Map<VirtualFile, Long> = emptyMap()
+    private var traceSourceVersionState: Boolean? = null
     private var traceLoadGeneration = 0L
     private var traceReplayExpanded = false
+    private val playbackCursors = mutableMapOf<String, PipelinePlaybackCursor>()
+    private val playbackToolbar = PipelinePlaybackToolbar(::playbackPositionChanged, ::openTraceFile)
+    private var traceDetailsPanel: JPanel? = null
     private var disposed = false
     private var refreshing = false
     private var syncingEntrySelector = false
@@ -261,7 +265,10 @@ internal class PipelineFlowPanel(
             addActionListener {
                 traceLoadGeneration++
                 currentTrace = null
+                playbackCursors.clear()
+                playbackToolbar.bind(null, false)
                 traceSourceVersions = emptyMap()
+                traceSourceVersionState = null
                 traceButton.isEnabled = true
                 nodeList.repaint()
                 updateTaskControls()
@@ -326,7 +333,10 @@ internal class PipelineFlowPanel(
             add(statusPanel, BorderLayout.CENTER)
         }
         contentSplit = OnePixelSplitter(false, 0.68f).apply {
-            firstComponent = logic
+            firstComponent = JPanel(BorderLayout()).apply {
+                add(logic, BorderLayout.CENTER)
+                add(playbackToolbar, BorderLayout.SOUTH)
+            }
             secondComponent = rightTabs
             border = JBUI.Borders.emptyTop(2)
         }
@@ -557,6 +567,8 @@ internal class PipelineFlowPanel(
     }
 
     private fun rebuildEffectiveContext() {
+        playbackToolbar.pause()
+        syncPlaybackSession()
         saveSession()
         val generation = ++effectiveGeneration
         val snapshot = currentModel
@@ -637,7 +649,7 @@ internal class PipelineFlowPanel(
 
     private fun nodeDisplayText(nodeName: String?): String {
         if (nodeName == null) return "（未选择节点）"
-        val state = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(nodeName)
+        val state = traceNodeState(nodeName)
         val node = currentModel.nodes.firstOrNull { it.name == nodeName }
         val references = node?.let { it.next + it.onError + it.embeddedReferences }.orEmpty()
         val reachability = if (nodeName !in reachableNodeNames().orEmpty()) "○ " else ""
@@ -665,6 +677,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun refreshFromDocument(document: Document, fullRefresh: Boolean = false) {
+        traceSourceVersionState = null
         FileDocumentManager.getInstance().getFile(document)?.let(pendingChangedFiles::add)
         fullRefreshRequired = fullRefreshRequired || fullRefresh
         val generation = ++refreshGeneration
@@ -759,6 +772,7 @@ internal class PipelineFlowPanel(
         if (rightTabs.selectedIndex != 0) return
         detailsDirty = false
         detailsPanel.removeAll()
+        traceDetailsPanel = null
         val selectedLocation = currentRoot()
         val location = inspectedLogicNode ?: selectedLocation
         // 中间流程保持任务入口或列表选中的根节点，右侧详情可以独立查看流程树中的任意目标。
@@ -863,14 +877,15 @@ internal class PipelineFlowPanel(
             } finally { logicBuildQueue = null }
         }
         logicPanel.setRows(rows)
+        updatePlaybackMarker()
         renderedContext = contextKey
     }
 
-    private fun traceSourceChanged(): Boolean = ReadAction.compute<Boolean, RuntimeException> {
+    private fun traceSourceChanged(): Boolean = traceSourceVersionState ?: ReadAction.compute<Boolean, RuntimeException> {
         traceSourceVersions.any { (source, version) ->
             !source.isValid || (FileDocumentManager.getInstance().getDocument(source)?.modificationStamp ?: source.modificationStamp) != version
         }
-    }
+    }.also { traceSourceVersionState = it }
 
     private fun appendTraceReplay(rows: MutableList<PipelineVirtualRow>) {
         val trace = currentTrace ?: return
@@ -903,19 +918,26 @@ internal class PipelineFlowPanel(
         }
         if (!traceReplayExpanded) return
         appendLogicNote(rows, "trace:version", 0, "日志未提供源码版本指纹；回放仅展示观察和明确标注的推断。点击行末可定位原始日志。")
-        replay.warnings.forEachIndexed { index, warning -> appendLogicNote(rows, "trace:warning:$index", 0, "⚠ $warning") }
-        replay.steps.forEachIndexed { index, step ->
-            val target = step.nodeName?.let { name -> currentModel.projectNodes.ifEmpty { currentModel.nodes }.singleOrNull { it.name == name } }
-            appendLogicRow(rows, "trace:step:$index", step.depth, 26, revision = listOf(trace.file, entry, step, target)) { panel ->
-                val task = step.event.taskId?.let { "[任务 $it] " }.orEmpty().takeIf { entry == null }.orEmpty()
-                val label = if (target == null) PipelineWrappingLabel(task + step.text) else {
-                    createNavigationLabel(task + step.text) { navigateToLogicNode(target) }
+        appendLogicRow(rows, "trace:recent", 0, 120, revision = listOf(trace, entry)) { panel ->
+            val update = Runnable {
+                panel.removeAll()
+                val cursor = playbackToolbar.session
+                val source = cursor?.source as? PipelineLogPlaybackSource
+                if (source != null) {
+                    val first = (cursor.eventIndex - 7).coerceAtLeast(0)
+                    for (index in first..cursor.eventIndex) {
+                        val frame = source.frame(index) ?: continue
+                        panel.add(PipelineWrappingLabel(frame.text))
+                        frame.lineNumber?.let { line ->
+                            panel.add(createNavigationLabel("查看原日志 · 第 $line 行") { openTraceFile(line) })
+                        }
+                    }
                 }
-                panel.add(label)
-                panel.add(createNavigationLabel("查看原日志 · 第 ${step.event.lineNumber} 行") {
-                    openTraceFile(step.event.lineNumber)
-                })
+                panel.revalidate()
+                panel.repaint()
             }
+            panel.putClientProperty("pipeline.playback.refresh", update)
+            update.run()
         }
     }
 
@@ -1041,12 +1063,8 @@ internal class PipelineFlowPanel(
         }
         renderedNodeCount++
         logicRowByNode.putIfAbsent(nodeKey, "$instanceKey:header")
-        val traceState = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)
         appendLogicRow(rows, "$instanceKey:header", depth, 32,
-            revision = listOf(effective, incoming, isCollapsed, currentTrace, traceState, hasBody, overrides)) { panel ->
-            val traceSuffix = currentTrace?.nodeStatesForEntry(selectedEntry?.entryName)?.get(location.name)?.let {
-                " · 本次运行：${it.status.label}"
-            }.orEmpty()
+            revision = listOf(effective, incoming, isCollapsed, currentTrace, hasBody, overrides)) { panel ->
             val header = JPanel(BorderLayout()).apply { isOpaque = false }
             val headerText = if (!effectiveNode(location).enabled) "已禁用（enabled=false） → ${location.name}" else incoming?.let {
                     logicCandidateHeading(
@@ -1059,7 +1077,7 @@ internal class PipelineFlowPanel(
                     boundTargetName = location.name.takeIf { _ -> it.reference.isAnchor },
                     anchorMayBeUnset = it.anchorMayBeUnset,
                 )
-            } ?: "${PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(effectiveNode(location)))} → ${location.name}$traceSuffix"
+            } ?: "${PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(effectiveNode(location)))} → ${location.name}"
             val overrideHint = if (overrides.isEmpty()) "" else if (overrides.any { it.second }) {
                 if (traceOverrides() != null) " · 日志覆盖" else " · 任务覆盖"
             } else " · 可由任务选项覆盖"
@@ -1362,18 +1380,6 @@ internal class PipelineFlowPanel(
         boundaryKind: PipelineExpansionBoundary? = null,
         anchorResolution: PipelineAnchorResolution? = null,
     ) {
-        val traceOutcome = currentTrace?.let { trace ->
-            listOf(reference.targetName, reference.displayName)
-                .asSequence()
-                .map { candidateName ->
-                    trace.candidateOutcomeForEntry(
-                        traceNodeName.orEmpty(),
-                        candidateName,
-                        selectedEntry?.entryName,
-                    )
-                }
-                .firstOrNull { outcome -> outcome != PipelineTraceCandidateOutcome.UNOBSERVED }
-        }
             val heading = logicCandidateHeading(
                 index = index,
                 reference = reference,
@@ -1423,18 +1429,6 @@ internal class PipelineFlowPanel(
         if (reference.isAnchor && boundTargetName == null) {
             return "${index + 1}. $jumpBack${if (clearedAnchor) "skip" else PipelineConditionSummary.candidatePrefix(index, fieldName)} ${reference.targetName}${if (clearedAnchor) "（已清除）" else " 已绑定"} · 运行时绑定"
         }
-        val traceOutcome = currentTrace?.let { trace ->
-            listOf(reference.targetName, reference.displayName)
-                .asSequence()
-                .map { candidateName ->
-                    trace.candidateOutcomeForEntry(
-                        traceNodeName.orEmpty(),
-                        candidateName,
-                        selectedEntry?.entryName,
-                    )
-                }
-                .firstOrNull { outcome -> outcome != PipelineTraceCandidateOutcome.UNOBSERVED }
-        }
         return buildString {
             append("${index + 1}. ")
             append(jumpBack)
@@ -1445,7 +1439,6 @@ internal class PipelineFlowPanel(
             if (boundTargetName != null) {
                 append(" · 运行时绑定")
             }
-            traceOutcome?.let { append(" · ${it.label}") }
         }
     }
 
@@ -1478,11 +1471,12 @@ internal class PipelineFlowPanel(
             return component
         }
         val arrow = text.lastIndexOf(" → ")
-        if (arrow < 0) return label(text)
+        if (arrow < 0) return withPlaybackBadge(label(text), location, reference, parentName)
         val opensBlock = text.endsWith(" {")
         val target = text.substring(arrow + 1).removeSuffix(" {")
-        return PipelineFlowHeading(label(text.substring(0, arrow)), label(target),
-            if (opensBlock) label("{") else JPanel().apply { isOpaque = false; preferredSize = Dimension(0, 0) })
+        return withPlaybackBadge(PipelineFlowHeading(label(text.substring(0, arrow)), label(target),
+            if (opensBlock) label("{") else JPanel().apply { isOpaque = false; preferredSize = Dimension(0, 0) }),
+            location, reference, parentName)
     }
 
     private data class LogicIncomingBranch(
@@ -1658,7 +1652,8 @@ internal class PipelineFlowPanel(
                 }
             }.toMap()
         }
-        val observedEvents = currentTrace?.eventsForEntry(selectedEntry?.entryName).orEmpty()
+        val cursor = playbackToolbar.session
+        val observedEvents = (cursor?.source as? PipelineLogPlaybackSource)?.eventsThrough(cursor.eventIndex).orEmpty()
         val rows = PipelineAnchorOverview.build(currentModel).map { row ->
             val observed = observedEvents.lastOrNull { it.anchorName == row.name }
             row.copy(
@@ -2509,21 +2504,36 @@ internal class PipelineFlowPanel(
     }
 
     private fun addTraceSummary(location: PipelineNodeLocation) {
-        val trace = currentTrace ?: return
-        val entry = selectedEntry?.entryName
-        val events = trace.eventsForEntry(entry).filter { it.nodeName == location.name }
-        val rounds = trace.roundsForEntry(entry).filter { it.started.nodeName == location.name }
-        val calls = trace.replayForEntry(entry).calls.filter { it.caller == location.name || it.target == location.name }
-        if (events.isEmpty() && rounds.isEmpty() && calls.isEmpty()) return
-        detailsPanel.add(createSectionLabel("运行轨迹 · 本次运行"))
-        if (traceSourceChanged()) detailsPanel.add(JBLabel("⚠ 源码已改变，请按历史运行记录理解这些结果。"))
+        traceDetailsPanel = null
+        if (currentTrace == null) return
+        val panel = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+        }
+        val update = Runnable { renderTraceSummary(location, panel) }
+        panel.putClientProperty("pipeline.playback.refresh", update)
+        traceDetailsPanel = panel
+        detailsPanel.add(panel)
+        update.run()
+    }
+
+    private fun renderTraceSummary(location: PipelineNodeLocation, panel: JPanel) {
+        panel.removeAll()
+        val cursor = playbackToolbar.session ?: return
+        val source = cursor.source as? PipelineLogPlaybackSource ?: return
+        val events = source.nodeEventsThrough(location.name, cursor.eventIndex)
+        val rounds = source.roundsThrough(location.name, cursor.eventIndex)
+        val calls = source.callsThrough(location.name, cursor.eventIndex)
+        panel.add(createSectionLabel("运行轨迹 · 截至当前位置"))
+        if (events.isEmpty() && rounds.isEmpty() && calls.isEmpty()) panel.add(JBLabel("尚未观察到此节点"))
+        if (traceSourceChanged()) panel.add(JBLabel("⚠ 源码已改变，请按历史运行记录理解这些结果。"))
         rounds.takeLast(6).forEach { round ->
-            val number = rounds.indexOf(round) + 1
-            detailsPanel.add(createNavigationLabel("候选第 $number 轮 · 日志 ${round.started.lineNumber}") {
+            panel.add(createNavigationLabel("候选观察 · 日志 ${round.started.lineNumber}") {
                 openTraceFile(round.started.lineNumber)
             })
             round.started.candidates.forEach { candidate ->
-                detailsPanel.add(PipelineWrappingLabel("${candidate.name}：${round.outcome(candidate.name).label}").apply {
+                panel.add(PipelineWrappingLabel("${candidate.name}：${round.outcome(candidate.name).label}").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
@@ -2531,14 +2541,14 @@ internal class PipelineFlowPanel(
         }
         calls.takeLast(6).forEach { call ->
             val returned = call.resumed?.let { "推断返回 · 日志 ${it.lineNumber}" } ?: "未观察到返回"
-            detailsPanel.add(createNavigationLabel("↩ ${call.caller} → ${call.target}（推断；$returned）") {
+            panel.add(createNavigationLabel("↩ ${call.caller} → ${call.target}（推断；$returned）") {
                 openTraceFile(call.entered.lineNumber)
             })
         }
         events.takeLast(8).forEach { event ->
             val task = event.entryName?.let { "任务 $it" }.orEmpty()
             val suffix = if (task.isEmpty()) "" else "，$task"
-            detailsPanel.add(
+            panel.add(
                 createNavigationLabel(
                     "${event.kind.label}：${event.status.label}$suffix（日志第 ${event.lineNumber} 行）",
                 ) { openTraceFile(event.lineNumber) },
@@ -2551,21 +2561,118 @@ internal class PipelineFlowPanel(
                         append(candidate.name)
                     }
                 }
-                detailsPanel.add(PipelineWrappingLabel("候选：$candidates").apply {
+                panel.add(PipelineWrappingLabel("候选：$candidates").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
             }
             event.anchorName?.let { anchor ->
-                detailsPanel.add(PipelineWrappingLabel("运行时 Anchor：$anchor").apply {
+                panel.add(PipelineWrappingLabel("运行时 Anchor：$anchor").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
             }
         }
+        panel.revalidate()
+        panel.repaint()
+    }
+
+    private fun syncPlaybackSession() {
+        val trace = currentTrace
+        val entry = selectedEntry?.entryName ?: currentRoot()?.name
+        val cursor = if (trace != null && entry != null) playbackCursors.getOrPut(entry) {
+            PipelinePlaybackCursor(trace.playbackForEntry(entry))
+        } else null
+        playbackToolbar.bind(cursor, trace != null)
+    }
+
+    private fun traceNodeState(name: String?): PipelineTraceEvent? {
+        val cursor = playbackToolbar.session ?: return null
+        return name?.let { (cursor.source as? PipelineLogPlaybackSource)?.nodeState(it, cursor.eventIndex) }
+    }
+
+    private fun refreshPlaybackComponents(component: Component) {
+        if (component is JComponent) (component.getClientProperty("pipeline.playback.refresh") as? Runnable)?.run()
+        if (component is java.awt.Container) component.components.forEach(::refreshPlaybackComponents)
+    }
+
+    private fun playbackPositionChanged(forceFollow: Boolean) {
+        refreshPlaybackComponents(logicPanel)
+        logicPanel.refreshVisibleContent()
+        traceDetailsPanel?.takeIf { it.parent != null }?.let(::refreshPlaybackComponents)
+        nodeList.repaint()
+        val node = playbackToolbar.session?.frame?.nodeName?.let { currentReadingGraph().uniqueNode(it) }
+        logicPanel.followPlaybackRow(null)
+        if (node != null) {
+            inspectNode(node)
+            if (forceFollow || playbackToolbar.follow) {
+                val key = logicNodeKey(node.name, node.sourceFile ?: file)
+                if (key !in logicRowByNode) {
+                    val path = currentRoot()?.let { currentReadingGraph().path(it, node) }.orEmpty()
+                    var expanded = false
+                    path.dropLast(1).forEach { (_, parent) ->
+                        val parentKey = logicNodeKey(parent.name, parent.sourceFile ?: file)
+                        expanded = collapsedLogicNodes.remove(parentKey) || expanded
+                        logicRowByNode[parentKey]?.removeSuffix(":header")?.let { instance ->
+                            expanded = collapsedLogicNodes.remove(instance) || expanded
+                        }
+                        if (!effectiveNode(parent).enabled) expanded = explicitlyExpandedNodes.add(parentKey) || expanded
+                    }
+                    if (expanded) renderLogicView(currentRoot())
+                }
+                logicPanel.followPlaybackRow(logicRowByNode[key])
+            }
+        }
+        updatePlaybackMarker()
+    }
+
+    private fun updatePlaybackMarker() {
+        val node = playbackToolbar.session?.frame?.nodeName?.let { currentReadingGraph().uniqueNode(it) }
+        logicPanel.setPlaybackRow(node?.let { logicRowByNode[logicNodeKey(it.name, it.sourceFile ?: file)] })
+    }
+
+    private fun withPlaybackBadge(
+        heading: JComponent,
+        node: PipelineNodeLocation?,
+        reference: PipelineReference?,
+        parentName: String?,
+    ): JComponent {
+        if (currentTrace == null) return heading
+        val badge = JBLabel().apply { foreground = UIUtil.getContextHelpForeground(); border = JBUI.Borders.emptyLeft(8) }
+        val update = Runnable {
+            val cursor = playbackToolbar.session
+            val source = cursor?.source as? PipelineLogPlaybackSource
+            val outcome = if (source != null && parentName != null && reference != null) {
+                listOf(reference.targetName, reference.displayName).asSequence()
+                    .map { source.outcome(parentName, it, cursor.eventIndex) }
+                    .firstOrNull { it != PipelineTraceCandidateOutcome.UNOBSERVED }
+            } else null
+            val status = outcome?.let {
+                when (it) {
+                    PipelineTraceCandidateOutcome.SELECTED -> "已选择"
+                    PipelineTraceCandidateOutcome.MISSED -> "未命中"
+                    PipelineTraceCandidateOutcome.MATCHED -> "识别命中"
+                    PipelineTraceCandidateOutcome.SKIPPED -> "未选择"
+                    PipelineTraceCandidateOutcome.UNOBSERVED -> ""
+                }
+            } ?: if (parentName != null && reference != null) "" else {
+                traceNodeState(node?.name)?.let { "节点${it.status.label}" }.orEmpty()
+            }
+            val current = node?.name != null && cursor?.frame?.nodeName == node.name
+            badge.text = listOfNotNull("当前".takeIf { current }, status.takeIf { it.isNotEmpty() }).joinToString(" · ")
+            badge.toolTipText = "截至回放当前位置的日志观察"
+        }
+        badge.putClientProperty("pipeline.playback.refresh", update)
+        update.run()
+        return JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(heading, BorderLayout.CENTER)
+            add(badge, BorderLayout.EAST)
+        }
     }
 
     private fun loadTrace() {
+        playbackToolbar.pause()
         val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
             .withTitle("选择 MaaFramework 运行日志")
             .withDescription("选择 MaaFramework maafw.log 或导出的同类日志文件")
@@ -2591,6 +2698,7 @@ internal class PipelineFlowPanel(
                     indicator.checkCanceled()
                     trace.replayForEntry(entry)
                     trace.nodeStatesForEntry(entry)
+                    trace.playbackForEntry(entry)
                 }
                 parsedTrace = trace
             }
@@ -2599,7 +2707,9 @@ internal class PipelineFlowPanel(
                 if (disposed || generation != traceLoadGeneration) return
                 traceButton.isEnabled = true
                 currentTrace = parsedTrace
+                playbackCursors.clear()
                 traceSourceVersions = sourceVersions
+                traceSourceVersionState = null
                 nodeList.repaint()
                 updateTaskControls()
                 rebuildEffectiveContext()
@@ -3231,6 +3341,7 @@ internal class PipelineFlowPanel(
     )
 
     override fun dispose() {
+        playbackToolbar.dispose()
         saveSession()
         disposed = true
         refreshing = true
