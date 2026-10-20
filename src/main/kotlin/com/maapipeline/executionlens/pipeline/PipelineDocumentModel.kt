@@ -89,8 +89,8 @@ data class PipelineReference(
 enum class PipelineReferenceKind(
     val label: String,
 ) {
-    NEXT("后继"),
-    ON_ERROR("错误后继"),
+    NEXT("next"),
+    ON_ERROR("on_error"),
     TARGET("目标"),
     BEGIN("滑动起点"),
     END("滑动终点"),
@@ -1129,8 +1129,9 @@ internal object PipelineDocumentIndexer {
         }
 
         is JsonArray -> {
-            val values = value.valueList.take(3).joinToString(", ") { item -> summarizeInlineValue(item, depth + 1) }
-            if (value.valueList.size > 3) "[$values, …]" else "[$values]"
+            val limit = if (value.valueList.size == 4 && value.valueList.all { it.text.toDoubleOrNull() != null }) 4 else 3
+            val values = value.valueList.take(limit).joinToString(", ") { item -> summarizeInlineValue(item, depth + 1) }
+            if (value.valueList.size > limit) "[$values, …]" else "[$values]"
         }
 
         else -> scalarText(value.text)

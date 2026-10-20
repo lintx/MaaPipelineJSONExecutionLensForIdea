@@ -1,6 +1,7 @@
 package com.maapipeline.executionlens.pipeline
 
 import com.intellij.openapi.Disposable
+import com.intellij.codeInsight.daemon.impl.IntentionsUI
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.actionSystem.DataSink
 import com.intellij.openapi.actionSystem.PlatformDataKeys
@@ -33,6 +34,10 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
     private var generation = 0L
     private var disposed = false
     private var pinnedFile: VirtualFile? = null
+    private var active = false
+    private var workspaceActive = true
+    private var selectedEditor: TextEditor? = null
+    private val intentionBulbs = linkedMapOf<TextEditor, Boolean>()
 
     init { add(pathLabel, BorderLayout.NORTH); add(body, BorderLayout.CENTER) }
 
@@ -52,12 +57,38 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
         val textEditor = WriteIntentReadAction.compute<TextEditor> {
             TextEditorProvider.getInstance().createEditor(project, file) as TextEditor
         }
+        intentionBulbs[textEditor] = textEditor.editor.settings.isShowIntentionBulb
+        textEditor.editor.settings.isShowIntentionBulb = false
         textEditor.editor.caretModel.addCaretListener(object : CaretListener {
             override fun caretPositionChanged(event: CaretEvent) {
                 if (!navigating && currentFile == file) onCaret(file, event.caret.offset)
             }
         })
         textEditor
+    }
+
+    fun setActive(value: Boolean) {
+        active = value
+        updateActiveEditor()
+    }
+
+    fun setWorkspaceActive(value: Boolean) {
+        workspaceActive = value
+        updateActiveEditor()
+    }
+
+    private fun updateActiveEditor() {
+        val next = editors[currentFile].takeIf { active && workspaceActive && !disposed }
+        if (selectedEditor !== next) {
+            selectedEditor?.deselectNotify()
+            selectedEditor = next
+            next?.selectNotify()
+        }
+        editors.values.forEach { hosted ->
+            hosted.editor.settings.isShowIntentionBulb = hosted === next && intentionBulbs[hosted] == true
+            // 灯泡位于窗口的浮层；仅隐藏 Swing 页签不会清除已经显示的原生提示。
+            if (hosted !== next) IntentionsUI.getInstance(project).hideForEditor(hosted.editor)
+        }
     }
 
     fun showFile(file: VirtualFile, range: TextRange, focus: Boolean) {
@@ -73,13 +104,17 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
             body.revalidate()
             body.repaint()
         }
+        updateActiveEditor()
         navigating = true
         try {
             textEditor.editor.caretModel.moveToOffset(range.startOffset.coerceIn(0, textEditor.editor.document.textLength))
         } finally { navigating = false }
         while (editors.size > 8) {
             val unused = editors.keys.firstOrNull { it != pinnedFile && it != file } ?: break
-            editors.remove(unused)?.let { TextEditorProvider.getInstance().disposeEditor(it) }
+            editors.remove(unused)?.let {
+                intentionBulbs.remove(it)
+                TextEditorProvider.getInstance().disposeEditor(it)
+            }
         }
         ApplicationManager.getApplication().invokeLater({
             if (disposed || request != generation || textEditor.editor.isDisposed) return@invokeLater
@@ -87,16 +122,18 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
             try {
                 textEditor.editor.caretModel.moveToOffset(range.startOffset.coerceIn(0, textEditor.editor.document.textLength))
                 textEditor.editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
-                if (focus) textEditor.editor.contentComponent.requestFocusInWindow()
+                if (focus && active && workspaceActive) textEditor.editor.contentComponent.requestFocusInWindow()
             } finally { navigating = false }
         }, ModalityState.any())
     }
 
     override fun dispose() {
         disposed = true
+        updateActiveEditor()
         generation++
         editors.values.forEach { TextEditorProvider.getInstance().disposeEditor(it) }
         editors.clear()
+        intentionBulbs.clear()
         body.removeAll()
     }
 }

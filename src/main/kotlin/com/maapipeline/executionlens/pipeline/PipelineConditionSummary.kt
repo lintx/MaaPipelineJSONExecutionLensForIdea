@@ -8,11 +8,11 @@ internal object PipelineConditionSummary {
         val interval = policy.rateLimit?.summary ?: "1000"
         val limit = when (timeout.toLongOrNull()) {
             -1L -> "不限时"
-            0L -> return "匹配后继（不等待重试）"
+            0L -> return "匹配 next（不等待重试）"
             null -> "超时 $timeout"
             else -> "超时 ${timeout}ms"
         }
-        return "重试匹配后继（$limit，轮次间隔至少 ${interval}ms）"
+        return "重试匹配 next（$limit，轮次间隔至少 ${interval}ms）"
     }
 
     fun entryCondition(node: PipelineNodeLocation): String =
@@ -56,7 +56,7 @@ internal object PipelineConditionSummary {
     fun jumpBackHint(parentName: String?, field: String): String = if (field == "on_error") {
         "JumpBack：on_error 错误处理链不触发回跳。"
     } else {
-        "JumpBack：此节点及其后继链正常结束后，从${parentName?.let { "父节点 $it 的" } ?: "父节点的"} next 第一项重新尝试；不重新执行父节点动作。"
+        "JumpBack：此节点及其 next 链正常结束后，从${parentName?.let { "父节点 $it 的" } ?: "父节点的"} next 第一项重新尝试；不重新执行父节点动作。"
     }
 
     fun action(node: PipelineNodeLocation): String? =

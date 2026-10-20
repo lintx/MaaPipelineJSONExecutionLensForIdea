@@ -20,6 +20,41 @@ import javax.swing.JComboBox
 import javax.swing.JTabbedPane
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    fun testReferenceImageKeepsOriginalCommentAndUsesOverriddenConditions() {
+        val file = fixture()
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{
+              // @preview reference.png
+              "recognition":"OCR","expected":"原始条件","roi":[1,2,3,4],"next":["Done"]
+            },"Done":{}}
+        """.trimIndent())
+        replaceFixtureFile("assets/tasks/Tasks.json", """
+            {"task":[{"name":"Transfer","entry":"Start","pipeline_override":{
+              "Start":{"recognition":{"type":"OCR","param":{"expected":"覆盖条件","roi":[5,6,7,8]}}}
+            }}]}
+        """.trimIndent())
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single().stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            try {
+                PlatformTestUtil.waitWithEventsDispatching("任务覆盖后的详情没有加载", {
+                    descendants(host.component).filterIsInstance<javax.swing.JLabel>().any { it.text.contains("覆盖条件") }
+                }, 30)
+            } catch (failure: AssertionError) {
+                throw AssertionError(descendants(host.component).filterIsInstance<javax.swing.JLabel>().map { it.text }.joinToString("\n"), failure)
+            }
+            val labels = descendants(host.component).filterIsInstance<javax.swing.JLabel>()
+            assertTrue(labels.any { it.text.contains("参考图 · reference.png") })
+            assertTrue(labels.any { it.text.contains("[5, 6, 7, 8]") })
+        } finally { manager.closeFile(workspace.file) }
+    }
+
     private fun fixture() = myFixture.addFileToProject("assets/resource/pipeline/Main.json", """
         {"Start":{"recognition":"DirectHit","next":["Caller","Done"]},
          "Caller":{"action":"Custom","custom_action":"SubTask","custom_action_param":{"sub":["Child"]}},
@@ -394,7 +429,18 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single()
         assertEquals(listOf("节点详情", "原始 JSON"), (0 until tabs.tabCount).map(tabs::getTitleAt))
         assertEquals(1, tabs.selectedIndex)
-        assertEquals(3, descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single().editorFor(file).editor.caretModel.offset)
+        val source = descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single()
+        val embeddedEditor = source.editorFor(file).editor
+        assertEquals(3, embeddedEditor.caretModel.offset)
+        val showBulb = embeddedEditor.settings.isShowIntentionBulb
+        tabs.selectedIndex = 0
+        assertFalse(embeddedEditor.settings.isShowIntentionBulb)
+        tabs.selectedIndex = 1
+        assertEquals(showBulb, embeddedEditor.settings.isShowIntentionBulb)
+        host.deselectNotify()
+        assertFalse(embeddedEditor.settings.isShowIntentionBulb)
+        host.selectNotify()
+        assertEquals(showBulb, embeddedEditor.settings.isShowIntentionBulb)
         val openBefore = manager.openFiles.toSet()
         panel.activateTask(other)
         PlatformTestUtil.waitWithEventsDispatching("任务切换没有保存", {
@@ -478,11 +524,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val cycle = labels().single { it.text.contains("· ↩ 循环") }
             val header = cycle.parent.parent as javax.swing.JPanel
             val controls = (header.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.SOUTH)
-            assertNotNull("循环候选应和普通节点一样把按钮放在标题下方", controls)
-            header.setSize(700, header.preferredSize.height)
-            header.doLayout()
-            assertEquals(0, controls.x)
-            assertEquals(header.width, controls.width)
+            assertNull("左侧循环候选只负责阅读，不应保留编辑操作", controls)
+            assertTrue(descendants(logic).filterIsInstance<javax.swing.JToggleButton>().none { it.text in setOf("回", "锚") })
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text == "↩ 回到此层" }.doClick()
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals("Start", (descendants(host.component).filterIsInstance<JComboBox<*>>().single().selectedItem as PipelineNodeLocation).name)
@@ -546,9 +589,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertTrue(labels().none { it.text.contains("Unused") })
             assertTrue(labels().none { it.text.contains("可能目标") || it.text.contains("设置 Anchor") || it.text.contains("存在清除") })
             assertTrue(descendants(logic).filterIsInstance<javax.swing.JButton>().none { it.text.contains("可能目标") })
-            val header = label.parent.parent as javax.swing.JPanel
-            val markers = descendants(header).filterIsInstance<javax.swing.JToggleButton>()
-            assertTrue(markers.single { it.text == "锚" }.isSelected)
+            assertTrue(descendants(logic).filterIsInstance<javax.swing.JToggleButton>().none { it.text in setOf("回", "锚") })
             val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
             val tabs = descendants(host.component).filterIsInstance<JTabbedPane>().single()
             tabs.selectedIndex = 1
@@ -565,6 +606,14 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             label.mouseListeners.forEach { it.mouseClicked(navigate) }
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals(target.nameRange.startOffset, sourceEditor.caretModel.offset)
+            tabs.selectedIndex = 0
+            val start = labels().single { it.text == "→ Start" }
+            start.mouseListeners.forEach { listener -> listener.mouseClicked(java.awt.event.MouseEvent(start,
+                java.awt.event.MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)) }
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            val anchorMarker = descendants(host.component).filterIsInstance<javax.swing.JToggleButton>().single { it.text == "锚" && it.isSelected }
+            val markers = descendants(anchorMarker.parent).filterIsInstance<javax.swing.JToggleButton>()
+            assertTrue(markers.single { it.text == "锚" }.isSelected)
             val document = source.editorFor(file).editor.document
             val previousDialog = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.YES }
             try { markers.single { it.text == "回" }.doClick() }
@@ -656,7 +705,9 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals(originalRows, logic.components.toList())
             assertEquals(originalDetails, descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>())
             tabs.selectedIndex = 0
-            assertTrue(descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>().any { it.text == "Child" })
+            assertTrue(descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>().any {
+                it.text.removePrefix("<html>").removeSuffix("</html>") == "Child"
+            })
             assertEquals(originalRows, logic.components.toList())
 
             val previousModel = selector.model

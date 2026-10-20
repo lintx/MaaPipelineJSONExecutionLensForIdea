@@ -13,8 +13,6 @@ import com.intellij.psi.util.PsiTreeUtil
 import com.jetbrains.jsonSchema.impl.JsonOriginalPsiWalker
 import com.jetbrains.jsonSchema.impl.JsonSchemaVersion
 import com.jetbrains.jsonSchema.impl.NetworkntValidationBridge
-import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.JBTextField
 import com.intellij.util.ui.JBUI
 import java.awt.BorderLayout
@@ -30,11 +28,7 @@ internal class PipelineNodeDialog(
     private val project: Project,
 ) : DialogWrapper(project, true) {
     private val nameField = JBTextField()
-    private val bodyField = JBTextArea("{\n  \"recognition\": {},\n  \"action\": {}\n}").apply {
-        lineWrap = false
-        wrapStyleWord = false
-        tabSize = 2
-    }
+    private val bodyField = PipelineJsonEditor(project, "{\n  \"recognition\": \"DirectHit\",\n  \"action\": \"DoNothing\"\n}")
 
     init {
         title = "添加 Pipeline 节点"
@@ -46,7 +40,7 @@ internal class PipelineNodeDialog(
         get() = nameField.text.trim()
 
     val nodeBody: String
-        get() = bodyField.text.trim()
+        get() = bodyField.value
 
     override fun createCenterPanel(): JComponent = JPanel(BorderLayout(0, JBUI.scale(8))).apply {
         border = JBUI.Borders.empty(8)
@@ -80,7 +74,7 @@ internal class PipelineNodeDialog(
             },
         )
         form.add(
-            JBScrollPane(bodyField).apply { preferredSize = JBUI.size(620, 360) },
+            bodyField.apply { preferredSize = JBUI.size(620, 360) },
             GridBagConstraints().apply {
                 gridx = 1
                 gridy = 1

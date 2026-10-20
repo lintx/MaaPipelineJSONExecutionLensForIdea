@@ -57,9 +57,15 @@ internal class PipelineFileEditor(private val project: Project, private val file
         workspace.requestedFile?.let { panel.openFromSource(it, workspace.requestedOffset) }
     }
 
+    internal fun navigateSource(target: VirtualFile, range: com.intellij.openapi.util.TextRange, focus: Boolean) {
+        source.showFile(target, range, focus)
+    }
+
     override fun getComponent(): JComponent = component
     override fun getPreferredFocusedComponent(): JComponent = component
     override fun getName(): String = "Pipeline 流程"
+    override fun selectNotify() { source.setWorkspaceActive(true) }
+    override fun deselectNotify() { source.setWorkspaceActive(false) }
     override fun setState(state: FileEditorState) = Unit
     override fun isModified(): Boolean = false
     override fun isValid(): Boolean = !disposed

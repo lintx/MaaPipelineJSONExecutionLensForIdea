@@ -9,8 +9,6 @@ import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.PsiFileFactory
 import com.intellij.psi.util.PsiTreeUtil
-import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextArea
 import com.intellij.util.ui.JBUI
 import com.jetbrains.jsonSchema.impl.JsonOriginalPsiWalker
 import com.jetbrains.jsonSchema.impl.JsonSchemaVersion
@@ -26,11 +24,7 @@ internal class PipelineJsonFieldDialog(
     private val fieldName: String,
     initialText: String,
 ) : DialogWrapper(project, true) {
-    private val textArea = JBTextArea(initialText).apply {
-        lineWrap = false
-        wrapStyleWord = false
-        tabSize = 2
-    }
+    private val jsonEditor = PipelineJsonEditor(project, initialText)
 
     init {
         title = "编辑 Pipeline 字段：$fieldName"
@@ -39,14 +33,12 @@ internal class PipelineJsonFieldDialog(
     }
 
     val value: String
-        get() = textArea.text.trim()
+        get() = jsonEditor.value
 
     override fun createCenterPanel(): JComponent = JPanel(BorderLayout(0, JBUI.scale(6))).apply {
         border = JBUI.Borders.empty(8)
-        add(JLabel("编辑 JSON 值；应用前会校验语法，取消不会修改源码。"), BorderLayout.NORTH)
-        add(JBScrollPane(textArea).apply {
-            preferredSize = JBUI.size(720, 420)
-        }, BorderLayout.CENTER)
+        add(PipelineWrappingLabel("原生 JSON 编辑器 · 应用前校验语法与 Schema；只修改当前字段，取消不写回。"), BorderLayout.NORTH)
+        add(jsonEditor, BorderLayout.CENTER)
     }
 
     override fun doValidate(): ValidationInfo? = ReadAction.compute<ValidationInfo?, RuntimeException> { validateValue() }
@@ -58,11 +50,11 @@ internal class PipelineJsonFieldDialog(
             value,
         )
         if (PsiTreeUtil.hasErrorElements(psiFile)) {
-            return ValidationInfo("JSON 语法错误，请修正后再应用。", textArea)
+            return ValidationInfo("JSON 语法错误，请修正后再应用。", jsonEditor.field)
         }
         val schemaError = validateAgainstPipelineSchema()
         if (schemaError != null) {
-            return ValidationInfo("Pipeline Schema 校验失败：$schemaError", textArea)
+            return ValidationInfo("Pipeline Schema 校验失败：$schemaError", jsonEditor.field)
         }
         return null
     }

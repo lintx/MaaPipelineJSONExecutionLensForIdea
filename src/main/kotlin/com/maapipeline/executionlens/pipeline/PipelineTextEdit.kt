@@ -11,6 +11,18 @@ internal data class PipelineEditSnapshot(val version: Long, val text: String) {
 }
 
 internal object PipelineJsonTextEdits {
+    fun alignValue(document: String, startOffset: Int, value: String): String {
+        if (!value.contains('\n')) return value
+        val lineStart = document.lastIndexOf('\n', (startOffset - 1).coerceAtLeast(0)) + 1
+        val indent = document.substring(lineStart, startOffset).takeWhile { it == ' ' || it == '\t' }
+        val lines = value.replace("\r\n", "\n").trim().split('\n')
+        val common = lines.drop(1).filter { it.isNotBlank() }.map { it.takeWhile { character -> character == ' ' || character == '\t' } }
+            .reduceOrNull { current, next -> current.commonPrefixWith(next) }.orEmpty()
+        return lines.first() + "\n" + lines.drop(1).joinToString("\n") { line ->
+            if (line.isBlank()) "" else indent + line.removePrefix(common)
+        }
+    }
+
     fun replacementEdit(range: TextRange, original: String, replacement: String): PipelineTextEdit {
         val prefix = original.commonPrefixWith(replacement).length
         val suffix = original.drop(prefix).commonSuffixWith(replacement.drop(prefix)).length

@@ -11,7 +11,7 @@ internal enum class PipelineTraceEventKind(
 ) {
     TASK("任务"),
     PIPELINE_NODE("节点"),
-    NEXT_LIST("候选后继"),
+    NEXT_LIST("next 候选"),
     RECOGNITION("识别"),
     ACTION("动作"),
     WAIT_FREEZES("等待静止"),

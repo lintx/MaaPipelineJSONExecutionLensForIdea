@@ -295,6 +295,7 @@ internal class PipelineFlowPanel(
             })
             rightTabs.addTab("原始 JSON", source)
             rightTabs.addChangeListener {
+                source.setActive(rightTabs.selectedIndex == 1)
                 if (!restoring && rightTabs.selectedIndex == 1) selectedDetail()?.let {
                     source.showFile(it.sourceFile ?: file, it.nameRange, false)
                 }
@@ -519,6 +520,7 @@ internal class PipelineFlowPanel(
             expandedBranches += session.expandedBranches
             nodeBudget = session.nodeBudget.coerceAtLeast(MAX_LOGIC_NODES)
             rightTabs.selectedIndex = session.rightTab.coerceIn(0, 1)
+            source.setActive(rightTabs.selectedIndex == 1)
             contentSplit.proportion = session.splitProportion.coerceIn(0.15f, 0.9f)
             overrideToggle.isSelected = session.applyOverrides
             restoreScroll = true
@@ -734,38 +736,35 @@ internal class PipelineFlowPanel(
         } else if (location == null) {
             detailsPanel.add(JBLabel("选择任务或从源码节点打开流程"))
         } else {
-            detailsPanel.add(JBLabel(location.name).apply {
+            detailsPanel.add(PipelineWrappingLabel(location.name).apply {
                 font = font.deriveFont(Font.BOLD)
                 foreground = UIUtil.getLabelForeground()
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
             })
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             val staticPath = staticPathTo(location)
             if (staticPath == null && selectedEntry != null) {
-                detailsPanel.add(JBLabel("路径分析：从当前任务入口未解析到此节点（按文件和节点名计算项目静态路径）").apply {
+                detailsPanel.add(PipelineWrappingLabel("路径分析：从当前任务入口未解析到此节点").apply {
                     foreground = UIUtil.getContextHelpForeground()
                 })
             } else if (staticPath != null) {
-                detailsPanel.add(JBLabel("路径分析：${staticPath.joinToString(" → ")}").apply {
-                    foreground = UIUtil.getContextHelpForeground()
-                })
+                addPathAnalysis(staticPath)
             }
             addRelationshipOverview(location)
             val effectiveLocation = effectiveNode(location)
             val sourceFile = location.sourceFile ?: file
-            addControlFlowExplanation(effectiveLocation, sourceFile)
+            addControlFlowExplanation(effectiveLocation, sourceFile, location)
             addAnchorDefinitions(location, sourceFile)
             addNodeDiagnostics(location)
             addTaskOverrideSummary(location)
             addReferences(
-                "失败分支 · on_error",
+                "on_error",
                 effectiveLocation.onError,
                 effectiveLocation.onErrorField,
                 "on_error",
                 effectiveLocation.onErrorField?.sourceFile ?: sourceFile,
             )
             addReferences(
-                "成功分支 · next",
+                "next",
                 effectiveLocation.next,
                 effectiveLocation.nextField,
                 "next",
@@ -965,7 +964,6 @@ internal class PipelineFlowPanel(
             collapsedLogicNodes += nodes.map { logicNodeKey(it.name, it.sourceFile ?: file) }
             renderLogicView(currentRoot())
         }
-        addAction("Anchor", "查看项目级 Anchor 定义、引用和运行时设置点") { showAnchorManager() }
         val actionToolbar = ActionManager.getInstance().createActionToolbar("MaaPipeline.Logic", actions, true)
         actionToolbar.targetComponent = this
         container.add(JPanel(BorderLayout()).apply {
@@ -1033,19 +1031,6 @@ internal class PipelineFlowPanel(
                 renderLogicView(currentRoot())
                 saveSession()
             }, BorderLayout.WEST)
-            incoming?.let {
-                it.editableField?.let { fieldName ->
-                    addLogicCandidateControls(
-                        container = header,
-                        index = it.index,
-                        reference = it.reference,
-                        sourceLocation = it.sourceLocation,
-                        editableField = fieldName,
-                        referenceCount = it.referenceCount,
-                        bottomSlot = true,
-                    )
-                }
-            }
             panel.add(header)
         }
         if (isCollapsed) return
@@ -1354,17 +1339,6 @@ internal class PipelineFlowPanel(
                 anchorResolution?.hint()),
             BorderLayout.CENTER,
         )
-        if (editableField != null && sourceLocation != null) {
-            addLogicCandidateControls(
-                container = card,
-                index = index,
-                reference = reference,
-                sourceLocation = sourceLocation,
-                editableField = editableField,
-                referenceCount = referenceCount,
-                bottomSlot = true,
-            )
-        }
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         container.add(card)
     }
@@ -1450,45 +1424,6 @@ internal class PipelineFlowPanel(
             if (opensBlock) label("{") else JPanel().apply { isOpaque = false; preferredSize = Dimension(0, 0) })
     }
 
-    private fun addLogicCandidateControls(
-        container: JPanel,
-        index: Int,
-        reference: PipelineReference,
-        sourceLocation: PipelineNodeLocation,
-        editableField: String,
-        referenceCount: Int,
-        bottomSlot: Boolean = false,
-    ) {
-        val fieldLabel = referenceFieldLabel(editableField)
-        val controls = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
-            isOpaque = false
-            if (reference.isString) {
-                add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack, !currentModel.isGenerated) {
-                    toggleReferenceMarker(reference, "[JumpBack]", it)
-                })
-                add(createMarkerButton("锚", "切换 Anchor 前缀", reference.isAnchor, !currentModel.isGenerated) {
-                    toggleReferenceMarker(reference, "[Anchor]", it)
-                })
-            }
-            add(createReorderButton("↑", "将此${fieldLabel}前移", index > 0 && !currentModel.isGenerated) {
-                moveReference(sourceLocation, editableField, index, -1)
-            })
-            add(createReorderButton("↓", "将此${fieldLabel}后移", index < referenceCount - 1 && !currentModel.isGenerated) {
-                moveReference(sourceLocation, editableField, index, 1)
-            })
-            add(createReorderButton("×", "删除此${fieldLabel}", !currentModel.isGenerated) {
-                removeReference(sourceLocation, editableField, index)
-            })
-        }
-        controls.alignmentX = LEFT_ALIGNMENT
-        controls.maximumSize = Dimension(Int.MAX_VALUE, controls.preferredSize.height)
-        if (bottomSlot) {
-            container.add(controls, BorderLayout.SOUTH)
-        } else {
-            container.add(controls)
-        }
-    }
-
     private data class LogicIncomingBranch(
         val index: Int,
         val reference: PipelineReference,
@@ -1517,17 +1452,20 @@ internal class PipelineFlowPanel(
         }
     }
 
-    private fun addControlFlowExplanation(location: PipelineNodeLocation, sourceFile: VirtualFile) {
-        detailsPanel.add(createSectionLabel("快速阅读"))
-        val recognitionText = "${PipelineConditionSummary.entryCondition(location)}"
-        if (location.recognition != null) {
-            addQuickReadField("进入", recognitionText, location.recognition, sourceFile, emphasized = true)
-        } else {
-            addDetailText("进入：$recognitionText", emphasized = true)
+    private fun addControlFlowExplanation(location: PipelineNodeLocation, sourceFile: VirtualFile, original: PipelineNodeLocation) {
+        val catalog = currentModel.projectNodes.groupBy { it.name }.mapValues { (_, nodes) -> nodes.singleOrNull()?.let(::effectiveNode) }
+        val resolve: (String) -> PipelineNodeLocation? = { catalog[it] }
+        val visuals = PipelineVisualDetails(project, sourceFile, resolve) {
+            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(it, true)
         }
-        PipelineConditionSummary.action(location)?.let { action ->
-            addQuickReadField("动作", action, location.action, sourceFile)
-        }
+        val recognition = PipelineVisualModel.operation(location, resolve = resolve)
+        val action = PipelineVisualModel.operation(location, isAction = true, resolve = resolve)
+        addQuickReadField("条件", if (location.enabled) recognition.title else "已禁用（enabled=false）",
+            location.recognition, sourceFile, emphasized = true)
+        detailsPanel.add(visuals.operation(recognition))
+        addQuickReadField("动作", action.title, location.action, sourceFile)
+        detailsPanel.add(visuals.operation(action))
+        visuals.referenceImage(original, recognition, action)?.let { detailsPanel.add(it) }
         PipelineConditionSummary.anchor(location)?.let { anchor ->
             addQuickReadField("锚点", anchor, location.anchor, sourceFile)
         }
@@ -1548,14 +1486,14 @@ internal class PipelineFlowPanel(
         val row = JPanel(BorderLayout()).apply {
             isOpaque = false
             alignmentX = LEFT_ALIGNMENT
-            maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
         }
         row.add(JBLabel("$title：").apply {
             foreground = UIUtil.getContextHelpForeground()
             preferredSize = Dimension(JBUI.scale(42), preferredSize.height)
+            toolTipText = PipelineVisualModel.fieldHelp(title)
         }, BorderLayout.WEST)
         val value = if (field == null) {
-            JBLabel(text)
+            PipelineWrappingLabel(text)
         } else {
             createNavigationLabel(text) { navigateToFileRange(fieldSourceFile, field.range) }
         }
@@ -1573,14 +1511,14 @@ internal class PipelineFlowPanel(
             }, BorderLayout.EAST)
         }
         detailsPanel.add(row)
+        row.maximumSize = Dimension(Int.MAX_VALUE, row.preferredSize.height)
     }
 
     private fun addDetailText(text: String, emphasized: Boolean = false) {
-        detailsPanel.add(JBLabel(text).apply {
+        detailsPanel.add(PipelineWrappingLabel(text).apply {
             if (emphasized) font = font.deriveFont(Font.BOLD)
             foreground = UIUtil.getLabelForeground()
             alignmentX = LEFT_ALIGNMENT
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
         })
     }
 
@@ -1703,7 +1641,8 @@ internal class PipelineFlowPanel(
         val range = row.valueRange ?: return
         val dialog = PipelineJsonFieldDialog(project, "anchor", snapshot.text.substring(range.startOffset, range.endOffset))
         if (!dialog.showAndGet()) return
-        applyAnchorEdits(row, snapshot, listOf(PipelineTextEdit(range, dialog.value)), "编辑 Anchor 绑定")
+        applyAnchorEdits(row, snapshot, listOf(PipelineTextEdit(range,
+            PipelineJsonTextEdits.alignValue(snapshot.text, range.startOffset, dialog.value))), "编辑 Anchor 绑定")
     }
 
     private fun documentFor(sourceFile: VirtualFile): Document? =
@@ -1846,18 +1785,19 @@ internal class PipelineFlowPanel(
                         fieldName = fieldName,
                         referenceCount = references.size,
                         sourceFile = sourceFile,
-                        targetRecognitionSummary = targetLocation?.let { effectiveNode(it).recognition?.summary },
+                        targetRecognitionSummary = targetLocation?.let { PipelineConditionSummary.flowCondition(effectiveNode(it)) },
                     ),
                 )
             }
         }
-        val section = JPanel(BorderLayout()).apply {
+        val section = object : JPanel(BorderLayout()) {
+            override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
             isOpaque = false
             alignmentX = LEFT_ALIGNMENT
         }
         val foldMarker = createFoldMarker(body.isVisible, title) { isExpanded ->
             body.isVisible = isExpanded
-            section.maximumSize = Dimension(Int.MAX_VALUE, section.preferredSize.height)
             detailsPanel.revalidate()
             detailsPanel.repaint()
         }
@@ -1886,8 +1826,6 @@ internal class PipelineFlowPanel(
         }
         section.add(header, BorderLayout.NORTH)
         section.add(body, BorderLayout.CENTER)
-        // 嵌套在 BoxLayout 中时锁定自身高度，折叠后才能即时收缩而不留下空白。
-        section.maximumSize = Dimension(Int.MAX_VALUE, section.preferredSize.height)
         detailsPanel.add(section)
     }
 
@@ -1936,64 +1874,35 @@ internal class PipelineFlowPanel(
         sourceFile: VirtualFile = file,
         targetRecognitionSummary: String? = null,
     ): JComponent {
-        val card = JPanel().apply {
+        val card = object : JPanel() {
+            override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = true
             background = UIUtil.getPanelBackground()
-            border = JBUI.Borders.compound(
-                JBUI.Borders.customLine(JBColor.border()),
-                JBUI.Borders.empty(3, 6),
-            )
+            border = JBUI.Borders.empty(3, 6)
             alignmentX = LEFT_ALIGNMENT
         }
-        val state = states.takeIf { it.isNotEmpty() }?.joinToString("、")?.let { "（$it）" }.orEmpty()
-        val branchPrefix = PipelineConditionSummary.candidatePrefix(index, fieldName ?: "next")
-        val targetSuffix = if (reference.targetExists || reference.isAnchor) {
-            " → ${reference.targetName}"
-        } else {
-            ""
-        }
+        val condition = PipelineConditionSummary.flowCandidateCondition(reference, targetRecognitionSummary)
+        val branch = PipelineConditionSummary.flowBranch(index, fieldName ?: "next", condition)
+        val prefix = if (reference.isJumpBack) "[↶ 执行后重试] " else ""
+        val binding = if (reference.isAnchor) " · 运行时绑定" else ""
         card.add(
             createNavigationLabel(
-                "$marker${index + 1}. $branchPrefix ${PipelineConditionSummary.candidateLabel(reference, targetRecognitionSummary, fieldName ?: "next")}$targetSuffix $state",
-            ) { navigateToReference(reference) },
+                "${index + 1}. $prefix$branch → ${reference.targetName}$binding",
+            ) { navigateToReference(reference) }.apply {
+                toolTipText = PipelineFlowTooltip.render(
+                    reference.target?.recognitionDetails.orEmpty(), getFontMetrics(UIUtil.getLabelFont()),
+                    jumpBack = reference.isJumpBack, fieldName = fieldName ?: "next",
+                    anchorHint = states.joinToString(" · "), sourcePath = reference.target?.file?.let(::displayPath))
+            },
         )
-        reference.target?.let { target ->
-            val summary = buildList {
-                if (reference.isCrossFile) add("文件：${pipelinePath(target.file)}")
-                target.description?.let { add("说明：$it") }
-                target.actionSummary?.let { add("动作：$it") }
-            }.joinToString("  ")
-            if (summary.isNotEmpty()) card.add(JBLabel(summary).apply {
-                foreground = UIUtil.getContextHelpForeground()
-                border = JBUI.Borders.emptyTop(2)
-                alignmentX = LEFT_ALIGNMENT
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            })
-        }
-        reference.anchorTarget?.let { anchor ->
-            val summary = buildList {
-                add("定义：${anchor.definingNodeName}")
-                if (anchor.isCleared) {
-                    add("目标：未设置")
-                } else if (anchor.targetNode != null) {
-                    if (anchor.targetNode.file != file) add("文件：${displayPath(anchor.targetNode.file)}")
-                } else {
-                    add("目标：节点未定义")
-                }
-            }.joinToString("  ")
-            card.add(JBLabel(summary).apply {
-                foreground = UIUtil.getContextHelpForeground()
-                border = JBUI.Borders.emptyTop(2)
-                alignmentX = LEFT_ALIGNMENT
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            })
-        }
         if (sourceFile == file && (fieldName == "next" || fieldName == "on_error")) {
             val fieldLabel = referenceFieldLabel(fieldName)
             val controls = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
                 isOpaque = false
             }
+            controls.add(createReorderButton("改名", "修改原始引用名称", !currentModel.isGenerated) { editReferenceName(reference) })
             if (reference.isString) {
                 controls.add(createMarkerButton("回", "切换 JumpBack 前缀", reference.isJumpBack, !currentModel.isGenerated) {
                     toggleReferenceMarker(reference, "[JumpBack]", it)
@@ -2015,14 +1924,12 @@ internal class PipelineFlowPanel(
             controls.maximumSize = Dimension(Int.MAX_VALUE, controls.preferredSize.height)
             card.add(controls)
         }
-        // 操作区放在候选内容下方，窄窗口下不会被标题或详情文本挤出可视区域。
-        card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         return card
     }
 
     private fun referenceFieldLabel(fieldName: String?): String = when (fieldName) {
-        "on_error" -> "错误后继"
-        "next" -> "后继"
+        "on_error" -> "on_error"
+        "next" -> "next"
         else -> "引用"
     }
 
@@ -2124,7 +2031,7 @@ internal class PipelineFlowPanel(
             navigateToFileRange(override.file, override.range)
         })
         if (override.fields.isEmpty()) {
-            detailsPanel.add(JBLabel("当前任务存在覆盖对象，但没有可展示的字段").apply {
+            detailsPanel.add(PipelineWrappingLabel("当前任务存在覆盖对象，但没有可展示的字段").apply {
                 foreground = UIUtil.getContextHelpForeground()
             })
             detailsPanel.add(createOverrideAddButton(location, override))
@@ -2136,13 +2043,12 @@ internal class PipelineFlowPanel(
                 font = font.deriveFont(Font.BOLD)
                 maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
             })
-            detailsPanel.add(JBLabel("默认值：$defaultSummary").apply {
-                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
-            })
-            val row = JPanel(BorderLayout()).apply {
+            detailsPanel.add(PipelineWrappingLabel("默认值：$defaultSummary"))
+            val row = object : JPanel(BorderLayout()) {
+                override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
+            }.apply {
                 isOpaque = false
                 alignmentX = LEFT_ALIGNMENT
-                maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(28))
             }
             row.add(
                 createNavigationLabel("此处覆盖：${field.summary}") {
@@ -2270,7 +2176,7 @@ internal class PipelineFlowPanel(
         } else {
             val dialog = PipelineJsonFieldDialog(project, field.name, initialText)
             if (!dialog.showAndGet()) return
-            dialog.value
+            PipelineJsonTextEdits.alignValue(snapshot.text, range.startOffset, dialog.value)
         }
         if (replacement == initialText) return
         val edits = listOf(PipelineTextEdit(range, replacement))
@@ -2454,6 +2360,44 @@ internal class PipelineFlowPanel(
         )
     }
 
+    private fun addPathAnalysis(path: List<String>) {
+        val section = object : JPanel(BorderLayout()) {
+            override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
+        }.apply { isOpaque = false; alignmentX = LEFT_ALIGNMENT }
+        val body = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            path.forEachIndexed { index, step -> add(PipelineWrappingLabel("${index + 1}. $step")) }
+            isVisible = path.size <= 4
+        }
+        val header = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(createSectionLabel("路径分析 · ${path.size} 步"), BorderLayout.CENTER)
+            add(createFoldMarker(body.isVisible, "路径分析") { expanded ->
+                body.isVisible = expanded
+                detailsPanel.revalidate()
+                detailsPanel.repaint()
+            }, BorderLayout.EAST)
+        }
+        section.add(header, BorderLayout.NORTH)
+        section.add(body, BorderLayout.CENTER)
+        detailsPanel.add(section)
+    }
+
+    private fun editReferenceName(reference: PipelineReference) {
+        if (!ensureEditable()) return
+        val snapshot = captureEditSnapshot()
+        val text = Messages.showInputDialog(project, "修改 next / on_error 引用（保留所需前缀）：", "修改节点引用", null,
+            reference.displayName, null)?.trim()?.takeIf { it.isNotEmpty() } ?: return
+        val replacement = quoteJsonString(text)
+        val edit = PipelineTextEdit(reference.range, replacement)
+        if (!ensureSnapshot(snapshot, listOf(edit))) return
+        if (!confirmDocumentChange("修改 Pipeline 引用", reference.displayName, text, edits = listOf(edit))) return
+        WriteCommandAction.runWriteCommandAction(project, "修改 Pipeline 引用", null, Runnable {
+            editor.document.replaceString(edit.range.startOffset, edit.range.endOffset, replacement)
+        })
+    }
+
     private fun addTraceSummary(location: PipelineNodeLocation) {
         val trace = currentTrace ?: return
         val entry = selectedEntry?.entryName
@@ -2469,7 +2413,7 @@ internal class PipelineFlowPanel(
                 openTraceFile(round.started.lineNumber)
             })
             round.started.candidates.forEach { candidate ->
-                detailsPanel.add(JBLabel("${candidate.name}：${round.outcome(candidate.name).label}").apply {
+                detailsPanel.add(PipelineWrappingLabel("${candidate.name}：${round.outcome(candidate.name).label}").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
@@ -2497,13 +2441,13 @@ internal class PipelineFlowPanel(
                         append(candidate.name)
                     }
                 }
-                detailsPanel.add(JBLabel("候选：$candidates").apply {
+                detailsPanel.add(PipelineWrappingLabel("候选：$candidates").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
             }
             event.anchorName?.let { anchor ->
-                detailsPanel.add(JBLabel("运行时 Anchor：$anchor").apply {
+                detailsPanel.add(PipelineWrappingLabel("运行时 Anchor：$anchor").apply {
                     foreground = UIUtil.getContextHelpForeground()
                     border = JBUI.Borders.emptyLeft(8)
                 })
@@ -2678,8 +2622,8 @@ internal class PipelineFlowPanel(
         val initialText = editor.document.getText(range)
         val dialog = PipelineJsonFieldDialog(project, field.name, initialText)
         if (!dialog.showAndGet()) return
-        val replacement = dialog.value
-        if (replacement.isEmpty() || replacement == initialText) return
+        if (dialog.value.isEmpty() || dialog.value == initialText) return
+        val replacement = PipelineJsonTextEdits.alignValue(snapshot.text, range.startOffset, dialog.value)
         if (!ensureSnapshot(snapshot, listOf(PipelineTextEdit(range, replacement)))) return
         if (!ensureEditable()) return
         if (!confirmDocumentChange("编辑 Pipeline JSON 字段", initialText, replacement,
@@ -3067,6 +3011,11 @@ internal class PipelineFlowPanel(
         foreground = UIUtil.getContextHelpForeground()
         border = JBUI.Borders.emptyTop(5)
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+        toolTipText = when {
+            title.contains("Anchor") -> PipelineVisualModel.fieldHelp("anchor")
+            title == "next" || title == "on_error" -> PipelineVisualModel.fieldHelp(title)
+            else -> null
+        }
     }
 
     private fun createNavigationLabel(text: String, range: TextRange): JComponent =
@@ -3144,11 +3093,10 @@ internal class PipelineFlowPanel(
         }
     }
 
-    private fun createNavigationLabel(text: String, onClick: () -> Unit): JComponent = JBLabel(text).apply {
+    private fun createNavigationLabel(text: String, onClick: () -> Unit): JComponent = PipelineWrappingLabel(text).apply {
         cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
         foreground = JBColor.namedColor("Link.activeForeground", UIUtil.getLabelForeground())
         border = JBUI.Borders.empty(2, 4)
-        maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
         addMouseListener(object : MouseAdapter() {
             private val normalForeground = foreground
 
