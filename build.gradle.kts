@@ -7,7 +7,7 @@ plugins {
     id("org.jetbrains.intellij.platform") version "2.19.0"
 }
 
-group = "com.maapipeline.executionlens"
+group = "org.lintx.maapipeline.executionlens"
 version = "0.1.0-SNAPSHOT"
 
 repositories {
@@ -35,6 +35,7 @@ dependencies {
     intellijPlatform {
         local(file(ideaSdkPath))
         bundledPlugin("com.intellij.modules.json")
+        bundledPlugin("com.intellij.platform.images")
         testFramework(TestFrameworkType.Platform)
     }
 }
@@ -71,6 +72,6 @@ tasks {
 
 tasks.test {
     useJUnitPlatform()
-    systemProperty("idea.load.plugins.id", "com.intellij.modules.json,com.maapipeline.json.execution.lens")
+    systemProperty("idea.load.plugins.id", "com.intellij.modules.json,com.intellij.platform.images,org.lintx.maapipeline.executionlens")
     maaEndPath?.let { environment("MAAEND_PATH", it) }
 }

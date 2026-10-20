@@ -1,5 +1,5 @@
 <idea-plugin>
-    <id>com.maapipeline.json.execution.lens</id>
+    <id>org.lintx.maapipeline.executionlens</id>
     <name>MaaPipeline JSON Execution Lens</name>
     <vendor email="">MaaPipeline JSON Execution Lens</vendor>
 
@@ -10,26 +10,28 @@
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.json</depends>
+    <depends>com.intellij.platform.images</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <fileEditorProvider implementation="com.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
-        <postStartupActivity implementation="com.maapipeline.executionlens.MaaPipelineStartupActivity"/>
-        <fileBasedIndex implementation="com.maapipeline.executionlens.pipeline.PipelineNavigationIndex"/>
-        <psi.referenceContributor language="JSON" implementation="com.maapipeline.executionlens.pipeline.PipelineJsonReferenceContributor"/>
-        <lang.documentationProvider language="JSON" order="first" implementationClass="com.maapipeline.executionlens.pipeline.PipelineJsonDocumentationProvider"/>
-        <platform.backend.documentation.targetProvider order="first" implementation="com.maapipeline.executionlens.pipeline.PipelineDocumentationTargetProvider"/>
-        <platform.backend.documentation.psiTargetProvider order="first" implementation="com.maapipeline.executionlens.pipeline.PipelineDocumentationTargetProvider"/>
+        <fileEditorProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
+        <postStartupActivity implementation="org.lintx.maapipeline.executionlens.MaaPipelineStartupActivity"/>
+        <fileBasedIndex implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineNavigationIndex"/>
+        <psi.referenceContributor language="JSON" implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonReferenceContributor"/>
+        <lang.documentationProvider language="JSON" order="first" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonDocumentationProvider"/>
+        <platform.backend.documentation.targetProvider order="first" implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineDocumentationTargetProvider"/>
+        <platform.backend.documentation.psiTargetProvider order="first" implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineDocumentationTargetProvider"/>
+        <platform.backend.documentation.linkHandler order="first" implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineImageDocumentationLinkHandler"/>
         <localInspection language="JSON" shortName="MaaPipelineReference"
                          displayName="MaaPipeline 节点与 Anchor 引用"
                          groupName="MaaPipeline" enabledByDefault="true" level="WARNING"
-                         implementationClass="com.maapipeline.executionlens.pipeline.PipelineReferenceInspection"/>
+                         implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineReferenceInspection"/>
     </extensions>
     <actions>
-        <action id="MaaPipeline.OpenWorkspace" class="com.maapipeline.executionlens.pipeline.OpenPipelineWorkspaceAction"
+        <action id="MaaPipeline.OpenWorkspace" class="org.lintx.maapipeline.executionlens.pipeline.OpenPipelineWorkspaceAction"
                 text="打开 Pipeline 流程" description="在中央编辑器打开独立的 Pipeline 工作区">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
         </action>
-        <action id="MaaPipeline.OpenFromSource" class="com.maapipeline.executionlens.pipeline.OpenPipelineFromSourceAction"
+        <action id="MaaPipeline.OpenFromSource" class="org.lintx.maapipeline.executionlens.pipeline.OpenPipelineFromSourceAction"
                 text="从此处查看流程" description="在独立工作区查看当前 Pipeline 节点">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
