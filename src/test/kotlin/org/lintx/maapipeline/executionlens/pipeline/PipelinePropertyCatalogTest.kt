@@ -17,7 +17,10 @@ class PipelinePropertyCatalogTest {
         val properties = PipelinePropertyCatalog.properties(source, resource).associateBy { it.name }
         assertEquals("0", properties.getValue("rate_limit").defaultValue.toString())
         assertFalse(properties.getValue("rate_limit").inherited)
+        assertTrue(properties.getValue("rate_limit").isDefault)
         assertTrue(properties.getValue("timeout").inherited)
+        assertTrue(properties.getValue("timeout").isDefault)
+        assertFalse(properties.getValue("extension").isDefault)
         assertEquals("20000", properties.getValue("timeout").value.toString())
         assertEquals("""{"base":1,"shared":2}""", properties.getValue("attach").value.toString())
         assertTrue(properties.containsKey("extension"))
@@ -29,6 +32,8 @@ class PipelinePropertyCatalogTest {
         assertEquals("0.9", defaults.getValue("threshold").value.toString())
         assertTrue(defaults.getValue("threshold").inherited)
         assertTrue(defaults.getValue("threshold").resourceDefault)
+        assertTrue(defaults.getValue("threshold").isDefault)
         assertFalse(defaults.getValue("template").inherited)
+        assertFalse(defaults.getValue("template").isDefault)
     }
 }

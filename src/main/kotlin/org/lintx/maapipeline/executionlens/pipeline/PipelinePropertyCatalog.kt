@@ -12,6 +12,7 @@ internal data class PipelinePropertyValue(
     val resourceDefault: Boolean,
     val explanation: String,
 ) {
+    val isDefault: Boolean get() = inherited || value != null && value == defaultValue
     val suffix: String get() = when {
         inherited -> if (resourceDefault) "（默认 · 资源配置）" else "（默认）"
         value != null && value == defaultValue -> "（与默认值相同）"

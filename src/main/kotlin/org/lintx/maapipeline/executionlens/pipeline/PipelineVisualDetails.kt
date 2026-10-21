@@ -6,68 +6,96 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.ui.HideableDecorator
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.Cursor
+import java.awt.BorderLayout
+import java.awt.Component
+import java.awt.Container
 import java.awt.Dimension
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.image.BufferedImage
-import javax.swing.BoxLayout
 import javax.swing.ImageIcon
 import javax.swing.JComponent
 import javax.swing.JPanel
-import javax.swing.SwingConstants
+import javax.swing.JTextArea
+import javax.swing.JViewport
+import javax.swing.SwingUtilities
+import javax.swing.text.DefaultCaret
+import javax.swing.text.View
 
-internal class PipelineWrappingLabel(value: String) : JBLabel(value) {
-    private var renderedWidth = -1
-    private var renderedFont: java.awt.Font? = null
-    private var renderedText: String? = null
-    private var renderedLines: List<String> = emptyList()
+internal fun pipelineDefaultProperties(content: JPanel, count: Int): JComponent =
+    pipelineCollapsedSection("默认参数（$count）", content)
+
+internal fun pipelineCollapsedSection(title: String, content: JPanel): JComponent = object : JPanel(BorderLayout()) {
+    override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
+}.apply {
+    isOpaque = false
+    alignmentX = JComponent.LEFT_ALIGNMENT
+    HideableDecorator(this, title, false).apply {
+        setContentComponent(content)
+        setOn(false)
+    }
+}
+
+internal class PipelineWrappingLabel(value: String) : JTextArea(value) {
     init {
-        verticalAlignment = SwingConstants.TOP
+        lineWrap = true
+        wrapStyleWord = false
+        isEditable = false
+        isOpaque = false
+        font = UIUtil.getLabelFont()
+        foreground = UIUtil.getLabelForeground()
+        caretColor = foreground
+        selectionColor = JBColor.namedColor("TextField.selectionBackground", UIUtil.getListSelectionBackground(false))
+        selectedTextColor = JBColor.namedColor("TextField.selectionForeground", UIUtil.getLabelForeground())
         alignmentX = LEFT_ALIGNMENT
+        margin = JBUI.insets(2, 4)
+        // 数据刷新不能让只读文本的光标抢走流程滚动；用户的选择、复制仍由 Swing 处理。
+        (caret as? DefaultCaret)?.updatePolicy = DefaultCaret.NEVER_UPDATE
     }
 
-    private fun lines(available: Int): List<String> {
-        if (renderedWidth != available || renderedFont != font || renderedText != text) {
-            renderedWidth = available
-            renderedFont = font
-            renderedText = text
-            renderedLines = PipelineVisualAssets.wrapOverlayText(listOf(text.orEmpty()), getFontMetrics(font), available)
+    private fun availableWidth(): Int {
+        val viewport = SwingUtilities.getAncestorOfClass(JViewport::class.java, this) as? JViewport
+        if (viewport == null) {
+            return parent?.let { it.width - it.insets.left - it.insets.right }?.takeIf { it > 0 } ?: JBUI.scale(480)
         }
-        return renderedLines
+        var available = viewport.extentSize.width
+        var child: Component = this
+        var container: Container? = parent
+        while (container != null && container !== viewport) {
+            available -= container.insets.left + container.insets.right
+            val layout = container.layout
+            if (layout is BorderLayout && layout.getLayoutComponent(BorderLayout.CENTER) === child) {
+                listOf(BorderLayout.WEST, BorderLayout.EAST).forEach { side ->
+                    layout.getLayoutComponent(side)?.takeIf { it.isVisible }?.let {
+                        available -= it.preferredSize.width + layout.hgap
+                    }
+                }
+            }
+            child = container
+            container = container.parent
+        }
+        return available.coerceAtLeast(1)
     }
 
     override fun getPreferredSize(): Dimension {
-        val parentWidth = ((parent?.width ?: 0) - (parent?.insets?.let { it.left + it.right } ?: 0))
-            .takeIf { it > 0 } ?: JBUI.scale(480)
-        val available = minOf(width.takeIf { it > 0 } ?: parentWidth, parentWidth)
-        return preferredSizeForWidth(available)
+        val naturalWidth = text.orEmpty().lineSequence().maxOfOrNull { getFontMetrics(font).stringWidth(it) } ?: 0
+        return preferredSizeForWidth(minOf(naturalWidth + insets.left + insets.right, availableWidth()))
     }
 
     fun preferredSizeForWidth(available: Int): Dimension {
         val contentWidth = (available - insets.left - insets.right).coerceAtLeast(1)
-        // 尺寸查询不能改动标签文本，否则会在 BoxLayout 计算中途清空其布局缓存。
-        return Dimension(available, lines(contentWidth).size * getFontMetrics(font).height + insets.top + insets.bottom)
+        val view = getUI().getRootView(this)
+        view.setSize(contentWidth.toFloat(), Float.MAX_VALUE)
+        val contentHeight = kotlin.math.ceil(view.getPreferredSpan(View.Y_AXIS).toDouble()).toInt()
+        return Dimension(available.coerceAtLeast(0), contentHeight + insets.top + insets.bottom)
     }
-
-    override fun paintComponent(graphics: java.awt.Graphics) {
-        val copy = graphics.create() as java.awt.Graphics2D
-        try {
-            if (isOpaque) { copy.color = background; copy.fillRect(0, 0, width, height) }
-            copy.font = font
-            copy.color = if (isEnabled) foreground else UIUtil.getLabelDisabledForeground()
-            copy.setRenderingHint(java.awt.RenderingHints.KEY_TEXT_ANTIALIASING, java.awt.RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
-            val metrics = copy.fontMetrics
-            lines((width - insets.left - insets.right).coerceAtLeast(1)).forEachIndexed { index, line ->
-                copy.drawString(line, insets.left, insets.top + metrics.ascent + index * metrics.height)
-            }
-        } finally { copy.dispose() }
-    }
-
-    override fun getBaseline(width: Int, height: Int): Int = insets.top + getFontMetrics(font).ascent
 
     fun setContent(value: String) { text = value }
 
@@ -97,6 +125,7 @@ internal class PipelineVisualDetails(
 
     private fun appendOperation(container: JPanel, original: PipelineOperation, depth: Int) {
         val properties = PipelinePropertyCatalog.operationProperties(original, defaults(original.source))
+        val defaultContent = column()
         val byName = properties.associateBy { it.name }
         val operation = original.copy(parameters = properties.mapNotNull { property ->
             property.value?.let { property.name to it }
@@ -115,7 +144,8 @@ internal class PipelineVisualDetails(
         regionKeys.forEach { key ->
             val regionSource = if (key in original.roiHints && key !in original.parameters) original else operation
             val region = PipelineVisualModel.region(regionSource, key, resolve)
-            container.add(PipelineWrappingLabel("$key：${region.summary}${byName[key]?.suffix.orEmpty()}").apply { toolTipText = region.explanation })
+            val target = if (byName[key]?.isDefault == true && key !in original.roiHints) defaultContent else container
+            target.add(PipelineWrappingLabel("$key：${region.summary}${byName[key]?.suffix.orEmpty()}").apply { toolTipText = region.explanation })
         }
         val excluded = regionKeys.toSet() + setOf("all_of", "any_of", "template", "lower", "upper")
         properties.filter { it.name !in excluded }.forEach { property ->
@@ -123,7 +153,8 @@ internal class PipelineVisualDetails(
             val value = property.value
             val rendered = if (value != null && (value.isJsonObject || value.isJsonArray && value.asJsonArray.any { it.isJsonObject }))
                 GsonBuilder().setPrettyPrinting().create().toJson(value) else value?.let(PipelineVisualModel::display) ?: "未设置"
-            container.add(PipelineWrappingLabel("$key：$rendered${property.suffix}").apply {
+            val target = if (property.isDefault) defaultContent else container
+            target.add(PipelineWrappingLabel("$key：$rendered${property.suffix}").apply {
                 toolTipText = if (key in setOf("method", "detector", "only_rec") && mode != null) mode.second else property.explanation
             })
         }
@@ -151,6 +182,7 @@ internal class PipelineVisualDetails(
             }
             if (colors.ranges.isEmpty()) container.add(PipelineWrappingLabel("lower：${operation.text("lower") ?: "未设置"}\nupper：${operation.text("upper") ?: "未设置"}"))
         }
+        if (defaultContent.componentCount > 0) container.add(pipelineDefaultProperties(defaultContent, defaultContent.componentCount))
         operation.children.forEach { child ->
             val body = column().apply { border = JBUI.Borders.empty(4, 12, 4, 0) }
             if (depth < 16) appendOperation(body, child, depth + 1)
@@ -231,7 +263,7 @@ internal class PipelineVisualDetails(
         override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
     }.apply {
         isOpaque = false
-        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        layout = VerticalLayout(0)
         alignmentX = JComponent.LEFT_ALIGNMENT
     }
 }

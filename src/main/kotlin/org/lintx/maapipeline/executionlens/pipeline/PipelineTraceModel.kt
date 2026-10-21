@@ -61,6 +61,8 @@ internal class PipelineExecutionTrace(
     val events: List<PipelineTraceEvent>,
     val taskEntries: Map<Long, String>,
     val taskOverrides: List<PipelineTraceTaskOverrides> = emptyList(),
+    val taskCalls: List<PipelineTraceTaskCall> = emptyList(),
+    val taskRuns: List<PipelineTraceTaskRun> = emptyList(),
 ) {
     private val scopedEvents = mutableMapOf<String?, List<PipelineTraceEvent>>()
     private val scopedNodeStates = mutableMapOf<String?, Map<String, PipelineTraceEvent>>()
@@ -84,13 +86,13 @@ internal class PipelineExecutionTrace(
 
     fun overridesForEntry(entryName: String?): PipelineTraceTaskOverrides? {
         if (entryName == null) return null
-        val start = events.lastOrNull { it.kind == PipelineTraceEventKind.TASK &&
+        val start = eventsForEntry(entryName).firstOrNull { it.kind == PipelineTraceEventKind.TASK &&
             it.status == PipelineTraceStatus.STARTING && it.entryName == entryName } ?: return null
         return taskOverrides.singleOrNull { it.startLineNumber == start.lineNumber && it.taskId == start.taskId }
     }
 
     fun eventsForEntry(entryName: String?): List<PipelineTraceEvent> = scopedEvents.getOrPut(entryName) {
-        pipelineTraceEventsForEntry(events, taskEntries, entryName)
+        pipelineTraceEventsForEntry(events, taskEntries, entryName, taskCalls, taskRuns)
     }
 
     fun nodeStatesForEntry(entryName: String?): Map<String, PipelineTraceEvent> = scopedNodeStates.getOrPut(entryName) {
@@ -103,11 +105,11 @@ internal class PipelineExecutionTrace(
     }
 
     fun replayForEntry(entryName: String?): PipelineTraceReplay = scopedReplays.getOrPut(entryName) {
-        PipelineTraceReplayBuilder.build(eventsForEntry(entryName), roundsForEntry(entryName))
+        PipelineTraceReplayBuilder.build(eventsForEntry(entryName), roundsForEntry(entryName), taskCalls)
     }
 
     fun playbackForEntry(entryName: String?): PipelineLogPlaybackSource = scopedPlayback.getOrPut(entryName) {
-        PipelineLogPlaybackSource(eventsForEntry(entryName), roundsForEntry(entryName), replayForEntry(entryName))
+        PipelineLogPlaybackSource(eventsForEntry(entryName), roundsForEntry(entryName), replayForEntry(entryName), taskCalls)
     }
 
     fun latestNextListForNode(nodeName: String, taskId: Long? = null): PipelineTraceEvent? = events
@@ -141,14 +143,38 @@ internal fun pipelineTraceEventsForEntry(
     events: List<PipelineTraceEvent>,
     taskEntries: Map<Long, String>,
     entryName: String?,
+    taskCalls: List<PipelineTraceTaskCall> = emptyList(),
+    taskRuns: List<PipelineTraceTaskRun> = emptyList(),
 ): List<PipelineTraceEvent> {
     if (entryName == null) return events
     val latestTaskId = pipelineTraceLatestTaskIds(events, taskEntries)[entryName] ?: return emptyList()
+    val run = taskRuns.lastOrNull { it.taskId == latestTaskId && it.entryName == entryName }
+    // 实际 PipelineTask::run 标明执行进程；Agent 转发的 Starting 不能替代运行来源。
     val start = events.lastOrNull { it.taskId == latestTaskId && it.entryName == entryName &&
-        it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING }
-    // 同名任务可能运行多次，候选和节点状态必须来自同一个 task_id，不能拼成一条虚假的路径。
-    return events.filter { it.taskId == latestTaskId && (start == null ||
-        it.lineNumber >= start.lineNumber && (start.processId == null || it.processId == start.processId)) }
+        it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING &&
+        (run == null || it.processId == run.processId && it.lineNumber <= run.startLine) }
+    val end = events.firstOrNull { it.taskId == latestTaskId && it.kind == PipelineTraceEventKind.TASK &&
+        it.status != PipelineTraceStatus.STARTING && it.lineNumber > (start?.lineNumber ?: 0) &&
+        (start?.processId == null || it.processId == start.processId) }?.lineNumber ?: Int.MAX_VALUE
+    val included = mutableListOf<PipelineTraceTaskCall>()
+    // 子调用按开始行递归展开；并行任务与其他进程的同号任务不能借用父任务上下文。
+    taskCalls.sortedBy { it.startLine }.forEach { call ->
+        if (call.startLine < (start?.lineNumber ?: 0) || call.startLine > end ||
+            start?.processId != null && call.processId != start.processId) return@forEach
+        if (call.parentTaskId == latestTaskId || included.any { parent ->
+            parent.childTaskId == call.parentTaskId && parent.processId == call.processId &&
+                call.startLine in parent.startLine..(parent.endLine ?: end)
+        }) included += call
+    }
+    val callsByTask = included.groupBy { it.childTaskId }
+    return events.filter { event ->
+        event.lineNumber in (start?.lineNumber ?: 0)..end &&
+            (start?.processId == null || event.processId == start.processId) &&
+            (event.taskId == latestTaskId || callsByTask[event.taskId].orEmpty().any { call ->
+                event.taskId == call.childTaskId && event.processId == call.processId &&
+                    event.lineNumber in call.startLine..(call.endLine ?: end)
+            })
+    }
 }
 
 private fun pipelineTraceLatestTaskIds(events: List<PipelineTraceEvent>, taskEntries: Map<Long, String>): Map<String, Long> {
@@ -178,6 +204,8 @@ internal data class PipelineTraceParseResult(
     val events: List<PipelineTraceEvent>,
     val taskEntries: Map<Long, String>,
     val taskOverrides: List<PipelineTraceTaskOverrides> = emptyList(),
+    val taskCalls: List<PipelineTraceTaskCall> = emptyList(),
+    val taskRuns: List<PipelineTraceTaskRun> = emptyList(),
 )
 
 internal object PipelineTraceParser {
@@ -191,7 +219,7 @@ internal object PipelineTraceParser {
         val parsed = file.inputStream.use { input ->
             parseLines(input.bufferedReader(StandardCharsets.UTF_8).lineSequence(), checkCanceled)
         }
-        return PipelineExecutionTrace(file, parsed.events, parsed.taskEntries, parsed.taskOverrides)
+        return PipelineExecutionTrace(file, parsed.events, parsed.taskEntries, parsed.taskOverrides, parsed.taskCalls, parsed.taskRuns)
     }
 
     internal fun parseText(text: String): PipelineTraceParseResult = parseLines(text.lineSequence())
@@ -201,17 +229,23 @@ internal object PipelineTraceParser {
         val events = mutableListOf<PipelineTraceEvent>()
         val taskEntries = mutableMapOf<Long, String>()
         val overrides = PipelineTraceOverrideCollector()
+        val calls = PipelineTraceTaskCallCollector()
+        val nativeNotifications = mutableMapOf<Triple<String?, Long?, String>, JsonObject>()
         var lineNumber = 0
         lines.forEach { line ->
             lineNumber++
             if (lineNumber % 1000 == 0) checkCanceled()
             overrides.accept(line, lineNumber)
+            calls.accept(line, lineNumber)
             val size = events.size
-            parseLine(line, lineNumber, events, taskEntries)
-            if (events.size != size) overrides.started(events.last(), line)
+            parseLine(line, lineNumber, events, taskEntries, nativeNotifications)
+            if (events.size != size) {
+                overrides.started(events.last(), line)
+                calls.observe(events.last(), line)
+            }
         }
         checkCanceled()
-        return PipelineTraceParseResult(events, taskEntries, overrides.snapshots)
+        return PipelineTraceParseResult(events, taskEntries, overrides.snapshots, calls.calls, calls.runs)
     }
 
     private fun parseLine(
@@ -219,6 +253,7 @@ internal object PipelineTraceParser {
         lineNumber: Int,
         events: MutableList<PipelineTraceEvent>,
         taskEntries: MutableMap<Long, String>,
+        nativeNotifications: MutableMap<Triple<String?, Long?, String>, JsonObject>,
     ) {
         val messageStart = line.indexOf(messagePrefix).takeIf { it >= 0 }
             ?: line.indexOf(fallbackMessagePrefix)
@@ -241,6 +276,11 @@ internal object PipelineTraceParser {
         }.getOrNull() ?: return
 
         val taskId = details.longValue("task_id")
+        val processId = processPattern.find(line)?.groupValues?.get(1)
+        val notificationKey = Triple(processId, taskId, message)
+        val forwarded = line.contains("::AgentClient::tasker_event_sink]") || line.contains("::AgentClient::ctx_event_sink]")
+        if (forwarded && nativeNotifications[notificationKey] == details) return
+        if (!forwarded) nativeNotifications[notificationKey] = details
         val entryName = details.stringValue("entry")
         if (kind == PipelineTraceEventKind.TASK && taskId != null && entryName != null) {
             taskEntries[taskId] = entryName
@@ -263,7 +303,7 @@ internal object PipelineTraceParser {
             nodeId = details.longValue("node_id"),
             candidates = candidates,
             anchorName = details.stringValue("anchor"),
-            processId = processPattern.find(line)?.groupValues?.get(1),
+            processId = processId,
         )
         if (events.lastOrNull()?.sameEvent(event) != true) {
             events += event

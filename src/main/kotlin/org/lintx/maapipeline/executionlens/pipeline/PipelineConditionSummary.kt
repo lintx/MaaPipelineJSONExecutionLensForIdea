@@ -11,12 +11,13 @@ internal object PipelineConditionSummary {
         val timeout = policy.timeout?.summary ?: PipelinePropertyCatalog.policyValue(node, resource, "timeout")
         val interval = policy.rateLimit?.summary ?: PipelinePropertyCatalog.policyValue(node, resource, "rate_limit")
         val limit = when (timeout.toLongOrNull()) {
-            -1L -> "不限时"
-            0L -> return "匹配 next（不等待重试）"
-            null -> "超时 $timeout"
-            else -> "超时 ${timeout}ms"
+            -1L -> "不设等待上限"
+            0L -> return "next 仅检查一轮，不重试"
+            null -> "最多等待 $timeout"
+            else -> "最多等待 ${timeout}ms"
         }
-        return "重试匹配 next（$limit，轮次间隔至少 ${interval}ms）"
+        val rateLimit = if (interval.toLongOrNull() == 0L) "" else "，每轮识别至少耗时 ${interval}ms"
+        return "next 均未命中时重试，$limit$rateLimit"
     }
 
     fun entryCondition(node: PipelineNodeLocation): String =

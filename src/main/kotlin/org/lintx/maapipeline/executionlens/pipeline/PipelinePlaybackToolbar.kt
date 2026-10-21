@@ -118,7 +118,15 @@ internal class PipelinePlaybackToolbar(
         add(eventLabel, BorderLayout.SOUTH)
         slider.toolTipText = "拖动定位到回放步骤"
         slider.addChangeListener {
-            if (!updating && !slider.valueIsAdjusting) { pause(); seek(slider.value) }
+            if (!updating) {
+                // pause() 会刷新旧游标；拖动期间只停止计时，保留预览，松手后提交目标位置。
+                val target = slider.value
+                timer.stop()
+                if (slider.valueIsAdjusting) {
+                    updatePositionPreview(target)
+                    toolbar.updateActionsImmediately()
+                } else seek(target)
+            }
         }
         addHierarchyListener { event ->
             if (event.changeFlags and HierarchyEvent.SHOWING_CHANGED.toLong() != 0L && !isShowing) pause()
@@ -151,9 +159,10 @@ internal class PipelinePlaybackToolbar(
         updating = true
         try {
             slider.maximum = ((value?.size ?: 0) - 1).coerceAtLeast(0)
-            slider.value = value?.position ?: 0
+            if (!slider.valueIsAdjusting) slider.value = value?.position ?: 0
             slider.isEnabled = value != null && value.size > 1 && value.source.canSeekBackward
-            positionLabel.text = if (value == null || value.size == 0) "0 / 0" else "${value.position + 1} / ${value.size}"
+            val displayedPosition = if (slider.valueIsAdjusting) slider.value else value?.position ?: 0
+            positionLabel.text = positionText(displayedPosition, value?.size ?: 0)
             eventLabel.text = value?.frame?.let { frame ->
                 listOfNotNull(frame.timestamp, frame.text).joinToString(" · ")
             } ?: "当前入口没有可回放的日志事件"
@@ -161,6 +170,13 @@ internal class PipelinePlaybackToolbar(
         } finally { updating = false }
         toolbar.updateActionsImmediately()
     }
+
+    private fun updatePositionPreview(position: Int) {
+        positionLabel.text = positionText(position, slider.maximum + 1)
+    }
+
+    private fun positionText(position: Int, size: Int): String =
+        if (size <= 0) "第 0 / 0 步" else "第 ${(position + 1).coerceIn(1, size)} / $size 步"
 
     override fun dispose() { timer.stop() }
 }

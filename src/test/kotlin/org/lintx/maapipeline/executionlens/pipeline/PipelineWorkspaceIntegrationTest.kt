@@ -15,8 +15,222 @@ import java.awt.Component
 import java.awt.Container
 import javax.swing.JComboBox
 import javax.swing.JTabbedPane
+import javax.swing.JLabel
+import javax.swing.text.JTextComponent
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    private fun textComponents(root: Component): List<Component> = descendants(root)
+        .filter { it is JLabel || it is JTextComponent }
+
+    private val Component.text: String
+        get() = when (this) {
+            is JLabel -> text
+            is JTextComponent -> text
+            else -> ""
+        }
+
+    fun testManyOptionalOverridesStayCompactAndPreserveTheirSources() {
+        val file = fixture(maaEnd = false)
+        val longRecognitionValue = "recognition-parameter-".repeat(14) + "complete-value-marker"
+        val cases = (0..39).joinToString(",") { index ->
+            """{"name":"Choice$index","label":"选项$index","pipeline_override":{"Start":{"post_delay":${index % 4 * 100}}}}"""
+        }
+        replaceFixtureFile("assets/tasks/Tasks.json", """
+            {"task":[{"name":"Transfer","entry":"Start","option":["Variant"]}],
+             "option":{"Variant":{"label":"测试分类","default_case":"Choice0","cases":[$cases]}}}
+        """.trimIndent())
+        val log = myFixture.addFileToProject("debug/override.log", """
+            [t][Px1][Tx1][MaaNS::Tasker::post_task] [entry=Start] [pipeline_override={"Start":{"template":["logged-template.png"],"recognition":{"param":{"custom_recognition_param":"$longRecognitionValue"}}}}]
+            [t][Px1][Tx1][MaaNS::TaskNS::Context::create] [id=9]
+            [t][Px1][Tx2] [msg=Tasker.Task.Starting] [details={"entry":"Start","task_id":9}]
+        """.trimIndent()).virtualFile
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single().stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
+            PlatformTestUtil.waitWithEventsDispatching("任务覆盖尚未加载", {
+                descendants(host.component).filterIsInstance<PipelineFlowPanel>().any { panel ->
+                    (field("currentModel").get(panel) as PipelineDocumentModel).version >= 0 && !field("contextLoading").getBoolean(panel)
+                }
+            }, 30)
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            val logic = field("logicPanel").get(panel) as PipelineRowsPanel
+            @Suppress("UNCHECKED_CAST")
+            val rows = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+                .get(logic) as List<PipelineRow>
+            val notes = rows.filter { it.key.endsWith(":override") }
+                .flatMap { textComponents(it.createComponent()) }
+            assertEquals("主流程只应保留一条覆盖摘要", 1, notes.size)
+            assertTrue("摘要应展示实际覆盖值", notes.single().text.contains("post_delay = 0"))
+            assertTrue(notes.single().text.contains("39"))
+            assertFalse(notes.single().text.contains("选项39"))
+            val details = field("detailsPanel").get(panel) as javax.swing.JPanel
+            val labels = textComponents(details)
+            val sources = labels.filter { it.text.startsWith("测试分类 = 选项") }
+            assertEquals("所有未应用条件的源码入口仍应保留", 39, sources.size)
+            val optionalSection = generateSequence(sources.first() as Component?) { it.parent }.first { it.parent === details }
+            assertEquals("相同覆盖值应合并展示", 4, textComponents(optionalSection)
+                .count { it.text.startsWith("post_delay：") })
+            sources.forEach { label ->
+                assertTrue("未应用配置应默认收起", generateSequence(label as Component?) { it.parent }
+                    .takeWhile { it !== details }.any { !it.isVisible })
+                assertTrue(label.mouseListeners.isNotEmpty())
+            }
+            field("currentTrace").set(panel, PipelineTraceParser.parse(log))
+            PipelineFlowPanel::class.java.getDeclaredMethod("rebuildEffectiveContext").apply { isAccessible = true }.invoke(panel)
+            PlatformTestUtil.waitWithEventsDispatching("日志覆盖没有完成刷新", {
+                !field("contextLoading").getBoolean(panel) && textComponents(details)
+                    .any { it.text.contains("template：") && it.text.contains("logged-template.png") }
+            }, 30)
+            @Suppress("UNCHECKED_CAST")
+            val loggedRows = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+                .get(logic) as List<PipelineRow>
+            val loggedNote = loggedRows.single { it.key.endsWith(":override") }.createComponent().let { row ->
+                textComponents(row).single()
+            }
+            assertTrue("日志摘要不能只剩字段名：${loggedNote.text}",
+                loggedNote.text.contains("template =") && loggedNote.text.contains("logged-template.png"))
+            assertTrue(loggedNote.text.contains("40"))
+            val loggedLabels = textComponents(details)
+            assertEquals("加载日志不能丢失任务的可选配置", 40, loggedLabels.count { it.text.startsWith("测试分类 = 选项") })
+            assertTrue("日志来源应仍可定位", loggedLabels.any { it.text.startsWith("来源：") && it.text.contains("override.log") })
+            assertTrue(loggedLabels.any { it.text.contains("task_id=9") })
+            val fullRecognition = loggedLabels.filterIsInstance<PipelineWrappingLabel>()
+                .single { it.text.startsWith("recognition：") }
+            assertTrue("详情必须显示未经摘要截断的覆盖值", fullRecognition.text.contains("complete-value-marker"))
+            assertFalse(fullRecognition.isEditable)
+            fullRecognition.select(0, "recognition".length)
+            assertEquals("recognition", fullRecognition.selectedText)
+            val sourceLabel = loggedLabels.single { it.text.startsWith("来源：") && it.text.contains("override.log") }
+            sourceLabel.mouseListeners.forEach { it.mouseClicked(java.awt.event.MouseEvent(sourceLabel,
+                java.awt.event.MouseEvent.MOUSE_CLICKED, 0L, 0, 1, 1, 1, false, java.awt.event.MouseEvent.BUTTON1)) }
+            assertTrue("覆盖来源应打开普通 IDE 文件标签", manager.isFileOpen(log))
+            assertTrue(sourceLabel is PipelineWrappingLabel)
+            val tabs = field("rightTabs").get(panel) as JTabbedPane
+            assertEquals("打开来源文件不应切换内嵌 JSON 页", 0, tabs.selectedIndex)
+            tabs.selectedIndex = 1
+            val click = java.awt.event.MouseEvent(loggedNote, java.awt.event.MouseEvent.MOUSE_CLICKED,
+                0L, 0, 1, 1, 1, false, java.awt.event.MouseEvent.BUTTON1)
+            loggedNote.mouseListeners.forEach { it.mouseClicked(click) }
+            assertEquals("摘要点击应切回详情，即使该节点已被选中", 0, tabs.selectedIndex)
+            assertNotNull(field("overrideDetailsHeader").get(panel))
+        } finally { manager.closeFile(workspace.file) }
+    }
+
+    fun testPlaybackRevealsDynamicAnchorPathBeyondBudgetWithoutExpandingUnrelatedBranches() {
+        val file = fixture(maaEnd = false)
+        val fillers = (0..204).map { "Filler$it" }
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"next":[${fillers.joinToString(",") { "\"$it\"" }},"Router"]},
+             ${fillers.joinToString(",") { "\"$it\":{}" }},
+             "Router":{"action":"Custom","custom_action":"Opaque","next":["[Anchor]Resume"]},
+             "Setup":{"anchor":{"Resume":"Target"}},"OtherSetup":{"anchor":{"Resume":"Alternative"}},
+             "Target":{"next":["Tail"]},"Tail":{"next":["Start"]},"Alternative":{"next":["Unrelated"]},"Unrelated":{}}
+        """.trimIndent())
+        replaceFixtureFile("assets/tasks/Tasks.json", """{"task":[{"name":"Transfer","entry":"Start"}]}""")
+        val log = myFixture.addFileToProject("debug/replay.log", """
+            [t0] [msg=Tasker.Task.Starting] [details={"entry":"Start","task_id":1}]
+            [t1] [msg=Node.Action.Starting] [details={"name":"Start","task_id":1}]
+            [t2] [msg=Node.Action.Starting] [details={"name":"Target","task_id":1,"anchor":"Resume"}]
+            [t3] [msg=Node.Action.Starting] [details={"name":"Tail","task_id":1}]
+        """.trimIndent()).virtualFile
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single().stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
+            PlatformTestUtil.waitWithEventsDispatching("流程尚未加载", {
+                (field("currentModel").get(panel) as PipelineDocumentModel).projectNodes.size == model.projectNodes.size &&
+                    !(field("contextLoading").getBoolean(panel))
+            }, 30)
+            field("currentTrace").set(panel, PipelineTraceParser.parse(log))
+            PipelineFlowPanel::class.java.getDeclaredMethod("rebuildEffectiveContext").apply { isAccessible = true }.invoke(panel)
+            PlatformTestUtil.waitWithEventsDispatching("日志上下文尚未加载", { !field("contextLoading").getBoolean(panel) }, 30)
+            val controls = field("playbackToolbar").get(panel) as PipelinePlaybackToolbar
+            val logic = field("logicPanel").get(panel) as PipelineRowsPanel
+            val rowsField = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+            @Suppress("UNCHECKED_CAST")
+            val rowByNode = field("logicRowByNode").get(panel) as Map<String, String>
+            val targetKey = "${file.url}#Target"
+            val tailKey = "${file.url}#Tail"
+            assertFalse(rowByNode.containsKey(targetKey))
+            val initialRows = rowsField.get(logic)
+            val follow = PipelinePlaybackToolbar::class.java.getDeclaredField("follow").apply { isAccessible = true }
+            follow.setBoolean(controls, false)
+            controls.seek(2)
+            assertEquals("Target", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            assertSame(initialRows, rowsField.get(logic))
+            assertFalse(rowByNode.containsKey(targetKey))
+            follow.setBoolean(controls, true)
+            controls.seek(1)
+            controls.seek(2)
+            assertNotNull("跟随应展开预算边界及动态 Anchor 候选", rowByNode[targetKey])
+            assertEquals(rowByNode[targetKey], PipelineRowsPanel::class.java.getDeclaredField("playbackRowKey")
+                .apply { isAccessible = true }.get(logic))
+            controls.seek(3)
+            assertNotNull("Anchor 目标之后的流程也应能定位", rowByNode[tailKey])
+            assertEquals(200, field("nodeBudget").getInt(panel))
+            assertFalse(rowByNode.containsKey("${file.url}#Alternative"))
+            assertFalse(rowByNode.containsKey("${file.url}#Filler204"))
+            val revealedRows = rowsField.get(logic)
+            controls.seek(2)
+            controls.seek(3)
+            assertSame("已展开路径上的步进不应重建流程", revealedRows, rowsField.get(logic))
+        } finally { manager.closeFile(workspace.file) }
+    }
+
+    fun testDetailsRemainMeasurableWhenDynamicChildInvalidatesItsParentDuringMeasurement() {
+        val file = fixture()
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val flow = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            val details = PipelineFlowPanel::class.java.getDeclaredField("detailsPanel").apply { isAccessible = true }
+                .get(flow) as javax.swing.JPanel
+            PlatformTestUtil.waitWithEventsDispatching("节点详情未加载", {
+                textComponents(details).any { it.text == "Start" }
+            }, 30)
+            val content = javax.swing.JPanel(java.awt.BorderLayout()).apply {
+                add(PipelineWrappingLabel("动态参考图与折叠内容的尺寸变化".repeat(8)))
+            }
+            val dynamic = object : javax.swing.JPanel(java.awt.BorderLayout()) {
+                override fun getPreferredSize(): java.awt.Dimension {
+                    parent?.invalidate()
+                    return super.getPreferredSize()
+                }
+            }.apply { add(content) }
+            details.add(dynamic)
+            val scroll = javax.swing.SwingUtilities.getAncestorOfClass(javax.swing.JScrollPane::class.java, details) as javax.swing.JScrollPane
+            repeat(12) { step ->
+                scroll.setSize(300 + step % 3 * 100, 900)
+                content.isVisible = step % 2 == 0
+                details.preferredSize
+                scroll.doLayout()
+                details.doLayout()
+                assertTrue(details.preferredSize.height > 0)
+                assertTrue(dynamic.height < 900)
+            }
+        } finally { manager.closeFile(workspace.file) }
+    }
+
     fun testPlaybackUpdatesHistoryAndDetailsWithoutRebuildingFlowAndStopsOnClear() {
         val file = fixture(maaEnd = false)
         replaceFixtureFile("assets/resource/pipeline/Main.json", """{"Start":{"next":["Child"]},"Child":{}}""")
@@ -50,8 +264,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertTrue(controls.isVisible)
             val cursor = controls.session!!
             val source = cursor.source as PipelineLogPlaybackSource
-            val logic = field("logicPanel").get(panel) as PipelineVirtualRowsPanel
-            val rowsField = PipelineVirtualRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+            val logic = field("logicPanel").get(panel) as PipelineRowsPanel
+            val rowsField = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
             val rows = rowsField.get(logic)
             controls.seek(2)
             assertEquals("Child", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
@@ -77,6 +291,28 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals("Child", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
             val timer = PipelinePlaybackToolbar::class.java.getDeclaredField("timer").apply { isAccessible = true }
                 .get(controls) as javax.swing.Timer
+            val slider = PipelinePlaybackToolbar::class.java.getDeclaredField("slider").apply { isAccessible = true }
+                .get(controls) as javax.swing.JSlider
+            val positionLabel = PipelinePlaybackToolbar::class.java.getDeclaredField("positionLabel").apply { isAccessible = true }
+                .get(controls) as javax.swing.JLabel
+            timer.start()
+            slider.valueIsAdjusting = true
+            slider.value = 1
+            assertTrue("拖动预览应同步显示目标步骤", positionLabel.text.contains("2 / ${cursor.size}"))
+            controls.refresh()
+            assertFalse("拖动进度时应暂停播放", timer.isRunning)
+            assertEquals("刷新不能把拖动位置改回旧游标", 1, slider.value)
+            assertTrue("刷新不能把步骤数字改回旧游标", positionLabel.text.contains("2 / ${cursor.size}"))
+            assertEquals("拖动期间不应反复重建当前位置", 2, cursor.position)
+            slider.valueIsAdjusting = false
+            assertEquals("松开滑块应跳转到拖动位置", 1, cursor.position)
+            assertEquals("Start", (field("inspectedLogicNode").get(panel) as PipelineNodeLocation).name)
+            slider.value = 2
+            assertEquals("直接调整进度也应生效", 2, cursor.position)
+            slider.valueIsAdjusting = true
+            slider.value = 1
+            slider.valueIsAdjusting = false
+            assertEquals("进度条应支持向后定位", 1, cursor.position)
             timer.start()
             (field("clearTraceButton").get(panel) as javax.swing.JButton).doClick()
             assertFalse(timer.isRunning)
@@ -192,12 +428,12 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
-            val logic = descendants(host.component).filterIsInstance<PipelineVirtualRowsPanel>().single()
-            val rowsField = PipelineVirtualRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
-            fun labels(): List<javax.swing.JLabel> {
+            val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
+            val rowsField = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
+            fun labels(): List<Component> {
                 @Suppress("UNCHECKED_CAST")
-                val rows = rowsField.get(logic) as List<PipelineVirtualRow>
-                return rows.flatMap { descendants(it.createComponent()).filterIsInstance<javax.swing.JLabel>() }
+                val rows = rowsField.get(logic) as List<PipelineRow>
+                return rows.flatMap { textComponents(it.createComponent()) }
             }
             PlatformTestUtil.waitWithEventsDispatching("子任务流程未展开", { labels().count { it.text.contains("CHILD_BODY") } == 2 }, 30)
             assertFalse(labels().any { it.text.contains("DISABLED_BODY") })
@@ -235,7 +471,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 val row = caption.parent as javax.swing.JPanel
                 row.setSize(500, row.preferredSize.height)
                 row.doLayout()
-                val value = (row.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.CENTER) as javax.swing.JLabel
+                val value = (row.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.CENTER) as Component
                 assertEquals(caption.y + caption.getBaseline(caption.width, caption.height), value.y + value.getBaseline(value.width, value.height))
                 assertTrue(row.components.filterIsInstance<javax.swing.JButton>().single().isEnabled)
             }
@@ -305,12 +541,12 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             try {
                 PlatformTestUtil.waitWithEventsDispatching("任务覆盖后的详情没有加载", {
-                    descendants(host.component).filterIsInstance<javax.swing.JLabel>().any { it.text.contains("覆盖条件") }
+                    textComponents(host.component).any { it.text.contains("覆盖条件") }
                 }, 30)
             } catch (failure: AssertionError) {
-                throw AssertionError(descendants(host.component).filterIsInstance<javax.swing.JLabel>().map { it.text }.joinToString("\n"), failure)
+                throw AssertionError(textComponents(host.component).map { it.text }.joinToString("\n"), failure)
             }
-            val labels = descendants(host.component).filterIsInstance<javax.swing.JLabel>()
+            val labels = textComponents(host.component)
             assertTrue(labels.any { it.text.contains("参考图 · reference.png") })
             assertTrue(labels.any { it.text.contains("[5, 6, 7, 8]") })
         } finally { manager.closeFile(workspace.file) }
@@ -693,15 +929,15 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
-            descendants(host.component).any { it is PipelineVirtualRowsPanel } && workspace.reading(entry.stableId).rootNode.endsWith("#Start")
+            descendants(host.component).any { it is PipelineRowsPanel } && workspace.reading(entry.stableId).rootNode.endsWith("#Start")
         }, 30)
-        val logic = descendants(host.component).filterIsInstance<PipelineVirtualRowsPanel>().single()
+        val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
         val viewport = logic.parent as javax.swing.JViewport
         viewport.extentSize = java.awt.Dimension(1000, 4000)
         val attach = !logic.isDisplayable
         if (attach) logic.addNotify()
         try {
-            fun labels() = descendants(logic).filterIsInstance<javax.swing.JLabel>()
+            fun labels() = textComponents(logic)
             PlatformTestUtil.waitWithEventsDispatching("可能目标按钮未加载", {
                 descendants(logic).filterIsInstance<javax.swing.JButton>().any { it.text.contains("个可能目标") }
             }, 30)
@@ -714,7 +950,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 labels().any { it.text == "→ Target" }
             }, 30)
             val label = labels().single { it.text == "→ Target" }
-            assertTrue(descendants(label.parent).filterIsInstance<javax.swing.JLabel>().any { it.text == "可能目标（运行时绑定）" })
+            assertTrue(textComponents(label.parent).any { it.text == "可能目标（运行时绑定）" })
             val click = java.awt.event.MouseEvent(label, java.awt.event.MouseEvent.MOUSE_CLICKED,
                 System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
             label.mouseListeners.forEach { it.mouseClicked(click) }
@@ -765,7 +1001,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
             workspace.reading(entry.stableId).rootNode.endsWith("#Start") && selector.selectedItem != null
         }, 30)
-        val logic = descendants(panel).filterIsInstance<PipelineVirtualRowsPanel>().single()
+        val logic = descendants(panel).filterIsInstance<PipelineRowsPanel>().single()
         val viewport = logic.parent as javax.swing.JViewport
         viewport.extentSize = java.awt.Dimension(900, 1000)
         val attach = !logic.isDisplayable
@@ -774,7 +1010,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             PlatformTestUtil.waitWithEventsDispatching("流程可见行未创建", { logic.componentCount > 5 }, 30)
             val originalRows = logic.components.toList()
             val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single()
-            val originalDetails = descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>()
+            val originalDetails = textComponents(tabs.getComponentAt(0))
             val source = descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single()
             tabs.selectedIndex = 1
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
@@ -785,9 +1021,9 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals("Child", (selector.selectedItem as PipelineNodeLocation).name)
             assertEquals(originalRows, logic.components.toList())
-            assertEquals(originalDetails, descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>())
+            assertEquals(originalDetails, textComponents(tabs.getComponentAt(0)))
             tabs.selectedIndex = 0
-            assertTrue(descendants(tabs.getComponentAt(0)).filterIsInstance<javax.swing.JLabel>().any {
+            assertTrue(textComponents(tabs.getComponentAt(0)).any {
                 it.text.removePrefix("<html>").removeSuffix("</html>") == "Child"
             })
             assertEquals(originalRows, logic.components.toList())
@@ -803,7 +1039,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             PlatformTestUtil.waitWithEventsDispatching("无关文件修改未索引", { selector.model !== previousModel }, 30)
             com.intellij.openapi.application.impl.NonBlockingReadActionImpl.waitForAsyncTaskCompletion()
             PlatformTestUtil.waitWithEventsDispatching("更新后流程尚未就绪", {
-                descendants(logic).filterIsInstance<javax.swing.JLabel>().any { it.text?.contains("Start") == true }
+                textComponents(logic).any { it.text.contains("Start") }
             }, 30)
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals(originalRows, logic.components.toList())
@@ -826,7 +1062,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         fun readyHost(): PipelineFileEditor {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             PlatformTestUtil.waitWithEventsDispatching("工作区未就绪", {
-                descendants(host.component).filterIsInstance<javax.swing.JLabel>().any { it.text?.startsWith("项目资源：") == true }
+                textComponents(host.component).any { it.text.startsWith("项目资源：") }
             }, 30)
             return host
         }
@@ -837,8 +1073,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         val restored = readyHost()
         assertNull(descendants(restored.component).filterIsInstance<JComboBox<*>>().single().selectedItem)
-        assertTrue(descendants(restored.component).filterIsInstance<javax.swing.JLabel>()
-            .any { it.text?.contains("上次任务或流程已不存在") == true })
+        assertTrue(textComponents(restored.component).any { it.text.contains("上次任务或流程已不存在") })
         manager.closeFile(workspace.file)
     }
 

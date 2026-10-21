@@ -40,6 +40,8 @@ internal fun pipelineTraceRounds(events: List<PipelineTraceEvent>): List<Pipelin
                     val selected = event.takeIf { current -> started?.candidates?.any { it.name == current.nodeName } == true }
                     finish(selected)
                 }
+                event.kind == PipelineTraceEventKind.ACTION && event.status == PipelineTraceStatus.STARTING &&
+                    started?.candidates?.any { it.name == event.nodeName } == true -> finish(event)
                 started != null -> {
                     observations += event
                     if (event.kind == PipelineTraceEventKind.NEXT_LIST && event.status == PipelineTraceStatus.FAILED) finish()
@@ -85,7 +87,8 @@ internal object PipelineTraceReplayBuilder {
         fun snapshot() = PipelineTraceCall(caller, target, taskId, depth, entered, resumed)
     }
 
-    fun build(events: List<PipelineTraceEvent>, rounds: List<PipelineTraceRound> = pipelineTraceRounds(events)): PipelineTraceReplay {
+    fun build(events: List<PipelineTraceEvent>, rounds: List<PipelineTraceRound> = pipelineTraceRounds(events),
+        taskCalls: List<PipelineTraceTaskCall> = emptyList()): PipelineTraceReplay {
         val selectedRounds = rounds.mapNotNull { round -> round.selected?.let { it.lineNumber to round } }.toMap()
         val steps = mutableListOf<PipelineTraceReplayStep>()
         val calls = mutableListOf<PendingCall>()
@@ -114,7 +117,9 @@ internal object PipelineTraceReplayBuilder {
                             steps += PipelineTraceReplayStep(event, frame.depth, "↩ 推断返回 ${frame.caller}：父候选组再次开始", frame.caller)
                         }
                     }
-                    event.kind == PipelineTraceEventKind.PIPELINE_NODE && event.status == PipelineTraceStatus.STARTING -> {
+                    (event.kind == PipelineTraceEventKind.PIPELINE_NODE ||
+                        event.kind == PipelineTraceEventKind.ACTION && event.lineNumber in selectedRounds) &&
+                        event.status == PipelineTraceStatus.STARTING -> {
                         val round = selectedRounds[event.lineNumber]
                         val candidate = round?.started?.candidates?.singleOrNull { it.name == event.nodeName }
                         val caller = round?.started?.nodeName
@@ -145,8 +150,12 @@ internal object PipelineTraceReplayBuilder {
         }
         val snapshots = calls.map { it.snapshot() }
         val warnings = buildList {
-            if (events.isNotEmpty() && events.groupBy { it.taskId }.values.any { task ->
-                task.none { it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING }
+            if (events.isNotEmpty() && events.groupBy { it.processId to it.taskId }.values.any { task ->
+                task.none { it.kind == PipelineTraceEventKind.TASK && it.status == PipelineTraceStatus.STARTING } &&
+                    task.none { event -> taskCalls.any { call ->
+                        call.childTaskId == event.taskId && call.processId == event.processId &&
+                            event.lineNumber in call.startLine..(call.endLine ?: Int.MAX_VALUE)
+                    } }
             }) add("部分日志缺少任务开始，轨迹可能不完整；没有 task_id 的事件单独处理。")
             val incomplete = snapshots.count { it.resumed == null }
             if (incomplete > 0) add("$incomplete 个 JumpBack 未观察到父候选组恢复，不能确认返回。")

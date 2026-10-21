@@ -50,18 +50,48 @@ internal class PipelineLogPlaybackSource(
     val events: List<PipelineTraceEvent>,
     private val rounds: List<PipelineTraceRound>,
     private val replay: PipelineTraceReplay,
+    taskCalls: List<PipelineTraceTaskCall> = emptyList(),
 ) : PipelinePlaybackSource {
     override val canSeekBackward = true
     override val canAutoplay = true
     private val allPositions = events.indices.toList()
-    private val nodePositions = events.indices.filter { index ->
-        events[index].kind == PipelineTraceEventKind.TASK ||
-            events[index].kind == PipelineTraceEventKind.PIPELINE_NODE && events[index].status == PipelineTraceStatus.STARTING
-    }.let { positions ->
-        (positions + listOfNotNull(events.indices.firstOrNull(), events.indices.lastOrNull())).distinct().sorted()
-    }
+    private val eventsByTask = events.groupBy { it.taskId }
+    private val childReturns = taskCalls.filter { call -> eventsByTask[call.childTaskId].orEmpty().any {
+        it.taskId == call.childTaskId && it.processId == call.processId && it.lineNumber >= call.startLine &&
+            (call.endLine == null || it.lineNumber <= call.endLine!!)
+    } }.mapNotNull { call ->
+        val end = call.endLine ?: return@mapNotNull null
+        events.indexOfFirst { event -> event.lineNumber > end && event.taskId == call.parentTaskId &&
+            event.processId == call.processId && event.nodeName == call.caller &&
+            event.kind in setOf(PipelineTraceEventKind.ACTION, PipelineTraceEventKind.PIPELINE_NODE, PipelineTraceEventKind.NEXT_LIST)
+        }.takeIf { it >= 0 }?.let { it to call }
+    }.toMap()
+    private val nodePositions = buildSet {
+        val pendingRounds = mutableMapOf<Pair<String?, Long?>, Int>()
+        events.forEachIndexed { index, event ->
+            val key = event.processId to event.taskId
+            if (index in childReturns) add(index)
+            when {
+                event.kind == PipelineTraceEventKind.TASK -> {
+                    pendingRounds.remove(key)?.let(::add)
+                    add(index)
+                }
+                event.kind == PipelineTraceEventKind.PIPELINE_NODE && event.status == PipelineTraceStatus.STARTING -> {
+                    pendingRounds.put(key, index)?.let(::add)
+                }
+                event.kind == PipelineTraceEventKind.ACTION && event.status == PipelineTraceStatus.STARTING -> {
+                    // PipelineNode.Starting 的 name 可能是候选组所属节点；动作通知才给出实际执行目标。
+                    pendingRounds.remove(key)
+                    add(index)
+                }
+            }
+        }
+        addAll(pendingRounds.values)
+        events.indices.firstOrNull()?.let(::add)
+        events.indices.lastOrNull()?.let(::add)
+    }.sorted()
     private val replayByLine = replay.steps.groupBy { it.event.lineNumber }
-    private val nodeEvents = events.filter { it.kind == PipelineTraceEventKind.PIPELINE_NODE }.groupBy { it.nodeName }
+    private val nodeEvents = events.filter { it.kind in setOf(PipelineTraceEventKind.PIPELINE_NODE, PipelineTraceEventKind.ACTION) }.groupBy { it.nodeName }
     private val eventsByNode = events.groupBy { it.nodeName }
     private val roundsByNode = rounds.groupBy { it.started.nodeName }
     private val callsByNode = replay.calls.flatMap { call -> listOf(call.caller to call, call.target to call) }
@@ -72,7 +102,8 @@ internal class PipelineLogPlaybackSource(
 
     override fun frame(eventIndex: Int): PipelinePlaybackFrame? = events.getOrNull(eventIndex)?.let { event ->
         PipelinePlaybackFrame(
-            replayByLine[event.lineNumber]?.map { it.text }?.distinct()?.joinToString(" · ")
+            childReturns[eventIndex]?.let { "子流程 ${it.entryName} 结束，继续 ${it.caller}" }
+                ?: replayByLine[event.lineNumber]?.map { it.text }?.distinct()?.joinToString(" · ")
                 ?: "${event.kind.label} ${event.nodeName ?: event.entryName.orEmpty()}：${event.status.label}",
             event.timestamp, event.nodeName, event.lineNumber,
         )
