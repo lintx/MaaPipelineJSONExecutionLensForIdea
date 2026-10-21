@@ -827,6 +827,10 @@ internal class PipelineFlowPanel(
             })
             detailsPanel.add(Box.createVerticalStrut(JBUI.scale(4)))
             val staticPath = staticPathTo(location)
+            val effectiveLocation = effectiveNode(location)
+            effectiveLocation.description?.let {
+                detailsPanel.add(PipelineWrappingLabel(it).apply { toolTipText = PipelineVisualModel.fieldHelp("desc") })
+            }
             if (staticPath == null && selectedEntry != null) {
                 detailsPanel.add(PipelineWrappingLabel("路径分析：从当前任务入口未解析到此节点").apply {
                     foreground = UIUtil.getContextHelpForeground()
@@ -835,7 +839,6 @@ internal class PipelineFlowPanel(
                 addPathAnalysis(staticPath)
             }
             addRelationshipOverview(location)
-            val effectiveLocation = effectiveNode(location)
             val sourceFile = location.sourceFile ?: file
             addControlFlowExplanation(effectiveLocation, sourceFile, location)
             addAnchorDefinitions(location, sourceFile)
@@ -1000,8 +1003,19 @@ internal class PipelineFlowPanel(
         }
     }
 
-    private fun appendLogicNote(rows: MutableList<PipelineRow>, key: String, depth: Int, text: String) {
-        appendLogicRow(rows, key, depth, revision = text) { addLogicNote(text, it) }
+    private fun appendLogicNote(
+        rows: MutableList<PipelineRow>, key: String, depth: Int, text: String,
+        foreground: java.awt.Color = UIUtil.getContextHelpForeground(),
+        bold: Boolean = false, tooltip: String? = null,
+    ) {
+        appendLogicRow(rows, key, depth, revision = listOf(text, foreground, bold, tooltip)) { panel ->
+            panel.add(PipelineWrappingLabel(text).apply {
+                this.foreground = foreground
+                if (bold) font = font.deriveFont(Font.BOLD)
+                toolTipText = tooltip
+                border = JBUI.Borders.empty(2, 8)
+            })
+        }
     }
 
     private fun entryRootNode(entry: PipelineEntryLocation): PipelineNodeLocation? {
@@ -1099,6 +1113,7 @@ internal class PipelineFlowPanel(
         val anchorChanges = currentReadingGraph().visibleAnchorChanges(location)
         val hasBody = effective.action != null || effective.description != null || anchorChanges.isNotEmpty() ||
             policySummary != null || overrides.isNotEmpty() || effective.next.isNotEmpty() || effective.onError.isNotEmpty() ||
+        val subTasks = effective.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }
             effective.embeddedReferences.any { it.kind == PipelineReferenceKind.SUBTASK }
         val previousRow = activeLogicRows.put(nodeKey, "$instanceKey:header")
         scheduleLogic {
@@ -1127,7 +1142,7 @@ internal class PipelineFlowPanel(
             header.add(createLogicHeading(
                 headerText + overrideHint + if (hasBody && !isCollapsed) " {" else "", location,
                 incoming?.reference, incoming?.fieldName ?: "next", incoming?.sourceLocation?.name,
-                incoming?.anchorHint, bold = true,
+                incoming?.anchorHint, bold = true, subtaskSource = incoming?.sourceLocation,
             ), BorderLayout.CENTER)
             header.add(createFoldMarker(!isCollapsed, location.name) { isExpanded ->
                 if (isExpanded) {
@@ -1145,6 +1160,10 @@ internal class PipelineFlowPanel(
         if (isCollapsed) return
         if (overrides.isNotEmpty()) {
             val active = overrides.filter { it.active }
+        effective.description?.let {
+            appendLogicNote(rows, "$instanceKey:description", depth + 1, it,
+                foreground = UIUtil.getLabelForeground(), tooltip = PipelineVisualModel.fieldHelp("desc"))
+        }
             val fields = active.flatMap { it.fields.entries }.associate { it.toPair() }
             val inactiveCount = overrides.size - active.size
             val summary = listOfNotNull(
@@ -1166,13 +1185,22 @@ internal class PipelineFlowPanel(
                 })
             }
         }
-        PipelineConditionSummary.action(effective)?.let { action ->
-            appendLogicNote(rows, "$instanceKey:action", depth + 1, action)
+        if (subTasks.isEmpty()) PipelineConditionSummary.action(effective)?.let { action ->
+            val operation = PipelineVisualModel.operation(effective, isAction = true)
+            val details = listOf(PipelineConditionDetail(PipelineVisualModel.actionHelp(operation))) +
+                PipelinePropertyCatalog.operationProperties(operation, defaults)
+                    .filter { it.name in operation.parameters }.flatMap { property -> listOf(
+                        PipelineConditionDetail("${property.name} = ${property.value?.let(PipelineVisualModel::display)}", 1),
+                        PipelineConditionDetail(property.explanation, 2),
+                    ) }
+            appendLogicNote(rows, "$instanceKey:action", depth + 1, action,
+                foreground = pipelineActionForeground(), bold = true,
+                tooltip = PipelineFlowTooltip.render(details, getFontMetrics(UIUtil.getLabelFont())))
         }
         anchorChanges.forEach { definition ->
             val text = PipelineConditionSummary.anchorChange(definition, location.name)
             appendLogicRow(rows, "$instanceKey:anchor:${definition.name}", depth + 1, revision = text) { panel ->
-                panel.add(JBLabel(text).apply {
+                panel.add(PipelineWrappingLabel(text).apply {
                     foreground = UIUtil.getLabelForeground()
                     border = JBUI.Borders.empty(0, 4)
                     toolTipText = PipelineFlowTooltip.render(listOf(
@@ -1183,9 +1211,12 @@ internal class PipelineFlowPanel(
                 })
             }
         }
-        effective.description?.let { appendLogicNote(rows, "$instanceKey:description", depth + 1, "说明：$it") }
         if (policySummary != null) {
-            appendLogicNote(rows, "$instanceKey:policy", depth + 1, policySummary)
+            val details = PipelinePropertyCatalog.properties(effective, defaults)
+                .filter { it.name in setOf("timeout", "max_hit") && !it.inherited && it.value != it.defaultValue }
+                .map { PipelineConditionDetail("${it.name}：${it.explanation}") }
+            appendLogicNote(rows, "$instanceKey:policy", depth + 1, policySummary,
+                tooltip = PipelineFlowTooltip.render(details, getFontMetrics(UIUtil.getLabelFont())))
         }
         if (hasBody) scheduleLogic {
             appendLogicRow(rows, "$instanceKey:close", depth, revision = "}") { panel ->
@@ -1200,16 +1231,7 @@ internal class PipelineFlowPanel(
             revealIndex = revealIndex) }
         scheduleLogic { appendVirtualLogicBranch(location, effective.onError, "on_error", rows, depth + 1, ancestors, expandedNodes, instanceKey, bindings,
             revealIndex = revealIndex) }
-        val subTasks = effective.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }
         if (subTasks.isNotEmpty()) scheduleLogic {
-            val action = PipelineVisualModel.operation(effective, isAction = true)
-            val parameters = action.parameters["custom_action_param"]?.takeIf { it.isJsonObject }?.asJsonObject
-            val random = parameters?.get("random_choice")?.toString()?.toIntOrNull() ?: 0
-            appendLogicNote(rows, "$instanceKey:subtask:begin", depth + 1,
-                if (random > 0) "SubTask · 随机选取至多 $random 项，运行顺序由本次抽取决定" else "SubTask · 依次调用子任务")
-            scheduleLogic {
-                appendLogicNote(rows, "$instanceKey:subtask:return", depth + 1, "return · 子任务调用结束，回到 ${location.name} 的动作")
-            }
             // RunTask 是独立子流程，不能因父流程见过同名节点而省略其主体；保留祖先检查防止递归无限展开。
             appendVirtualLogicBranch(location, subTasks, "subtask", rows, depth + 1, ancestors, linkedSetOf(), instanceKey, bindings,
                 revealIndex = revealIndex)
@@ -1478,7 +1500,7 @@ internal class PipelineFlowPanel(
         }
         card.add(
             createLogicHeading(heading + boundaryLabel, targetLocation, reference, fieldName, traceNodeName,
-                anchorResolution?.hint()),
+                anchorResolution?.hint(), subtaskSource = sourceLocation),
             BorderLayout.CENTER,
         )
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
@@ -1496,7 +1518,7 @@ internal class PipelineFlowPanel(
         clearedAnchor: Boolean = false,
         anchorMayBeUnset: Boolean = false,
     ): String {
-        if (fieldName == "subtask") return "${index + 1}. call → ${reference.targetName}"
+        if (fieldName == "subtask") return "${index + 1}. subtask → ${reference.targetName}"
         if (fieldName == "anchor_candidate") return "可能目标（运行时绑定） → ${reference.targetName}"
         val jumpBack = if (reference.isJumpBack) {
             if (fieldName == "on_error") "[JumpBack] " else "[↶ 执行后重试] "
@@ -1527,13 +1549,15 @@ internal class PipelineFlowPanel(
         bold: Boolean = false,
     ): JComponent {
         val recognition = location?.let { effectiveNode(it).recognition }
+        subtaskSource: PipelineNodeLocation? = null,
         val conditionDetails = if (location != null) recognition?.readingDetails?.takeIf { it.isNotEmpty() }
             ?: listOf(PipelineConditionDetail(PipelineConditionSummary.flowCondition(effectiveNode(location))))
             else if (reference?.isAnchor == true) emptyList()
             else reference?.target?.recognitionDetails?.takeIf { it.isNotEmpty() }
                 ?: listOf(PipelineConditionDetail(reference?.target?.recognitionSummary ?: "目标尚未解析"))
         val tooltip = PipelineFlowTooltip.render(
-            conditionDetails, getFontMetrics(UIUtil.getLabelFont()),
+            if (fieldName == "subtask" && subtaskSource != null) subtaskDetails(effectiveNode(subtaskSource)) else conditionDetails,
+            getFontMetrics(UIUtil.getLabelFont()),
             jumpBack = reference?.isJumpBack == true, parentName = parentName, fieldName = fieldName,
             anchorHint = anchorHint, sourcePath = (location?.sourceFile ?: reference?.target?.file)?.let(::displayPath),
             operationHint = if (location != null) "点击查看详情 · Ctrl+点击跳转源码" else "目标暂时无法在流程索引中展开",
@@ -1550,6 +1574,21 @@ internal class PipelineFlowPanel(
 
     private data class LogicIncomingBranch(
         val index: Int,
+    private fun subtaskDetails(source: PipelineNodeLocation): List<PipelineConditionDetail> {
+        val operation = PipelineVisualModel.operation(source, isAction = true)
+        val parameters = operation.parameters["custom_action_param"]?.takeIf { it.isJsonObject }?.asJsonObject
+        val random = parameters?.get("random_choice")?.toString()?.toIntOrNull() ?: 0
+        return buildList {
+            add(PipelineConditionDetail("subtask · ${source.name} 的 SubTask 动作"))
+            add(PipelineConditionDetail(if (random > 0) "随机选取至多 $random 项，实际选择和顺序由本轮抽取决定。"
+                else "按列表顺序调用独立子流程。", 1))
+            add(PipelineConditionDetail("每个子流程结束后继续父动作，父动作结束后再处理父节点的 next。", 1))
+            listOf("continue", "strict").forEach { name ->
+                parameters?.get(name)?.let { add(PipelineConditionDetail("$name = $it", 1)) }
+            }
+        }
+    }
+
         val reference: PipelineReference,
         val sourceLocation: PipelineNodeLocation,
         val editableField: String?,
@@ -1558,15 +1597,6 @@ internal class PipelineFlowPanel(
         val anchorHint: String? = null,
         val anchorMayBeUnset: Boolean = false,
     )
-
-    private fun addLogicNote(text: String, container: JPanel = logicPanel) {
-        container.add(PipelineWrappingLabel(text).apply {
-            foreground = UIUtil.getContextHelpForeground()
-            alignmentX = LEFT_ALIGNMENT
-            border = JBUI.Borders.empty(2, 8)
-            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height + JBUI.scale(4))
-        })
-    }
 
     private fun hasTaskOverride(location: PipelineNodeLocation, fieldName: String): Boolean {
         if (!overrideToggle.isSelected) return false
@@ -1620,13 +1650,13 @@ internal class PipelineFlowPanel(
         addQuickReadField("条件", if (location.enabled) recognition.title + if (location.recognition == null) "（默认）" else "" else "已禁用（enabled=false）",
             location.recognition, sourceFile, emphasized = true, operationEdit = { editOperation(location, sourceFile, false) })
         detailsPanel.add(visuals.operation(recognition))
-        addQuickReadField("动作", action.title + if (location.action == null) "（默认）" else "", location.action, sourceFile, operationEdit = { editOperation(location, sourceFile, true) })
+        addQuickReadField("动作", action.title + if (location.action == null) "（默认）" else "", location.action, sourceFile,
+            emphasized = true, operationEdit = { editOperation(location, sourceFile, true) }, action = action)
         detailsPanel.add(visuals.operation(action))
         visuals.referenceImage(original, recognition, action)?.let { detailsPanel.add(it) }
         PipelineConditionSummary.anchor(location)?.let { anchor ->
             addQuickReadField("锚点", anchor, location.anchor, sourceFile)
         }
-        location.description?.let { addDetailText("说明：$it") }
         detailsPanel.add(createSectionLabel("节点属性"))
         val defaults = PipelinePropertyCatalog.resourceDefaults(location, currentModel)
         val defaultContent = object : JPanel() {
@@ -1658,6 +1688,7 @@ internal class PipelineFlowPanel(
         operationEdit: (() -> Unit)? = null,
     ) {
         val fieldSourceFile = field?.sourceFile ?: sourceFile
+        action: PipelineOperation? = null,
         val row = object : JPanel(PipelineBaselineLayout()) {
             override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
         }.apply {
@@ -1665,7 +1696,8 @@ internal class PipelineFlowPanel(
             alignmentX = LEFT_ALIGNMENT
         }
         row.add(JBLabel("$title：").apply {
-            foreground = UIUtil.getContextHelpForeground()
+            foreground = if (emphasized) UIUtil.getLabelForeground() else UIUtil.getContextHelpForeground()
+            if (emphasized) font = font.deriveFont(Font.BOLD)
             verticalAlignment = javax.swing.SwingConstants.CENTER
             border = JBUI.Borders.empty(2, 0)
             preferredSize = Dimension(JBUI.scale(42), preferredSize.height)
@@ -1679,6 +1711,10 @@ internal class PipelineFlowPanel(
         if (emphasized) value.font = value.font.deriveFont(Font.BOLD)
         row.add(value, BorderLayout.CENTER)
         if (field != null || operationEdit != null) {
+        if (action != null) {
+            value.foreground = pipelineActionForeground()
+            value.toolTipText = PipelineVisualModel.actionHelp(action)
+        }
             row.add(JButton("编辑").apply {
                 toolTipText = "编辑当前字段"
                 isEnabled = fieldSourceFile.isWritable && fieldSourceFile !in currentModel.generatedFiles && field?.isDerived != true

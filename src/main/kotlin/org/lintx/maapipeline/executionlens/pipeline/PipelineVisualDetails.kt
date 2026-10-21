@@ -4,6 +4,8 @@ import com.google.gson.GsonBuilder
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.editor.DefaultLanguageHighlighterColors
+import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.HideableDecorator
@@ -28,6 +30,11 @@ import javax.swing.JViewport
 import javax.swing.SwingUtilities
 import javax.swing.text.DefaultCaret
 import javax.swing.text.View
+
+internal fun pipelineActionForeground(): java.awt.Color = JBColor.lazy {
+    EditorColorsManager.getInstance().globalScheme.getAttributes(DefaultLanguageHighlighterColors.KEYWORD)?.foregroundColor
+        ?: UIUtil.getLabelForeground()
+}
 
 internal fun pipelineDefaultProperties(content: JPanel, count: Int): JComponent =
     pipelineCollapsedSection("默认参数（$count）", content)
@@ -133,7 +140,9 @@ internal class PipelineVisualDetails(
         val title = operation.title + operation.reference?.takeIf { operation.type != "Reference" }?.let { " · $it" }.orEmpty()
         if (depth > 0) container.add(PipelineWrappingLabel(title).apply {
             font = font.deriveFont(java.awt.Font.BOLD)
-            toolTipText = PipelineVisualModel.fieldHelp(if (operation.isAction) "action" else "recognition")
+            if (operation.isAction) foreground = pipelineActionForeground()
+            toolTipText = if (operation.isAction) PipelineVisualModel.actionHelp(operation)
+                else PipelineVisualModel.fieldHelp("recognition")
         })
         val mode = PipelineVisualModel.mode(operation)
         val regionKeys = if (operation.isAction) when (operation.type) {

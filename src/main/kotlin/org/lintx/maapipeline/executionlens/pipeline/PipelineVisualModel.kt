@@ -279,7 +279,32 @@ internal object PipelineVisualModel {
         else -> null
     }
 
+    fun actionHelp(operation: PipelineOperation): String = "action · ${operation.type}：" + when (operation.type) {
+        "DoNothing" -> "不执行操作，仍继续处理 Anchor 和 next。"
+        "Click" -> "点击 target 指定的目标；默认使用本节点的识别结果。"
+        "LongPress" -> "按住 target 指定的目标，持续 duration 毫秒后松开。"
+        "Swipe" -> "从 begin 滑动到 end；duration 控制滑动时长，end_hold 控制终点停留。"
+        "MultiSwipe" -> "执行 swipes 中配置的多段滑动。"
+        "TouchDown" -> "在 target 处按下指定触点；后续 TouchMove / TouchUp 可继续控制该触点。"
+        "TouchMove" -> "将指定触点移动到 target。"
+        "TouchUp" -> "松开 contact 指定的触点。"
+        "Scroll" -> "在 target 指定的位置滚动，dx / dy 控制水平和垂直位移。"
+        "ClickKey" -> "按下并松开 key 指定的按键。"
+        "LongPressKey" -> "按住 key 指定的按键，持续 duration 毫秒后松开。"
+        "KeyDown" -> "按下 key 指定的按键；配合 KeyUp 或 auto_up 控制松开。"
+        "KeyUp" -> "松开 key 指定的按键。"
+        "InputText" -> "输入 input_text 中的文本。"
+        "StartApp" -> "启动 package 指定的应用。"
+        "StopApp" -> "停止 package 指定的应用。"
+        "Command" -> "运行 exec 指定的程序并传入 args；detach 控制是否等待程序结束。插件只展示配置。"
+        "Shell" -> "执行 cmd 指定的 Shell 命令；shell_timeout 控制等待上限。插件只展示配置。"
+        "Screencap" -> "截图并按 filename、format 和 quality 保存。"
+        "Custom" -> "调用注册的自定义动作 ${operation.text("custom_action") ?: "（未指定）"}；custom_action_param 原样传入，具体行为由实现决定。"
+        else -> "识别成功后交给控制器执行；具体行为由该动作实现决定。"
+    }
+
     fun fieldHelp(name: String): String = when (name) {
+        "desc", "说明" -> "desc：节点用途与业务意图的说明，不影响执行。"
         "recognition", "条件" -> "recognition：进入节点前的识别条件；满足后执行动作。缺省为 DirectHit。"
         "action", "动作" -> "action：识别成功后执行的动作；缺省为 DoNothing。"
         "anchor", "锚点" -> "anchor：动作结束后绑定、覆盖或清除命名节点引用；空字符串清除绑定。"

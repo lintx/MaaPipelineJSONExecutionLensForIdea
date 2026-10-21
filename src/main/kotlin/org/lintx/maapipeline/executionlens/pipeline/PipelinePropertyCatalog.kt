@@ -79,7 +79,7 @@ internal object PipelinePropertyCatalog {
     fun help(name: String): String = common[name]?.help ?: PipelineVisualModel.fieldHelp(name)
 
     fun policySummary(node: PipelineNodeLocation, resource: JsonObject): String? = properties(node, resource)
-        .filter { it.name in setOf("timeout", "rate_limit", "max_hit") && !it.inherited && it.value != it.defaultValue }
+        .filter { it.name in setOf("timeout", "max_hit") && !it.inherited && it.value != it.defaultValue }
         .joinToString("，") { "${it.name}=${it.value}" }.takeIf { it.isNotEmpty() }
 
     fun policyValue(node: PipelineNodeLocation, resource: JsonObject, name: String): String =

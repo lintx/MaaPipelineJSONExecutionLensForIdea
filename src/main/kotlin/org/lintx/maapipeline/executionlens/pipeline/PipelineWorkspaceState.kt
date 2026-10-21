@@ -8,7 +8,7 @@ import com.intellij.openapi.components.StoragePathMacros
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.testFramework.LightVirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
 
 class PipelineReadingState {
     var rootNode: String = ""
@@ -36,15 +36,14 @@ class PipelineWorkspaceStorage {
     var reopen: Boolean = false
 }
 
-internal class PipelineWorkspaceFile : LightVirtualFile("Pipeline 流程")
-
 @Service(Service.Level.PROJECT)
 @State(name = "MaaPipelineWorkspace", storages = [Storage(StoragePathMacros.WORKSPACE_FILE)])
 internal class PipelineWorkspaceState(private val project: Project) : PersistentStateComponent<PipelineWorkspaceStorage> {
     private var storage = PipelineWorkspaceStorage()
     private val emptyReading = PipelineReadingState()
     val data: PipelineWorkspaceStorage get() = storage
-    val file: VirtualFile = PipelineWorkspaceFile()
+    val file: VirtualFile = VirtualFileManager.getInstance().getFileSystem(PipelineWorkspaceFileSystem.PROTOCOL)
+        .findFileByPath("/${project.locationHash}/Pipeline 流程")!!
     var requestedFile: VirtualFile? = null
         private set
     var requestedOffset: Int = 0

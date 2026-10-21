@@ -13,6 +13,7 @@
     <depends>com.intellij.platform.images</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <virtualFileSystem key="maa-pipeline" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineWorkspaceFileSystem" physical="false"/>
         <fileEditorProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
         <postStartupActivity implementation="org.lintx.maapipeline.executionlens.MaaPipelineStartupActivity"/>
         <fileBasedIndex implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineNavigationIndex"/>

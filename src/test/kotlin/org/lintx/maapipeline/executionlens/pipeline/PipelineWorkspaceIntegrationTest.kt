@@ -19,6 +19,18 @@ import javax.swing.JLabel
 import javax.swing.text.JTextComponent
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    fun testWorkspaceUrlCanBeRestoredWithoutAnExistingFileInstance() {
+        val file = PipelineWorkspaceState.getInstance(project).file
+        assertTrue(file.url.startsWith("maa-pipeline:///"))
+        assertSame(file, com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(file.url))
+        val restored = PipelineWorkspaceFileSystem().findFileByPath(file.path)
+        assertNotNull(restored)
+        assertNotSame(file, restored)
+        assertEquals(file.url, restored!!.url)
+        assertTrue(PipelineFileEditorProvider().accept(project, restored))
+        assertNull(PipelineWorkspaceFileSystem().findFileByPath("/missing"))
+    }
+
     private fun textComponents(root: Component): List<Component> = descendants(root)
         .filter { it is JLabel || it is JTextComponent }
 
@@ -404,7 +416,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
              "Shared":{"next":["Done"]},"Done":{},
              "Caller":{"action":{"type":"Custom","custom_action":"SubTask","custom_action_param":{"sub":["Child"]}}},
              "OtherCall":{"action":{"type":"Custom","param":{"custom_action":"SubTask","custom_action_param":{"sub":["Child"]}}}},
-             "Child":{"desc":"CHILD_BODY","next":["Shared"]}}
+             "Child":{"desc":"CHILD_BODY","action":"Click","target":[1,2,3,4],"rate_limit":123,"timeout":345,"next":["Shared"]}}
         """.trimIndent())
         replaceFixtureFile("assets/tasks/Tasks.json", """
             {"task":[{"name":"Transfer","entry":"Start","option":["Enable"]}],
@@ -430,14 +442,44 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
             val rowsField = PipelineRowsPanel::class.java.getDeclaredField("rows").apply { isAccessible = true }
-            fun labels(): List<Component> {
+            fun rows(): List<PipelineRow> {
                 @Suppress("UNCHECKED_CAST")
-                val rows = rowsField.get(logic) as List<PipelineRow>
-                return rows.flatMap { textComponents(it.createComponent()) }
+                return rowsField.get(logic) as List<PipelineRow>
             }
+            fun labels(): List<Component> = rows().flatMap { textComponents(it.createComponent()) }
             PlatformTestUtil.waitWithEventsDispatching("子任务流程未展开", { labels().count { it.text.contains("CHILD_BODY") } == 2 }, 30)
             assertFalse(labels().any { it.text.contains("DISABLED_BODY") })
             assertTrue(labels().any { it.text.contains("可由任务选项覆盖") })
+            assertFalse(labels().any { it.text.contains("SubTask ·") || it.text.contains("call →") || it.text.contains("rate_limit") })
+            val subtaskRow = rows().first { row -> textComponents(row.createComponent()).any { it.text.contains("subtask → Child") } }
+            val subtaskIndex = rows().indexOf(subtaskRow)
+            assertTrue(textComponents(rows()[subtaskIndex + 1].createComponent()).any { it.text == "CHILD_BODY" })
+            val action = labels().filterIsInstance<PipelineWrappingLabel>().first { it.text.startsWith("执行动作 Click") }
+            assertTrue(action.font.isBold)
+            assertTrue(action.toolTipText.contains("target"))
+            assertTrue(action.toolTipText.contains("识别结果"))
+            val policy = labels().filterIsInstance<PipelineWrappingLabel>().first { it.text == "timeout=345" }
+            assertTrue(policy.toolTipText.contains("on_error"))
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            PipelineFlowPanel::class.java.getDeclaredMethod("inspectNode", PipelineNodeLocation::class.java,
+                Boolean::class.javaPrimitiveType).apply { isAccessible = true }.invoke(panel, model.projectNodes.single { it.name == "Child" }, false)
+            val details = PipelineFlowPanel::class.java.getDeclaredField("detailsPanel").apply { isAccessible = true }
+                .get(panel) as javax.swing.JPanel
+            val detailLabels = textComponents(details)
+            assertEquals("Child", detailLabels[0].text)
+            assertEquals("CHILD_BODY", detailLabels[1].text)
+            assertTrue(detailLabels.any { it.text.contains("rate_limit：123") })
+            val header = subtaskRow.createComponent()
+            val marker = descendants(header).filterIsInstance<javax.swing.JComponent>().single { it.toolTipText == "收起Child" }
+            fun toggle() {
+                val event = java.awt.event.MouseEvent(marker, java.awt.event.MouseEvent.MOUSE_CLICKED, 0, 0,
+                    2, 2, 1, false, java.awt.event.MouseEvent.BUTTON1)
+                marker.mouseListeners.forEach { it.mouseClicked(event) }
+            }
+            toggle()
+            assertEquals(1, labels().count { it.text == "CHILD_BODY" })
+            toggle()
+            assertEquals(2, labels().count { it.text == "CHILD_BODY" })
         } finally { manager.closeFile(workspace.file) }
     }
 
