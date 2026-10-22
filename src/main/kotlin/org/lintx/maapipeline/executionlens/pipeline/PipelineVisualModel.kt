@@ -16,6 +16,7 @@ internal data class PipelineOperation(
     val ownerPath: List<String> = emptyList(),
     val parameterPaths: Map<String, List<String>> = emptyMap(),
     val roiHints: Map<String, PipelineRoiHint> = emptyMap(),
+    val simulatedRegions: Map<String, List<Int>> = emptyMap(),
 ) {
     val title: String get() {
         val base = when (type) {
@@ -39,22 +40,53 @@ internal data class PipelineRegionInfo(
     val resultSteps: List<String> = emptyList(),
     val resultOperation: PipelineOperation? = null,
     val fromComment: Boolean = false,
+    val originalCoordinates: List<Int>? = null,
+    val actionTarget: Boolean = false,
+    val coordinateOffset: List<Int>? = null,
 ) {
-    fun rectangle(width: Int, height: Int): Rectangle? = coordinates?.let { rectangle(it, width, height) }
+    fun rectangle(width: Int, height: Int): Rectangle? = coordinates?.let {
+        if (actionTarget) actionRectangle(originalCoordinates ?: it, coordinateOffset, width, height)
+        else rectangle(it, width, height)
+    }
 
     companion object {
-        fun rectangle(values: List<Int>, width: Int, height: Int): Rectangle? {
+        private fun normalize(values: List<Int>, width: Int, height: Int): List<Long>? {
             if (values.size !in setOf(2, 4)) return null
-            var left = values[0].let { if (it < 0) width + it else it }
-            var top = values[1].let { if (it < 0) height + it else it }
-            var spanX = values.getOrElse(2) { 1 }
-            var spanY = values.getOrElse(3) { 1 }
-            if (spanX == 0) spanX = width - left
-            if (spanY == 0) spanY = height - top
+            var left = values[0].toLong().let { if (it < 0) width + it else it }
+            var top = values[1].toLong().let { if (it < 0) height + it else it }
+            var spanX = values.getOrElse(2) { 1 }.toLong()
+            var spanY = values.getOrElse(3) { 1 }.toLong()
             if (spanX < 0) { left += spanX; spanX = -spanX }
             if (spanY < 0) { top += spanY; spanY = -spanY }
-            return Rectangle(left, top, spanX, spanY).intersection(Rectangle(0, 0, width, height))
-                .takeIf { it.width > 0 && it.height > 0 }
+            if (spanX == 0L) spanX = width - left
+            if (spanY == 0L) spanY = height - top
+            return listOf(left, top, spanX, spanY)
+        }
+
+        fun rectangle(values: List<Int>, width: Int, height: Int): Rectangle? {
+            val normalized = normalize(values, width, height) ?: return null
+            val left = normalized[0].coerceAtLeast(0)
+            val top = normalized[1].coerceAtLeast(0)
+            val right = (normalized[0] + normalized[2]).coerceAtMost(width.toLong())
+            val bottom = (normalized[1] + normalized[3]).coerceAtMost(height.toLong())
+            return if (right > left && bottom > top) Rectangle(left.toInt(), top.toInt(), (right - left).toInt(), (bottom - top).toInt()) else null
+        }
+
+        private fun actionRectangle(values: List<Int>, offset: List<Int>?, width: Int, height: Int): Rectangle? {
+            val base = normalize(values, width, height) ?: return null
+            val shifted = base.mapIndexed { index, value -> value + (offset?.getOrNull(index) ?: 0) }
+            var left = shifted[0]
+            var top = shifted[1]
+            var spanX = shifted[2]
+            var spanY = shifted[3]
+            // 对齐 ActionHelper::get_target_rect：偏移后只反转负尺寸，负位置不再按屏幕边缘解释。
+            if (spanX < 0) { left += spanX; spanX = -spanX }
+            if (spanY < 0) { top += spanY; spanY = -spanY }
+            left = left.coerceIn(0, width.toLong())
+            top = top.coerceIn(0, height.toLong())
+            spanX = spanX.coerceIn(0, width - left)
+            spanY = spanY.coerceIn(0, height - top)
+            return if (spanX > 0 && spanY > 0) Rectangle(left.toInt(), top.toInt(), spanX.toInt(), spanY.toInt()) else null
         }
     }
 }
@@ -102,7 +134,7 @@ internal object PipelineVisualModel {
         "contact", "pressure", "key", "input_text", "package", "exec", "args", "detach", "cmd", "shell_timeout", "filename",
         "custom_action", "custom_action_param", "dx", "dy", "only_hover", "end_hold", "auto_up", "format", "quality")
 
-    fun parse(raw: String): JsonObject? = try { JsonParser.parseString(raw).takeIf { it.isJsonObject }?.asJsonObject }
+    fun parse(raw: String): JsonObject? = try { PipelineJsonc.parse(raw).takeIf { it.isJsonObject }?.asJsonObject }
         catch (_: com.google.gson.JsonParseException) { null }
 
     fun operationKeys(isAction: Boolean): Set<String> =
@@ -111,7 +143,7 @@ internal object PipelineVisualModel {
     fun operation(node: PipelineNodeLocation, isAction: Boolean = false,
         resolve: (String) -> PipelineNodeLocation? = { null }): PipelineOperation =
         operation(parse(node.rawJson) ?: JsonObject(), node, isAction, resolve, setOf(node.name), 0,
-            hints = PipelinePreviewHints.read(node.previewSource ?: node.rawJson))
+            hints = PipelinePreviewHints.selected(node))
 
     private fun operation(owner: JsonObject, source: PipelineNodeLocation?, isAction: Boolean,
         resolve: (String) -> PipelineNodeLocation?, visited: Set<String>, depth: Int,
@@ -142,7 +174,7 @@ internal object PipelineVisualModel {
                     val target = if (name !in visited) resolve(name) else null
                     if (target == null) PipelineOperation("Reference", emptyMap(), reference = name, source = source)
                     else operation(parse(target.rawJson) ?: JsonObject(), target, false, resolve, visited + name, depth + 1,
-                        hints = PipelinePreviewHints.read(target.previewSource ?: target.rawJson)).copy(reference = name)
+                        hints = PipelinePreviewHints.selected(target)).copy(reference = name)
                 }
             }.orEmpty()
         } else emptyList()
@@ -152,9 +184,9 @@ internal object PipelineVisualModel {
             ownerPath = ownerPath, parameterPaths = paths, roiHints = roiHints)
     }
 
-    fun preview(raw: String): String? {
-        return PipelinePreviewHints.read(raw)[emptyList()]?.preview?.takeIf { it.isNotBlank() }
-    }
+    fun preview(raw: String, environmentId: String = "", controllerType: String = environmentId): String? =
+        PipelinePreviewHints.preview(PipelineNodeLocation("", com.intellij.openapi.util.TextRange.EMPTY_RANGE,
+            com.intellij.openapi.util.TextRange.EMPTY_RANGE, rawJson = raw, environmentId = environmentId, controllerType = controllerType))?.path
 
     fun colors(operation: PipelineOperation): PipelineColorSpec? {
         if (operation.type != "ColorMatch") return null
@@ -171,26 +203,36 @@ internal object PipelineVisualModel {
 
     fun region(operation: PipelineOperation, key: String = if (operation.isAction) "target" else "roi",
         resolve: (String) -> PipelineNodeLocation? = { null }): PipelineRegionInfo {
+        operation.simulatedRegions[key]?.let {
+            val offset = integers(operation.parameters["${key}_offset"])
+            return PipelineRegionInfo("模拟 $it", "依据当前模拟链路与 @roi 注释推导，已应用偏移；不是实际识别结果。", it,
+                originalCoordinates = if (it.size == 4 && offset?.size == 4) it.zip(offset) { final, delta -> final - delta } else null,
+                actionTarget = operation.isAction, coordinateOffset = offset)
+        }
         val value = operation.parameters[key]
         val offset = integers(operation.parameters["${key}_offset"])
         val actual = integers(value)
-        val example = operation.roiHints[key]?.takeIf { actual == null }
-        val fixed = actual ?: example?.coordinates
-        fun shifted(coordinates: List<Int>): List<Int> = if (offset?.size == 4 && coordinates.size == 4)
-            coordinates.zip(offset) { original, delta -> original + delta } else coordinates
+        val example = operation.roiHints[key]
+        val fixed = example?.coordinates ?: actual
+        fun shifted(coordinates: List<Int>): List<Int> = if (offset?.size == 4) {
+            val rectangle = if (coordinates.size == 2) coordinates + listOf(1, 1) else coordinates
+            rectangle.zip(offset) { original, delta -> original + delta }
+        } else coordinates
         if (fixed != null && fixed.size in setOf(2, 4)) {
             val coordinates = shifted(fixed)
             return PipelineRegionInfo((if (example != null) "注释示意 " else "") + coordinates.toString(), "$key=$fixed" +
                 (offset?.let { "；${key}_offset=$it，四个分量相加" } ?: "") +
                 "。坐标在运行时截图坐标系中解释；负坐标从右/下边缘计算。" +
-                if (example != null) " 该框来自 @roi 注释，仅为预览示意，不改变运行时参数。" else "", coordinates, fromComment = example != null)
+                if (example != null) " 该框来自 @roi 注释，仅为预览示意，不改变运行时参数。" else "", coordinates, fromComment = example != null,
+                originalCoordinates = fixed.takeIf { offset?.size == 4 }, actionTarget = operation.isAction, coordinateOffset = offset)
         }
         if (value?.isJsonArray == true) return PipelineRegionInfo(value.toString(),
             "$key 是多个滑动途经点/区域；每项按照 target 规则解释，各段的偏移在运行时分别应用。")
         if (!operation.isAction && value == null) {
             val coordinates = shifted(listOf(0, 0, 0, 0))
             return PipelineRegionInfo(if (offset == null) "全屏" else coordinates.toString(),
-                "roi 默认 [0, 0, 0, 0]，表示全屏；roi_offset 四个分量相加。", coordinates)
+                "roi 默认 [0, 0, 0, 0]，表示全屏；roi_offset 四个分量相加。", coordinates,
+                originalCoordinates = listOf(0, 0, 0, 0).takeIf { offset?.size == 4 })
         }
         val name = value?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
         val own = name == null
@@ -217,7 +259,7 @@ internal object PipelineVisualModel {
         }
         fun searchRegion(condition: PipelineOperation?): List<Int>? {
             condition ?: return null
-            val coordinates = integers(condition.parameters["roi"])
+            val coordinates = condition.roiHints["roi"]?.coordinates ?: integers(condition.parameters["roi"])
                 ?: if (condition.parameters["roi"] == null) listOf(0, 0, 0, 0) else return null
             val delta = integers(condition.parameters["roi_offset"])
             return if (delta?.size == 4 && coordinates.size == 4) coordinates.zip(delta) { original, change -> original + change } else coordinates

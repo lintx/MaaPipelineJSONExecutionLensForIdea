@@ -39,6 +39,8 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
     private var activeRowKey: String? = null
     private var playbackRowKey: String? = null
     private var playbackScrollRequest = 0L
+    private var searchQuery = ""
+    private val searchHighlights = mutableMapOf<javax.swing.text.JTextComponent, MutableList<Any>>()
     private val viewport: JViewport? get() = parent as? JViewport
 
     init {
@@ -81,6 +83,7 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
         rowComponents.putAll(nextComponents)
         rows = newRows
         indentation = PipelineIndentScopes(rows.map { it.depth })
+        findRows(searchQuery)
         revalidate()
         repaint()
         if (anchor != null) restorePosition(anchor.first, anchor.second)
@@ -133,6 +136,36 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
         if (playbackRowKey == key) return
         playbackRowKey = key
         repaint()
+    }
+
+    fun findRows(query: String): List<String> {
+        searchHighlights.forEach { (text, highlights) -> highlights.forEach(text.highlighter::removeHighlight) }
+        searchHighlights.clear()
+        searchQuery = query
+        if (query.isBlank()) return emptyList()
+        val scheme = EditorColorsManager.getInstance().globalScheme
+        val background = scheme.getAttributes(EditorColors.SEARCH_RESULT_ATTRIBUTES)?.backgroundColor
+            ?: UIUtil.getListSelectionBackground(false)
+        val painter = javax.swing.text.DefaultHighlighter.DefaultHighlightPainter(background)
+        fun matches(component: Component): Boolean {
+            if (!component.isVisible) return false
+            if (component is javax.swing.text.JTextComponent) {
+                val text = component.text.orEmpty()
+                var index = text.indexOf(query, ignoreCase = true)
+                val found = index >= 0
+                while (index >= 0) {
+                    searchHighlights.getOrPut(component, ::mutableListOf) += component.highlighter.addHighlight(index, index + query.length, painter)
+                    index = text.indexOf(query, index + query.length, ignoreCase = true)
+                }
+                return found
+            }
+            if (component is javax.swing.JLabel) return component.text.orEmpty().contains(query, ignoreCase = true)
+            if (component !is Container) return false
+            var found = false
+            component.components.forEach { if (matches(it)) found = true }
+            return found
+        }
+        return rowComponents.filterValues(::matches).keys.toList()
     }
 
     private fun trackActiveRow(component: Component, key: String) {

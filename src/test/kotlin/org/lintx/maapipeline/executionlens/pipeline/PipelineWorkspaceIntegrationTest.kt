@@ -19,6 +19,180 @@ import javax.swing.JLabel
 import javax.swing.text.JTextComponent
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    fun testControllerResourcesMergePartialNodesAndResolveAddedNodes() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/interface.json", """
+            {"resource":[{"path":["./resource"]}],"import":["tasks/Tasks.json"],
+             "controller":[{"name":"Desktop","type":"Win32"},
+               {"name":"ADB","type":"Adb","attach_resource_path":["./resource_adb"]},
+               {"name":"Cloud","type":"Adb","attach_resource_path":["./resource_adb","./resource_cloud"]}]}
+        """.trimIndent())
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"desc":"基础说明","action":"Click","target":[10,20,30,40],"next":["Child"]},
+             "Child":{"recognition":"OCR","expected":"desktop","roi":[1,2,3,4]}}
+        """.trimIndent())
+        val adb = myFixture.addFileToProject("assets/resource_adb/pipeline/Overrides.json", """
+            {"Start":{"target":[50,60,70,80]},"Child":{"expected":"adb","next":["Added"]},
+             "Added":{"desc":"移动端节点","anchor":{"Mobile":"Child"}}}
+        """.trimIndent()).virtualFile
+        myFixture.addFileToProject("assets/resource_cloud/pipeline/Cloud.json", """{"Child":{"expected":"cloud"}}""")
+        fun index(id: String, previous: PipelineDocumentModel? = null, changes: Set<com.intellij.openapi.vfs.VirtualFile> = emptySet()) =
+            ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file, previous, changes, id) }
+        val desktop = index("Desktop")
+        val mobile = index("ADB", desktop)
+        assertEquals(3, mobile.projectNodes.size)
+        val start = mobile.projectNodes.single { it.name == "Start" }
+        val child = mobile.projectNodes.single { it.name == "Child" }
+        assertEquals(file, start.sourceFile)
+        assertEquals("基础说明", start.description)
+        assertEquals("Click", PipelineVisualModel.operation(start, true).type)
+        assertTrue(start.rawJson.contains("[50,60,70,80]"))
+        assertEquals("OCR", PipelineVisualModel.operation(child).type)
+        assertEquals("Added", child.next.single().target?.name)
+        assertEquals(adb, child.next.single().sourceFile)
+        assertEquals(2, mobile.resourceOverrides.size)
+        assertTrue(mobile.projectNodes.none { node -> node.next.any { it.isAmbiguousTarget } })
+        assertTrue(index("Cloud").projectNodes.single { it.name == "Child" }.rawJson.contains("cloud"))
+        val overlayDocument = FileDocumentManager.getInstance().getDocument(adb)!!
+        WriteCommandAction.runWriteCommandAction(project, Runnable {
+            overlayDocument.setText("""{"Start":{"target":[1,1,2,2]},"Child":{"expected":"changed"},"Added":{}}""")
+        })
+        com.intellij.psi.PsiDocumentManager.getInstance(project).commitDocument(overlayDocument)
+        assertTrue(index("ADB", mobile, setOf(adb)).projectNodes.single { it.name == "Child" }.rawJson.contains("changed"))
+        assertEquals(desktop.projectNodes.map { it.rawJson }, index("Desktop", mobile).projectNodes.map { it.rawJson })
+    }
+
+    fun testDynamicTemplateSearchRegionsKeepTheirOwnTemplateImagesInThePreview() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"recognition":"And","all_of":["Color","ButtonA","ButtonB"]},
+             "Color":{"recognition":"ColorMatch","method":40,"lower":[60,255,255],"upper":[60,255,255]},
+             "ButtonA":{"recognition":"TemplateMatch","roi":"Color","template":"ButtonA.png","action":"Click"},
+             "ButtonB":{"recognition":"TemplateMatch","roi":"Color","template":"ButtonB.png"}}
+        """.trimIndent())
+        val colors = listOf(java.awt.Color.MAGENTA, java.awt.Color.CYAN)
+        colors.forEachIndexed { index, color ->
+            val image = java.awt.image.BufferedImage(if (index == 0) 80 else 240, 80, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            val graphics = image.createGraphics()
+            try { graphics.color = color; graphics.fillRect(12, 12, 40, 40) } finally { graphics.dispose() }
+            val bytes = java.io.ByteArrayOutputStream().also { javax.imageio.ImageIO.write(image, "png", it) }.toByteArray()
+            val target = myFixture.addFileToProject("assets/resource/image/Button${if (index == 0) "A" else "B"}.png", "").virtualFile
+            WriteCommandAction.runWriteCommandAction(project, Runnable { target.setBinaryContent(bytes) })
+        }
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val nodes = model.projectNodes.associateBy { it.name }
+        for (name in listOf("Start", "ButtonA", "ButtonB")) {
+            val operations = PipelineVisualAssets.leaves(PipelineVisualModel.operation(nodes.getValue(name), resolve = nodes::get))
+            val templates = PipelineVisualAssets.previewTemplates(project, file, operations, nodes::get)
+            val expected = if (name == "Start") listOf("ButtonA.png", "ButtonB.png") else listOf("$name.png")
+            assertEquals(expected, templates.values.flatten().map { it.name })
+            assertTrue(templates.values.flatten().all { it.image != null })
+            if (name == "Start") {
+                val sizes = templates.values.flatten().mapIndexed { index, template ->
+                    val image = template.image!!
+                    val matching = (0 until image.height).flatMap { y -> (0 until image.width).mapNotNull { x ->
+                        (x to y).takeIf { image.getRGB(x, y) == colors[index].rgb }
+                    } }
+                    (matching.maxOf { it.first } - matching.minOf { it.first } + 1) to
+                        (matching.maxOf { it.second } - matching.minOf { it.second } + 1)
+                }
+                assertEquals("不同裁剪留白中的同尺寸按钮应按相同像素比例显示", sizes[0], sizes[1])
+            }
+            val overlay = PipelineVisualAssets.overlay(java.awt.image.BufferedImage(1280, 720, java.awt.image.BufferedImage.TYPE_INT_RGB),
+                operations, nodes::get, templatePreviews = templates)
+            val pixels = overlay.getRGB(0, 0, overlay.width, overlay.height, null, 0, overlay.width)
+            expected.forEach { template ->
+                val color = colors[if (template == "ButtonA.png") 0 else 1]
+                assertTrue("$name 的 $template 必须绘制在预览中", pixels.count { it == color.rgb } >= 24 * 12)
+            }
+            if (name == "Start") {
+                fun row(color: java.awt.Color) = pixels.indexOfFirst { it == color.rgb } / overlay.width
+                assertTrue("同框条件应依次显示颜色样本、模板 A、模板 B", row(java.awt.Color.GREEN) < row(colors[0]) && row(colors[0]) < row(colors[1]))
+            }
+        }
+        val action = PipelineVisualModel.operation(nodes.getValue("ButtonA"), true, nodes::get)
+        val actionTemplates = PipelineVisualAssets.previewTemplates(project, file, listOf(action), nodes::get)
+        assertEquals("ButtonA.png", actionTemplates.values.flatten().single().name)
+        assertNotNull(actionTemplates.values.flatten().single().image)
+    }
+
+    fun testControllerPreviewLayersAndRoiEditsUseTheActiveAnnotationSource() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/interface.json", """
+            {"resource":[{"path":["./resource"]}],"controller":[{"name":"Desktop","type":"Win32"},
+             {"name":"Mobile","type":"Adb","attach_resource_path":["./resource_adb"]},
+             {"name":"CloudADB","type":"Adb","attach_resource_path":["./resource_adb","./resource_cloud_adb"]}]}
+        """.trimIndent())
+        val definition = """{
+            // @preview desktop.png
+            // @preview adb mobile.png
+            // @preview CloudADB cloud.png
+            // @roi [1,2,3,4]
+            // @roi adb [10,20,30,40]
+            "recognition":"OCR","roi":[0,0,0,0],"roi_offset":[1,2,3,4]
+        }""".trimIndent()
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """{"Start":$definition,"Fallback":$definition}""")
+        val patch = myFixture.addFileToProject("assets/resource_adb/pipeline/Patch.json", """{"Start":{
+            // @preview patch.png
+            // @roi adb [40,50,20,10]
+            // @roi [2,3,4,5]
+        }}""").virtualFile
+        listOf("assets/resource/pipeline/desktop.png", "assets/resource/pipeline/mobile.png",
+            "assets/resource/pipeline/cloud.png", "assets/resource_adb/pipeline/patch.png").forEachIndexed { index, path ->
+            val image = java.awt.image.BufferedImage(100, 100, java.awt.image.BufferedImage.TYPE_INT_RGB)
+            image.setRGB(99, 99, index + 1)
+            val bytes = java.io.ByteArrayOutputStream().also { javax.imageio.ImageIO.write(image, "png", it) }.toByteArray()
+            val target = myFixture.addFileToProject(path, "").virtualFile
+            WriteCommandAction.runWriteCommandAction(project, Runnable { target.setBinaryContent(bytes) })
+        }
+        fun catalog(environment: String) = ReadAction.compute<PipelineDocumentModel, RuntimeException> {
+            PipelineDocumentIndexer.index(project, file, environmentId = environment)
+        }.projectNodes.associateBy { it.name }
+        val desktop = catalog("Desktop").getValue("Start")
+        assertEquals("desktop.png", PipelinePreviewHints.preview(desktop)?.path)
+        val mobile = catalog("Mobile")
+        val start = mobile.getValue("Start")
+        val hint = PipelinePreviewHints.preview(start)!!
+        assertEquals("patch.png", hint.path)
+        assertEquals(patch, hint.sourceFile)
+        assertEquals("mobile.png", PipelinePreviewHints.preview(mobile.getValue("Fallback"))?.path)
+        assertEquals("cloud.png", PipelinePreviewHints.preview(catalog("CloudADB").getValue("Fallback"))?.path)
+
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.data.lastContext = "preview-test"
+        val psi = com.intellij.psi.PsiManager.getInstance(project).findFile(file) as com.intellij.json.psi.JsonFile
+        fun comment(name: String) = com.intellij.psi.util.PsiTreeUtil.findChildOfType(
+            (psi.topLevelValue as com.intellij.json.psi.JsonObject).findProperty(name), com.intellij.psi.PsiComment::class.java)!!
+        for ((environment, name, marker) in listOf(Triple("Desktop", "Start", 1), Triple("Mobile", "Start", 4),
+            Triple("Mobile", "Fallback", 2), Triple("CloudADB", "Fallback", 3))) {
+            workspace.reading(workspace.data.lastContext).environmentId = environment
+            val loaded = PipelineHoverImages.load(comment(name), "preview")!!
+            assertEquals(marker, loaded.image.getRGB(99, 99) and 0xFFFFFF)
+            assertNotNull(PipelineJsonDocumentationProvider().generateDoc(comment(name), comment(name)))
+        }
+
+        val operation = PipelineVisualModel.operation(start)
+        val session = PipelineRoiEditSession(project, listOf(operation))
+        val annotation = PipelinePreviewModel.annotations(listOf(operation)).single()
+        assertEquals(listOf(41,52,23,14), annotation.region.coordinates)
+        assertNull(session.unavailable(annotation))
+        val baseDocument = FileDocumentManager.getInstance().getDocument(file)!!
+        val originalBase = baseDocument.text
+        val patchDocument = FileDocumentManager.getInstance().getDocument(patch)!!
+        val originalPatch = patchDocument.text
+        assertTrue(session.apply(annotation, listOf(50,60,30,20)))
+        assertEquals(originalBase, baseDocument.text)
+        assertEquals(originalPatch.replace("@roi adb [40,50,20,10]", "@roi adb [50, 60, 30, 20]"), patchDocument.text)
+        assertEquals(listOf(51,62,33,24), PipelineVisualModel.region(session.currentOperation(operation)).coordinates)
+
+        val fallback = PipelineVisualModel.operation(mobile.getValue("Fallback"))
+        val fallbackSession = PipelineRoiEditSession(project, listOf(fallback))
+        assertTrue(fallbackSession.apply(PipelinePreviewModel.annotations(listOf(fallback)).single(), listOf(15,25,35,45)))
+        val fallbackHint = "@roi adb [10,20,30,40]"
+        val fallbackStart = originalBase.lastIndexOf(fallbackHint)
+        assertEquals(originalBase.replaceRange(fallbackStart, fallbackStart + fallbackHint.length, "@roi adb [15, 25, 35, 45]"), baseDocument.text)
+    }
+
     fun testWorkspaceUrlCanBeRestoredWithoutAnExistingFileInstance() {
         val file = PipelineWorkspaceState.getInstance(project).file
         assertTrue(file.url.startsWith("maa-pipeline:///"))
@@ -31,13 +205,263 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         assertNull(PipelineWorkspaceFileSystem().findFileByPath("/missing"))
     }
 
+    fun testWorkspaceControllerSearchSourceTabsAndSharedNodeLocations() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Root":{"next":["Left","Right"]},"Left":{"desc":"移动端终点","next":["Shared"]},
+             "Right":{"next":["Shared"]},"Shared":{"desc":"共享终点"}}
+        """.trimIndent())
+        replaceFixtureFile("assets/tasks/Tasks.json", """{"task":[{"name":"Transfer","entry":"Root"}]}""")
+        replaceFixtureFile("assets/interface.json", """
+            {"resource":[{"path":["./resource"]}],"import":["tasks/Tasks.json"],
+             "controller":[{"name":"Desktop","type":"Win32"},
+              {"name":"ADB","type":"Adb","attach_resource_path":["./resource_adb"]}]}
+        """.trimIndent())
+        val overlay = myFixture.addFileToProject("assets/resource_adb/pipeline/Mobile.json", """
+            {"Start":{"action":"Click","target":[30,40,50,60]},"Shared":{"action":"Click","target":[30,40,50,60]}}
+        """.trimIndent()).virtualFile
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
+            fun current() = field("currentModel").get(panel) as PipelineDocumentModel
+            fun ready() = !field("contextLoading").getBoolean(panel)
+            val environment = descendants(panel).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-environment-selector" }
+            PlatformTestUtil.waitWithEventsDispatching("环境列表未就绪", {
+                current().version >= 0 && ready() && (0 until environment.itemCount).any { (environment.getItemAt(it) as PipelineEnvironment).id == "ADB" }
+            }, 30)
+            assertEquals("首启应使用 manifest 的第一个真实控制器", "Desktop", current().environmentId)
+            environment.selectedItem = (0 until environment.itemCount).map { environment.getItemAt(it) }
+                .single { (it as PipelineEnvironment).id == "ADB" }
+            PlatformTestUtil.waitWithEventsDispatching("控制器切换未应用到工作区", { current().environmentId == "ADB" && ready() }, 30)
+            val selector = descendants(panel).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
+            val search = field("nodeSearch").get(panel) as com.intellij.ui.SearchTextField
+            search.text = "移动端终点"
+            assertEquals(1, selector.itemCount)
+            assertEquals("Left", (selector.getItemAt(0) as PipelineNodeLocation).name)
+            search.text = "Shared"
+            assertEquals(1, selector.itemCount)
+            assertEquals("Shared", (selector.getItemAt(0) as PipelineNodeLocation).name)
+            search.text = ""
+            val shared = current().projectNodes.single { it.name == "Shared" }
+            selector.selectedItem = shared
+            val logic = field("logicPanel").get(panel) as PipelineRowsPanel
+            val components = logic.components.toList()
+            assertTrue(logic.findRows("共享终点").isNotEmpty())
+            assertEquals("查找不能重建流程", components, logic.components.toList())
+            logic.findRows("")
+            val locate = PipelineFlowPanel::class.java.getDeclaredMethod("locateDetailInFlow").apply { isAccessible = true }
+            locate.invoke(panel)
+            val first = field("locatedOccurrence").get(panel)
+            locate.invoke(panel)
+            assertNotSame("共享节点应能巡回定位：${field("logicOccurrences").get(panel)}", first, field("locatedOccurrence").get(panel))
+            val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
+            tabs.selectedIndex = 1
+            val source = descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single()
+            assertEquals(file, source.currentFile)
+            val resources = descendants(source).filterIsInstance<JTabbedPane>().single()
+            resources.selectedIndex = (0 until resources.tabCount).single { resources.getTitleAt(it) == "resource_adb" }
+            assertEquals(overlay, source.currentFile)
+            fun selectedResource() = resources.getTitleAt(resources.selectedIndex)
+            assertEquals("resource_adb", selectedResource())
+            tabs.selectedIndex = 0
+            tabs.selectedIndex = 1
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals(overlay, source.currentFile)
+            assertEquals("resource_adb", selectedResource())
+            source.clearNodeSources()
+            source.showNode(shared, current().resourceOverrides.filter { it.targetName == shared.name }, "ADB")
+            assertEquals("resource_adb", selectedResource())
+            source.showFile(file, shared.nameRange, false)
+            assertEquals("基础资源 · resource", selectedResource())
+            source.showFile(overlay, TextRange(0, 0), false)
+            assertEquals("resource_adb", selectedResource())
+            val nativeTabs = manager.openFiles.toSet()
+            val patch = current().resourceOverrides.single { it.targetName == "Shared" }
+            PipelineFlowPanel::class.java.getDeclaredMethod("navigateToFileRange", com.intellij.openapi.vfs.VirtualFile::class.java, TextRange::class.java)
+                .apply { isAccessible = true }.invoke(panel, patch.file, patch.range)
+            assertTrue(manager.isFileOpen(overlay))
+            assertTrue(manager.openFiles.toSet().containsAll(nativeTabs))
+        } finally { manager.closeFile(workspace.file) }
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            val current = PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }
+            PlatformTestUtil.waitWithEventsDispatching("重开工作区未恢复 ADB 资源", {
+                val restored = current.get(panel) as PipelineDocumentModel
+                restored.version >= 0 && restored.environmentId == "ADB" && restored.resourceOverrides.any { it.file == overlay }
+            }, 30)
+            val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
+            tabs.selectedIndex = 1
+            val resources = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-resource-sources" }
+            assertTrue((0 until resources.tabCount).any { resources.getTitleAt(it) == "resource_adb" })
+        } finally { manager.closeFile(workspace.file) }
+    }
+
+    fun testSimulationAdvancesOneCandidateAndRunsBranchesInPlace() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"next":["Disabled","Branch"]},"Disabled":{"enabled":false},
+             "Branch":{"next":["Left","Right"],"on_error":["Error"]},
+             "Left":{},"Right":{},"Error":{}}
+        """.trimIndent())
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
+            val logic = field("logicPanel").get(panel) as PipelineRowsPanel
+            val details = field("detailsPanel").get(panel) as javax.swing.JPanel
+            PlatformTestUtil.waitWithEventsDispatching("模拟流程未就绪", {
+                (field("currentModel").get(panel) as PipelineDocumentModel).version >= 0 &&
+                    !field("contextLoading").getBoolean(panel) && textComponents(logic).any { it.text.contains("→ Branch") }
+            }, 30)
+            fun invoke(name: String) = PipelineFlowPanel::class.java.getDeclaredMethod(name).apply { isAccessible = true }.invoke(panel)
+            fun step() = PipelineFlowPanel::class.java.getDeclaredMethod("chooseSimulationStep", Boolean::class.javaPrimitiveType)
+                .apply { isAccessible = true }.invoke(panel, false)
+            fun cursor() = field("simulationCursor").get(panel) as PipelinePlaybackCursor
+            fun runs(container: Component) = descendants(container).filterIsInstance<javax.swing.JButton>()
+                .filter { it.name == "pipeline-simulation-run" && it.isVisible }
+            val fold = descendants(logic).filterIsInstance<javax.swing.JComponent>().single { it.toolTipText == "收起Branch" }
+            val click = java.awt.event.MouseEvent(fold, java.awt.event.MouseEvent.MOUSE_CLICKED,
+                System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
+            fold.mouseListeners.forEach { it.mouseClicked(click) }
+            assertFalse(textComponents(logic).any { it.text.contains("→ Left") })
+            invoke("startSimulation")
+            assertEquals(1, runs(logic).size)
+            val toolbar = field("playbackToolbar").get(panel) as PipelinePlaybackToolbar
+            PipelinePlaybackToolbar::class.java.getDeclaredField("follow").apply { isAccessible = true }.setBoolean(toolbar, false)
+            step()
+            assertEquals("Branch", cursor().frame?.nodeName)
+            assertEquals(2, cursor().size)
+            assertTrue("进入已折叠节点应自动展开，与跟随滚动开关无关", textComponents(logic).any { it.text.contains("→ Left") })
+            step()
+            assertEquals("多候选等待就地选择，不能擅自前进", 2, cursor().size)
+            assertEquals(3, runs(logic).size)
+            runs(logic).single { it.toolTipText.contains("next → Left") }.doClick()
+            assertEquals("Left", cursor().frame?.nodeName)
+            toolbar.seek(1)
+            val selector = field("nodeSelector").get(panel) as JComboBox<*>
+            selector.selectedItem = (0 until selector.itemCount).map(selector::getItemAt)
+                .single { (it as PipelineNodeLocation).name == "Right" }
+            runs(details).single().doClick()
+            assertEquals("Right", cursor().frame?.nodeName)
+            assertEquals("从历史分岔后应丢弃旧路径", 3, cursor().size)
+            toolbar.seek(1)
+            runs(logic).single { it.toolTipText.contains("on_error → Error") }.doClick()
+            assertEquals("Error", cursor().frame?.nodeName)
+            invoke("stopSimulation")
+            assertEmpty(runs(logic))
+        } finally { manager.closeFile(workspace.file) }
+    }
+
+    fun testDetailsReturnToTopOnNodeAndTabChangesButKeepPositionOnRefresh() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"desc":"${"说明\\n".repeat(50)}","next":["Child"]},
+             "Child":{"desc":"${"子节点\\n".repeat(50)}"}}
+        """.trimIndent())
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val panel = descendants(manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single().component)
+                .filterIsInstance<PipelineFlowPanel>().single()
+            fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(panel)
+            val details = field("detailsPanel") as javax.swing.JPanel
+            val scroll = field("detailsScroll") as javax.swing.JScrollPane
+            PlatformTestUtil.waitWithEventsDispatching("详情未就绪", { textComponents(details).any { it.text == "Start" } }, 30)
+            scroll.setSize(420, 300)
+            scroll.doLayout()
+            scroll.viewport.doLayout()
+            details.doLayout()
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            textComponents(details).filterIsInstance<JTextComponent>().forEach { label ->
+                label.caretPosition = 0
+                label.caretPosition = label.document.length
+            }
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals("未聚焦的只读文本不能因延迟光标更新将详情滚到底部", 0, scroll.viewport.viewPosition.y)
+            fun moveDown() {
+                scroll.viewport.viewPosition = java.awt.Point(0, 180)
+                assertEquals(180, scroll.viewport.viewPosition.y)
+            }
+            moveDown()
+            PipelineFlowPanel::class.java.getDeclaredMethod("renderSelectedNode", Boolean::class.javaPrimitiveType)
+                .apply { isAccessible = true }.invoke(panel, false)
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals("同节点刷新保留阅读位置", 180, scroll.viewport.viewPosition.y)
+            val selector = field("nodeSelector") as JComboBox<*>
+            selector.selectedItem = (0 until selector.itemCount).map(selector::getItemAt)
+                .single { (it as PipelineNodeLocation).name == "Child" }
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals("切节点应回到开头", 0, scroll.viewport.viewPosition.y)
+            moveDown()
+            val tabs = field("rightTabs") as JTabbedPane
+            tabs.selectedIndex = 1
+            tabs.selectedIndex = 0
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertEquals("切回详情应回到开头", 0, scroll.viewport.viewPosition.y)
+        } finally { manager.closeFile(workspace.file) }
+    }
+
+    fun testMissingControllerOverlayCanBeDeclinedOrCreatedAsNodeOnlyJson() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/interface.json", """
+            {"resource":[{"path":["./resource"]}],
+             "controller":[{"name":"CloudADB","type":"Adb",
+               "attach_resource_path":["./resource_adb","./resource_cloud_adb"]}]}
+        """.trimIndent())
+        val adb = myFixture.addFileToProject("assets/resource_adb/pipeline/Main.json", """{"Start":{"desc":"ADB 覆盖"}}""").virtualFile
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file, environmentId = "CloudADB") }
+        val node = model.projectNodes.single { it.name == "Start" }
+        val source = PipelineWorkspaceSource(project)
+        try {
+            source.showNode(node, model.resourceOverrides, "CloudADB")
+            val tabs = descendants(source).filterIsInstance<JTabbedPane>().single()
+            assertEquals(listOf("基础资源 · resource", "resource_adb", "resource_cloud_adb · 创建"), (0 until tabs.tabCount).map(tabs::getTitleAt))
+            tabs.selectedIndex = 1
+            assertEquals(adb, source.currentFile)
+            var previousDialog = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.NO }
+            try { tabs.selectedIndex = 2 } finally { com.intellij.openapi.ui.TestDialogManager.setTestDialog(previousDialog) }
+            assertNull(myFixture.tempDirFixture.getFile("assets/resource_cloud_adb/pipeline/Main.json"))
+            assertEquals(1, tabs.selectedIndex)
+            previousDialog = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.YES }
+            try { tabs.selectedIndex = 2 } finally { com.intellij.openapi.ui.TestDialogManager.setTestDialog(previousDialog) }
+            val created = myFixture.tempDirFixture.getFile("assets/resource_cloud_adb/pipeline/Main.json")
+            assertNotNull(created)
+            assertEquals(created, source.currentFile)
+            val parsed = PipelineJsonc.parse(PipelineProjectFiles.text(created!!)).asJsonObject
+            assertEquals(setOf("Start"), parsed.keySet())
+            assertTrue(parsed.getAsJsonObject("Start").entrySet().isEmpty())
+        } finally { source.dispose() }
+    }
+
     private fun textComponents(root: Component): List<Component> = descendants(root)
         .filter { it is JLabel || it is JTextComponent }
 
     private val Component.text: String
         get() = when (this) {
-            is JLabel -> text
-            is JTextComponent -> text
+            is JLabel -> text.orEmpty()
+            is JTextComponent -> text.orEmpty()
             else -> ""
         }
 
@@ -454,8 +878,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val subtaskRow = rows().first { row -> textComponents(row.createComponent()).any { it.text.contains("subtask → Child") } }
             val subtaskIndex = rows().indexOf(subtaskRow)
             assertTrue(textComponents(rows()[subtaskIndex + 1].createComponent()).any { it.text == "CHILD_BODY" })
-            val action = labels().filterIsInstance<PipelineWrappingLabel>().first { it.text.startsWith("执行动作 Click") }
-            assertTrue(action.font.isBold)
+            val action = labels().filterIsInstance<PipelineStyledText>().first { it.text.startsWith("执行动作 Click") }
+            assertFalse("只强调关键字，不能整行加粗", action.font.isBold)
             assertTrue(action.toolTipText.contains("target"))
             assertTrue(action.toolTipText.contains("识别结果"))
             val policy = labels().filterIsInstance<PipelineWrappingLabel>().first { it.text == "timeout=345" }
@@ -795,7 +1219,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         PlatformTestUtil.waitWithEventsDispatching("源码未恢复", {
             descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().any { it.currentFile == file }
         }, 30)
-        val selector = descendants(host.component).filterIsInstance<JComboBox<*>>().single()
+        val selector = descendants(host.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
         val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
         com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
         val textEditor = source.editorFor(file).editor
@@ -836,7 +1260,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             descendants(host.component).any { it is PipelineWorkspaceSource }
         }, 30)
         val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
-        descendants(host.component).filterIsInstance<JTabbedPane>().single().selectedIndex = 1
+        descendants(host.component).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }.selectedIndex = 1
         source.showFile(file, TextRange(1, 1), false)
         com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
         val hosted = source.editorFor(file)
@@ -909,7 +1333,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             descendants(host.component).filterIsInstance<JComboBox<*>>().any { (it.selectedItem as? PipelineNodeLocation)?.name == "Child" }
         }, 30)
         val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
-        val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single()
+        val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
         assertEquals(listOf("节点详情", "原始 JSON"), (0 until tabs.tabCount).map(tabs::getTitleAt))
         assertEquals(1, tabs.selectedIndex)
         val source = descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single()
@@ -983,16 +1407,16 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             PlatformTestUtil.waitWithEventsDispatching("可能目标按钮未加载", {
                 descendants(logic).filterIsInstance<javax.swing.JButton>().any { it.text.contains("个可能目标") }
             }, 30)
-            val tabs = descendants(host.component).filterIsInstance<JTabbedPane>().single()
+            val tabs = descendants(host.component).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
             val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
             tabs.selectedIndex = 1
             val openBefore = manager.openFiles.toSet()
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text.contains("个可能目标") }.doClick()
             PlatformTestUtil.waitWithEventsDispatching("候选未展开", {
-                labels().any { it.text == "→ Target" }
+                labels().any { it.text.contains("→ Target") }
             }, 30)
-            val label = labels().single { it.text == "→ Target" }
-            assertTrue(textComponents(label.parent).any { it.text == "可能目标（运行时绑定）" })
+            val label = labels().single { it.text.contains("→ Target") }
+            assertTrue(label.text.contains("可能目标（运行时绑定）"))
             val click = java.awt.event.MouseEvent(label, java.awt.event.MouseEvent.MOUSE_CLICKED,
                 System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
             label.mouseListeners.forEach { it.mouseClicked(click) }
@@ -1002,16 +1426,17 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals(2, source.editorFor(other).editor.caretModel.logicalPosition.line)
             assertEquals(openBefore, manager.openFiles.toSet())
             assertTrue(labels().none { it.text.contains("本轮没有成功后继") || it.text.startsWith("否则：") })
-            assertEquals(labels().count { it.text == "{" }, labels().count { it.text == "}" })
+            assertEquals(labels().sumOf { it.text.count { character -> character == '{' } },
+                labels().sumOf { it.text.count { character -> character == '}' } })
             assertTrue(logic.componentCount < 60)
             val cycle = labels().single { it.text.contains("· ↩ 循环") }
-            val header = cycle.parent.parent as javax.swing.JPanel
+            val header = cycle.parent as javax.swing.JPanel
             val controls = (header.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.SOUTH)
             assertNull("左侧循环候选只负责阅读，不应保留编辑操作", controls)
             assertTrue(descendants(logic).filterIsInstance<javax.swing.JToggleButton>().none { it.text in setOf("回", "锚") })
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text == "↩ 回到此层" }.doClick()
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
-            assertEquals("Start", (descendants(host.component).filterIsInstance<JComboBox<*>>().single().selectedItem as PipelineNodeLocation).name)
+            assertEquals("Start", (descendants(host.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem as PipelineNodeLocation).name)
         } finally {
             if (attach) logic.removeNotify()
             manager.closeFile(workspace.file)
@@ -1039,7 +1464,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
-        val selector = descendants(panel).filterIsInstance<JComboBox<*>>().single()
+        val selector = descendants(panel).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
             workspace.reading(entry.stableId).rootNode.endsWith("#Start") && selector.selectedItem != null
         }, 30)
@@ -1051,7 +1476,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         try {
             PlatformTestUtil.waitWithEventsDispatching("流程可见行未创建", { logic.componentCount > 5 }, 30)
             val originalRows = logic.components.toList()
-            val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single()
+            val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
             val originalDetails = textComponents(tabs.getComponentAt(0))
             val source = descendants(panel).filterIsInstance<PipelineWorkspaceSource>().single()
             tabs.selectedIndex = 1
@@ -1108,13 +1533,13 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             }, 30)
             return host
         }
-        assertNull(descendants(readyHost().component).filterIsInstance<JComboBox<*>>().single().selectedItem)
+        assertNull(descendants(readyHost().component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem)
         assertEquals("", workspace.data.lastContext)
         manager.closeFile(workspace.file)
         workspace.data.lastContext = "${file.url}#task:Removed"
         workspace.open()
         val restored = readyHost()
-        assertNull(descendants(restored.component).filterIsInstance<JComboBox<*>>().single().selectedItem)
+        assertNull(descendants(restored.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem)
         assertTrue(textComponents(restored.component).any { it.text.contains("上次任务或流程已不存在") })
         manager.closeFile(workspace.file)
     }

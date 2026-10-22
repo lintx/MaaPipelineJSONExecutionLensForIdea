@@ -26,7 +26,7 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         element ?: return null
         val context = PipelineJsonContext.at(element) ?: return null
         val comment = generateSequence(element) { it.parent }.filterIsInstance<PsiComment>().firstOrNull()
-        if (comment != null && (comment.text.contains("@preview") || comment.text.contains("@roi")) && PipelineVisualModel.preview(context.location.rawJson) != null) return comment
+        if (comment != null && (comment.text.contains("@preview") || comment.text.contains("@roi"))) return comment
         return element.takeIf { context.field?.name in setOf("template", "lower", "upper", "method", "recognition", "action", "anchor", "target", "begin", "end", "roi", "custom_action", "custom_recognition") }
     }
 
@@ -36,29 +36,27 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         val origin = originalElement?.takeIf { PipelineJsonContext.at(it) != null } ?: element
         val context = PipelineJsonContext.at(origin) ?: return null
         val project = origin.project
-        val node = context.location
-        fun resolve(name: String): PipelineNodeLocation? {
-            val candidate = PipelineNavigationIndex.values(project, "node:$name").singleOrNull()?.first ?: return null
-            val psi = PsiManager.getInstance(project).findFile(candidate) as? com.intellij.json.psi.JsonFile ?: return null
-            val property = (psi.topLevelValue as? JsonObject)?.findProperty(name) ?: return null
-            return PipelineNodeLocation(name, property.nameElement.textRange, property.textRange,
-                sourceFile = candidate, rawJson = PipelinePreviewHints.sourceText(property))
-        }
+        val previewContext = PipelinePreviewContext(context)
+        val node = previewContext.location
+        val environmentId = previewContext.environment.id
+        fun resolve(name: String) = previewContext.resolve(name)
         val comment = generateSequence(origin) { it.parent }.filterIsInstance<PsiComment>().firstOrNull()
         val key = context.field?.name
         if ((comment != null && (comment.text.contains("@preview") || comment.text.contains("@roi"))) ||
-            (key in setOf("roi", "target", "begin", "end") && PipelineVisualModel.preview(node.rawJson) != null)) {
-            val path = PipelineVisualModel.preview(node.rawJson) ?: return null
-            val file = PipelineVisualAssets.resolve(project, context.file.virtualFile, path, true)
-            val image = file?.let(PipelineVisualAssets::read)
+            key in setOf("roi", "target", "begin", "end")) {
+            val hint = PipelinePreviewHints.preview(node)
+            val path = hint?.path
+            val image = if (hint != null) PipelineVisualAssets.resolve(project, hint.sourceFile ?: context.file.virtualFile,
+                hint.path, true, environmentId)?.let(PipelineVisualAssets::read)
+                else PipelinePreviewSettings.getInstance().background(context.file.virtualFile)?.second
             val recognition = PipelineVisualModel.operation(node, resolve = ::resolve)
             val action = PipelineVisualModel.operation(node, true, ::resolve)
             val operations = PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
             val annotation = PipelineHoverImages.annotationAt(origin, operations)
             return html {
-                line("参考图 · $path", true)
+                line(path?.let { "参考图 · $it" } ?: "默认预览", true)
                 if (image == null) line("图片未找到或无法解码") else {
-                    val templates = PipelineVisualAssets.previewTemplates(project, context.file.virtualFile, operations, ::resolve)
+                    val templates = PipelineVisualAssets.previewTemplates(project, context.file.virtualFile, operations, ::resolve, environmentId)
                     picture(PipelineVisualAssets.overlay(image, operations, ::resolve, selectedAnnotation = annotation?.number,
                         templatePreviews = templates, compact = true), 420, 240,
                         "preview")
@@ -78,20 +76,20 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
                 val region = PipelineVisualModel.region(operation, key!!, ::resolve)
                 line(region.summary, true)
             }
-            operationImages(operation, context, this)
+            operationImages(operation, context, this, environmentId)
             if (operation.children.isNotEmpty()) PipelineVisualAssets.leaves(operation).take(12).forEach {
                 line(it.title, true)
-                operationImages(it, context, this)
+                operationImages(it, context, this, environmentId)
             }
         }
     }
 
-    private fun operationImages(operation: PipelineOperation, context: PipelineJsonContext, html: Html) {
+    private fun operationImages(operation: PipelineOperation, context: PipelineJsonContext, html: Html, environmentId: String) {
         operation.parameters["template"]?.let { value ->
             val paths = if (value.isJsonArray) value.asJsonArray.toList() else listOf(value)
             paths.filter { it.isJsonPrimitive }.take(8).forEach { path ->
                 html.line("模板：${path.asString}")
-                val files = PipelineVisualAssets.templates(context.file.project, operation.source?.sourceFile ?: context.file.virtualFile, path.asString)
+                val files = PipelineVisualAssets.templates(context.file.project, operation.source?.sourceFile ?: context.file.virtualFile, path.asString, environmentId)
                 if (files.isEmpty()) html.line("模板图片未找到")
                 files.take(8).forEach { file -> PipelineVisualAssets.read(file)?.let {
                     val key = "template:" + java.net.URLEncoder.encode(file.url, java.nio.charset.StandardCharsets.UTF_8)

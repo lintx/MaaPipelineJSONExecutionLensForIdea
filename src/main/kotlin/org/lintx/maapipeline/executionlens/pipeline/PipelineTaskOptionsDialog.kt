@@ -26,6 +26,7 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
     private val textValues = inputValues.toMutableMap()
     private val controls = linkedMapOf<String, JPanel>()
     private val inputFields = linkedMapOf<String, Pair<PipelineTaskInput, JBTextField>>()
+    private val query = JBTextField()
     val selections: Map<String, List<String>> get() = selectedValues
     val inputs: Map<String, String> get() = textValues + inputFields.mapValues { it.value.second.text }
     private val options = buildList {
@@ -71,18 +72,21 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
                             }
                         }
                     }
+                    com.intellij.ui.ListSpeedSearch(list) { "${it.name} ${it.label} ${it.description}" }
                     row.add(JBScrollPane(list), BorderLayout.CENTER)
                 } else {
-                    val combo = JComboBox(option.cases.toTypedArray()).apply {
-                        this.renderer = renderer
-                        selectedIndex = option.cases.indexOfFirst { it.name in chosen }
-                        addActionListener {
-                            selectedValues[option.name] = listOfNotNull((selectedItem as? PipelineOptionCase)?.name)
-                            updateActive()
-                        }
+                    val chooser = javax.swing.JButton(option.cases.firstOrNull { it.name in chosen }?.label ?: "选择…")
+                    chooser.addActionListener {
+                        com.intellij.openapi.ui.popup.JBPopupFactory.getInstance().createPopupChooserBuilder(option.cases)
+                            .setTitle(option.label).setRenderer(renderer)
+                            .setNamerForFiltering { "${it.name} ${it.label} ${it.description}" }
+                            .setItemChosenCallback { item ->
+                                selectedValues[option.name] = listOf(item.name)
+                                chooser.text = item.label
+                                updateActive()
+                            }.createPopup().showUnderneathOf(chooser)
                     }
-                    ComboboxSpeedSearch(combo)
-                    row.add(combo, BorderLayout.CENTER)
+                    row.add(chooser, BorderLayout.CENTER)
                 }
             }
             if (option.inputs.isNotEmpty()) {
@@ -101,7 +105,21 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
             controls[option.path] = row
             body.add(row)
         }
-        return JBScrollPane(body).apply { preferredSize = Dimension(JBUI.scale(620), JBUI.scale(470)) }
+        query.emptyText.text = "搜索选项 ID、名称、说明或选项值"
+        query.document.addDocumentListener(object : com.intellij.ui.DocumentAdapter() {
+            override fun textChanged(event: javax.swing.event.DocumentEvent) {
+                options.forEach { option ->
+                    controls[option.path]?.isVisible = PipelineTaskContext.matches(query.text, option.name, option.label,
+                        option.description, option.cases.joinToString(" ") { "${it.name} ${it.label} ${it.description}" })
+                }
+                body.revalidate(); body.repaint()
+            }
+        })
+        return JPanel(BorderLayout(0, JBUI.scale(6))).apply {
+            preferredSize = Dimension(JBUI.scale(620), JBUI.scale(470))
+            add(query, BorderLayout.NORTH)
+            add(JBScrollPane(body), BorderLayout.CENTER)
+        }
     }
 
     private fun updateActive() {

@@ -3,13 +3,19 @@ package org.lintx.maapipeline.executionlens.pipeline
 import com.google.gson.JsonParser
 import com.intellij.json.psi.JsonProperty
 import com.intellij.openapi.util.TextRange
+import com.intellij.openapi.vfs.VirtualFile
 
-internal data class PipelineRoiHint(val key: String?, val coordinates: List<Int>, val range: TextRange, val path: List<String>)
-internal data class PipelineObjectHints(var preview: String? = null, val regions: MutableList<PipelineRoiHint> = mutableListOf())
+internal data class PipelineRoiHint(val key: String?, val coordinates: List<Int>, val range: TextRange, val path: List<String>,
+    val controller: String? = null, val sourceFile: VirtualFile? = null)
+internal data class PipelinePreviewHint(val path: String, val controller: String? = null, val sourceFile: VirtualFile? = null)
+internal data class PipelineObjectHints(val previews: MutableList<PipelinePreviewHint> = mutableListOf(),
+    val regions: MutableList<PipelineRoiHint> = mutableListOf())
 
 internal object PipelinePreviewHints {
-    private val roi = Regex("@roi\\s+(?:(roi|target|begin|end)\\s+)?(\\[\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*-?\\d+\\s*])")
+    private val roi = Regex("@roi\\s+((?:(?:\"[^\"\\r\\n]+\"|[^\\s\\[\\]\\r\\n]+)\\s+){0,2})(\\[\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*-?\\d+\\s*])")
     private val preview = Regex("@preview\\s+([^\\r\\n]+)")
+    private val selector = Regex("^(\"[^\"]+\"|[^\\s]+)\\s+(.+)$")
+    private val regionKeys = setOf("roi", "target", "begin", "end")
 
     fun sourceText(property: JsonProperty): String {
         val value = property.value ?: return "{}"
@@ -36,6 +42,41 @@ internal object PipelinePreviewHints {
 
     fun read(text: String): Map<List<String>, PipelineObjectHints> = Scanner(text).run { value(emptyList(), emptyList()); hints }
 
+    fun sources(node: PipelineNodeLocation): List<PipelinePreviewSource> = node.previewSources.ifEmpty {
+        listOf(PipelinePreviewSource(node.previewSource ?: node.rawJson, node.sourceFile))
+    }
+
+    fun selected(node: PipelineNodeLocation): Map<List<String>, PipelineObjectHints> {
+        val result = linkedMapOf<List<String>, PipelineObjectHints>()
+        fun rank(controller: String?): Int = when {
+            controller == null -> 0
+            node.environmentId.isNotBlank() && controller.equals(node.environmentId, true) -> 2
+            node.controllerType.isNotBlank() && controller.equals(node.controllerType, true) -> 1
+            else -> -1
+        }
+        // 每层先选择具体控制器、控制器类型或默认值，再由后加载的资源层覆盖已有注释。
+        sources(node).forEach { source ->
+            read(source.rawJson).forEach { (path, hints) ->
+                val target = result.getOrPut(path) { PipelineObjectHints() }
+                hints.previews.filter { rank(it.controller) >= 0 }.maxWithOrNull(compareBy<PipelinePreviewHint> { rank(it.controller) }
+                    .thenBy { hints.previews.indexOf(it) })?.let {
+                    target.previews.clear()
+                    target.previews += it.copy(sourceFile = source.sourceFile)
+                }
+                hints.regions.groupBy { it.key ?: "roi" }.forEach { (key, regions) ->
+                    regions.filter { rank(it.controller) >= 0 }.maxWithOrNull(compareBy<PipelineRoiHint> { rank(it.controller) }
+                        .thenBy { it.range.startOffset })?.let {
+                        target.regions.removeAll { hint -> (hint.key ?: "roi") == key }
+                        target.regions += it.copy(sourceFile = source.sourceFile)
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    fun preview(node: PipelineNodeLocation): PipelinePreviewHint? = selected(node)[emptyList()]?.previews?.lastOrNull()
+
     private class Scanner(private val text: String) {
         var index = 0
         val hints = linkedMapOf<List<String>, PipelineObjectHints>()
@@ -53,15 +94,24 @@ internal object PipelinePreviewHints {
                 if (!comment) return
                 val value = text.substring(start, index)
                 val target = hints.getOrPut(owner) { PipelineObjectHints() }
-                if (owner.isEmpty() && owner !in started) preview.find(value)?.let {
-                    target.preview = it.groupValues[1].removeSuffix("*/").trim().removeSurrounding("\"")
+                if (owner.isEmpty() && owner !in started) preview.findAll(value).forEach {
+                    val text = it.groupValues[1].removeSuffix("*/").trim()
+                    val parts = selector.matchEntire(text)
+                    val controller = parts?.groupValues?.get(1)?.removeSurrounding("\"")
+                        ?.takeUnless { token -> token.any { character -> character in "/\\.:" } }
+                    val path = (if (parts != null && controller != null) parts.groupValues[2] else text).trim().removeSurrounding("\"")
+                    if (path.isNotBlank()) target.previews += PipelinePreviewHint(path, controller)
                 }
                 roi.findAll(value).forEach { match ->
+                    val tokens = Regex("\"[^\"]+\"|\\S+").findAll(match.groupValues[1]).map { it.value.removeSurrounding("\"") }.toList()
+                    val explicitKey = tokens.firstOrNull { it in regionKeys }
+                    val controllers = tokens.filter { it !in regionKeys }
+                    if (controllers.size > 1) return@forEach
                     val array = match.groups[2]!!
                     val numbers = array.value.removeSurrounding("[", "]").split(',').mapNotNull { it.trim().toIntOrNull() }
-                    if (numbers.size == 4) target.regions += PipelineRoiHint(match.groups[1]?.value ?: key?.takeIf {
-                        it in setOf("roi", "target", "begin", "end") }, numbers,
-                        TextRange(start + array.range.first, start + array.range.last + 1), owner)
+                    if (numbers.size == 4) target.regions += PipelineRoiHint(explicitKey ?: key?.takeIf {
+                        it in regionKeys }, numbers,
+                        TextRange(start + array.range.first, start + array.range.last + 1), owner, controllers.singleOrNull())
                 }
             }
         }

@@ -14,6 +14,7 @@ import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Cursor
 import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.Point
 import java.awt.Rectangle
 import java.awt.event.ComponentAdapter
@@ -39,6 +40,7 @@ internal class PipelineImagePreview(
     private val templates: Map<Int, List<PipelineVisualAssets.TemplatePreview>> = emptyMap(),
     private val roiSession: PipelineRoiEditSession? = null,
     private val onApplied: () -> Unit = {},
+    private val node: PipelineNodeLocation? = null,
 ) : JPanel(BorderLayout()), Disposable {
     val viewer = ImageEditorManagerImpl.createImageEditorUI(original)
     private val picture = ImageEditorManagerImpl.getImageComponent(viewer)
@@ -46,13 +48,16 @@ internal class PipelineImagePreview(
     private var annotations = PipelinePreviewModel.annotations(displayOperations, resolve)
     private val editReasons = annotations.map { roiSession?.unavailable(it) }
     private val chooser = JComboBox((listOf("全部条件与动作") + annotations.map { it.title }).toTypedArray())
-    private val apply = iconButton(AllIcons.Actions.Checked, "应用 ROI") { applyRegion() }
+    private val apply = iconButton(AllIcons.Actions.Checked, "应用原始 ROI（保留 offset）") { applyRegion() }
     private val cancel = iconButton(AllIcons.Actions.Cancel, "取消调整") { stopEditing() }
-    private val numeric = iconButton(AllIcons.Actions.Edit, "输入 ROI 坐标") { editCoordinates() }
+    private val numeric = iconButton(AllIcons.Actions.Edit, "输入原始 ROI 坐标") { editCoordinates() }
     private val editButtons = annotations.map { annotation ->
-        iconButton(AllIcons.Actions.Edit, "调整 ${annotation.title}") {
+        iconButton(AllIcons.Actions.Edit, "调整 ${annotation.title} 的原始 ROI") {
             startEditing(annotation.number)
         }
+    }
+    private val offsetButtons = annotations.map { annotation ->
+        iconButton(AllIcons.Actions.Edit, "修改 ${annotation.key}_offset") { editOffset(annotation.number) }
     }
     private val status = JBLabel()
     // 显示筛选与编辑目标独立；切换可见区域时保留尚未应用的编辑框。
@@ -61,6 +66,8 @@ internal class PipelineImagePreview(
     private var changed = false
     internal var region: Rectangle? = null
         private set
+    private var regionValues: List<Int>? = null
+    private var editBasis: List<Int>? = null
     private var gesture: PipelineRoiGesture? = null
     private var panStart: Point? = null
     private var panPosition: Point? = null
@@ -71,15 +78,34 @@ internal class PipelineImagePreview(
         preferredSize = JBUI.size(1000, 760)
         Disposer.register(this, viewer)
         val top = JPanel(BorderLayout()).apply {
+            node?.description?.takeIf(String::isNotBlank)?.let { description ->
+                val text = PipelineWrappingLabel(description).apply { name = "pipeline-preview-description" }
+                add(object : com.intellij.ui.components.JBScrollPane(text) {
+                    override fun getPreferredSize(): java.awt.Dimension {
+                        val available = (parent?.width?.takeIf { it > 0 } ?: JBUI.scale(1000)) - insets.left - insets.right
+                        val height = text.preferredSizeForWidth(available).height + insets.top + insets.bottom
+                        return java.awt.Dimension(0, height.coerceAtMost(JBUI.scale(120)))
+                    }
+                }.apply {
+                    border = JBUI.Borders.emptyBottom(8)
+                    viewportBorder = null
+                    isOpaque = false
+                    viewport.isOpaque = false
+                    horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+                }, BorderLayout.CENTER)
+            }
             if (annotations.isNotEmpty()) add(chooser, BorderLayout.SOUTH)
         }
         add(top, BorderLayout.NORTH)
         add(viewer, BorderLayout.CENTER)
         add(status, BorderLayout.SOUTH)
         chooser.name = "pipeline-preview-annotations"
+        com.intellij.ui.ComboboxSpeedSearch(chooser)
         chooser.addActionListener { updateImage(); updateControls() }
         picture.layout = null
-        (editButtons + listOf(apply, cancel, numeric)).forEach(picture::add)
+        (editButtons + offsetButtons + listOf(apply, cancel, numeric)).forEach(picture::add)
+        com.intellij.openapi.application.ApplicationManager.getApplication().messageBus.connect(this)
+            .subscribe(PipelinePreviewSettings.CHANGED, Runnable { updateImage() })
         picture.addComponentListener(object : ComponentAdapter() {
             override fun componentResized(event: ComponentEvent) { positionButtons() }
         })
@@ -89,9 +115,13 @@ internal class PipelineImagePreview(
                 if (!editingVisible()) return
                 val rectangle = region ?: return
                 val bounds = screenRectangle(rectangle)
-                graphics.color = JBColor.BLUE
-                graphics.drawRect(bounds.x, bounds.y, bounds.width, bounds.height)
-                PipelineRoiGesture.handles(bounds).forEach { point -> graphics.fillRect(point.x - 3, point.y - 3, 7, 7) }
+                val pen = graphics.create() as Graphics2D
+                try {
+                    PipelineVisualAssets.drawRoiFrame(pen, bounds, (editingNumber ?: 1) - 1, original = true,
+                        dashed = true, PipelinePreviewSettings.lineWidth())
+                    pen.color = JBColor.BLUE
+                    PipelineRoiGesture.handles(bounds).forEach { point -> pen.fillRect(point.x - 3, point.y - 3, 7, 7) }
+                } finally { pen.dispose() }
             }
         }
         val listener = object : MouseAdapter() {
@@ -110,9 +140,20 @@ internal class PipelineImagePreview(
 
             override fun mouseDragged(event: MouseEvent) {
                 gesture?.let {
-                    region = it.move(imagePoint(event.point)); changed = true
-                    status.text = "${editingAnnotation()?.key} = ${region!!.let { box -> listOf(box.x, box.y, box.width, box.height) }}"
-                    apply.isEnabled = true; positionButtons(); picture.repaint(); return
+                    val moved = it.move(imagePoint(event.point))
+                    val basis = editBasis.orEmpty()
+                    val reverseX = basis.getOrElse(2) { 1 } < 0
+                    val reverseY = basis.getOrElse(3) { 1 } < 0
+                    val left = moved.x + if (reverseX) moved.width else 0
+                    val top = moved.y + if (reverseY) moved.height else 0
+                    // 拖动保留原有的右/下边缘参照和负尺寸方向；数值输入则原样保存。
+                    regionValues = listOf(left - if (basis.getOrElse(0) { 0 } < 0) original.width else 0,
+                        top - if (basis.getOrElse(1) { 0 } < 0) original.height else 0,
+                        if (reverseX) -moved.width else if (basis.getOrElse(2) { 1 } == 0 && moved.x + moved.width == original.width) 0 else moved.width,
+                        if (reverseY) -moved.height else if (basis.getOrElse(3) { 1 } == 0 && moved.y + moved.height == original.height) 0 else moved.height)
+                    region = moved; changed = true
+                    status.text = "原始 ${editingAnnotation()?.key} = $regionValues"
+                    apply.isEnabled = true; updateImage(); return
                 }
                 val start = panStart ?: return
                 val position = panPosition ?: return
@@ -154,7 +195,7 @@ internal class PipelineImagePreview(
         val zoom = viewer.zoomModel.zoomFactor
         picture.document.setValue(if (displayOperations.isEmpty()) original else
             PipelineVisualAssets.overlay(original, displayOperations, resolve, selected()?.number, templates,
-                excludedAnnotation = editingNumber))
+                excludedAnnotation = editingNumber, originalDraft = regionValues))
         viewer.zoomModel.zoomFactor = zoom
         positionButtons()
         picture.repaint()
@@ -164,13 +205,15 @@ internal class PipelineImagePreview(
         if (editing) return
         val annotation = annotations.firstOrNull { it.number == number } ?: return
         if (roiSession?.unavailable(annotation) != null || roiSession == null) return
-        region = annotation.region.rectangle(original.width, original.height) ?: return
+        regionValues = annotation.region.originalCoordinates ?: annotation.region.coordinates ?: return
+        editBasis = regionValues
+        region = originalRectangle(annotation)
         editingNumber = annotation.number; changed = false
         updateImage(); updateControls()
     }
 
     internal fun stopEditing() {
-        editingNumber = null; changed = false; region = null; gesture = null
+        editingNumber = null; changed = false; region = null; regionValues = null; editBasis = null; gesture = null
         updateImage(); updateControls()
     }
 
@@ -180,7 +223,7 @@ internal class PipelineImagePreview(
         apply.isVisible = editingVisible(); apply.isEnabled = changed
         cancel.isVisible = editingVisible()
         numeric.isVisible = editingVisible()
-        status.text = if (editing) "拖动框或控制点；框外拖动重画" else reason.orEmpty()
+        status.text = if (editing) "调整原始 ROI；offset 保持不变" else reason.orEmpty()
         picture.cursor = Cursor.getPredefinedCursor(if (editingVisible()) Cursor.CROSSHAIR_CURSOR else Cursor.HAND_CURSOR)
         positionButtons()
     }
@@ -191,6 +234,11 @@ internal class PipelineImagePreview(
         margin = JBUI.insets(2)
         addActionListener { action() }
     }
+
+    private fun originalRectangle(annotation: PipelinePreviewAnnotation): Rectangle? =
+        (annotation.region.originalCoordinates ?: annotation.region.coordinates)?.let {
+            PipelineRegionInfo.rectangle(it, original.width, original.height)
+        }
 
     private fun positionButtons() {
         val visible = picture.visibleRect
@@ -211,46 +259,80 @@ internal class PipelineImagePreview(
         }
         editButtons.forEachIndexed { index, button ->
             val annotation = annotations[index]
-            val rectangle = annotation.region.rectangle(original.width, original.height)
+            val rectangle = originalRectangle(annotation) ?: annotation.region.rectangle(original.width, original.height)
             button.isVisible = !editing && roiSession != null && rectangle != null && (selected() == null || selected()?.number == annotation.number)
             if (button.isVisible) {
                 val reason = editReasons[index]
                 button.isEnabled = reason == null
-                button.toolTipText = reason ?: "调整 ${annotation.title}"
+                button.toolTipText = reason ?: "调整 ${annotation.title} 的原始 ROI（保留 offset）"
                 place(button, rectangle!!)
             }
         }
+        offsetButtons.forEachIndexed { index, button ->
+            val annotation = annotations[index]
+            val rectangle = annotation.region.rectangle(original.width, original.height) ?: originalRectangle(annotation)
+            button.isVisible = !editing && roiSession != null && rectangle != null && (selected() == null || selected()?.number == annotation.number)
+            if (button.isVisible) {
+                val reason = roiSession?.unavailable(annotation, offset = true)
+                button.isEnabled = reason == null
+                button.toolTipText = reason ?: "修改 ${annotation.key}_offset（保留原始 ROI）"
+                place(button, rectangle!!, if (annotation.region.originalCoordinates == null) 1 else 0)
+            }
+        }
         apply.isVisible = editingVisible(); cancel.isVisible = editingVisible(); numeric.isVisible = editingVisible()
-        if (editingVisible()) region?.let {
+        if (editingVisible()) (region ?: imagePoint(Point(visible.x, visible.y)).let { Rectangle(it.x, it.y, 1, 1) }).let {
             place(apply, it, 2); place(cancel, it, 1); place(numeric, it)
         }
     }
 
     private fun editCoordinates() {
-        val current = region ?: return
+        val current = regionValues ?: return
         val input = com.intellij.openapi.ui.Messages.showInputDialog(project,
-            "x, y, width, height", "ROI 坐标", null,
-            listOf(current.x, current.y, current.width, current.height).joinToString(", "),
+            "x, y, width, height（支持负数；宽高为 0 表示延伸至边缘）", "原始 ROI 坐标", null,
+            current.joinToString(", "),
             object : com.intellij.openapi.ui.InputValidator {
                 override fun checkInput(inputString: String): Boolean {
-                    val values = inputString.trim().removeSurrounding("[", "]").split(',').mapNotNull { it.trim().toIntOrNull() }
-                    return values.size == 4 && values[0] >= 0 && values[1] >= 0 && values[2] > 0 && values[3] > 0 &&
-                        values[0].toLong() + values[2] <= original.width && values[1].toLong() + values[3] <= original.height
+                    val parts = inputString.trim().removeSurrounding("[", "]").split(',')
+                    return parts.size in setOf(2, 4) && parts.all { it.trim().toIntOrNull() != null }
                 }
                 override fun canClose(inputString: String) = checkInput(inputString)
             }) ?: return
         val values = input.trim().removeSurrounding("[", "]").split(',').map { it.trim().toInt() }
-        region = Rectangle(values[0], values[1], values[2], values[3]); changed = true
-        apply.isEnabled = true; positionButtons(); picture.repaint()
+        regionValues = values; editBasis = values
+        region = PipelineRegionInfo.rectangle(values, original.width, original.height); changed = true
+        status.text = "原始 ${editingAnnotation()?.key} = $values" + if (region == null) "（当前画布内无可见区域）" else ""
+        apply.isEnabled = true; updateImage()
+    }
+
+    private fun editOffset(number: Int) {
+        val annotation = annotations.firstOrNull { it.number == number } ?: return
+        if (editing || roiSession == null || roiSession.unavailable(annotation, offset = true) != null) return
+        val current = PipelineVisualModel.integers(annotation.operation.parameters["${annotation.key}_offset"]) ?: listOf(0, 0, 0, 0)
+        fun values(text: String): List<Int>? {
+            val parts = text.trim().removeSurrounding("[", "]").split(',')
+            if (parts.size != 4) return null
+            return parts.map { it.trim().toIntOrNull() ?: return null }
+        }
+        val input = com.intellij.openapi.ui.Messages.showInputDialog(project,
+            "Δx, Δy, Δwidth, Δheight（可为负数）", "${annotation.key}_offset", null, current.joinToString(", "),
+            object : com.intellij.openapi.ui.InputValidator {
+                override fun checkInput(inputString: String): Boolean = values(inputString) != null
+                override fun canClose(inputString: String): Boolean = checkInput(inputString)
+            }) ?: return
+        if (roiSession.applyOffset(annotation, values(input) ?: return)) refreshOperations()
+    }
+
+    private fun refreshOperations() {
+        displayOperations = displayOperations.map { roiSession!!.currentOperation(it) }
+        annotations = PipelinePreviewModel.annotations(displayOperations, resolve)
+        stopEditing(); onApplied()
     }
 
     private fun applyRegion() {
         val annotation = editingAnnotation() ?: return
-        val rectangle = region ?: return
-        if (!changed || roiSession?.apply(annotation, rectangle) != true) return
-        displayOperations = displayOperations.map { roiSession.currentOperation(it) }
-        annotations = PipelinePreviewModel.annotations(displayOperations, resolve)
-        stopEditing(); onApplied()
+        val values = regionValues ?: return
+        if (!changed || roiSession?.apply(annotation, values) != true) return
+        refreshOperations()
     }
 
     internal fun imagePoint(point: Point): Point {
@@ -271,20 +353,20 @@ internal class PipelineImagePreview(
     override fun dispose() {}
 
     companion object {
-        fun show(project: Project, file: VirtualFile, original: BufferedImage, operations: List<PipelineOperation> = emptyList(),
+        fun show(project: Project, node: PipelineNodeLocation, original: BufferedImage, operations: List<PipelineOperation> = emptyList(),
             resolve: (String) -> PipelineNodeLocation? = { null },
             templates: Map<Int, List<PipelineVisualAssets.TemplatePreview>> = emptyMap(),
             blocked: (VirtualFile) -> Boolean = { false }) {
             object : DialogWrapper(project, false) {
                 private val preview = PipelineImagePreview(project, original, operations, resolve, templates,
-                    if (operations.isEmpty()) null else PipelineRoiEditSession(project, operations, blocked))
-                init { title = "图片预览 · ${file.name}"; setOKButtonText("关闭"); init(); Disposer.register(disposable, preview) }
+                    if (operations.isEmpty()) null else PipelineRoiEditSession(project, operations, blocked), node = node)
+                init { title = "识别预览 · ${node.name}"; setOKButtonText("关闭"); init(); Disposer.register(disposable, preview) }
                 override fun createActions() = arrayOf(okAction)
                 override fun createCenterPanel(): JComponent = preview
                 override fun doOKAction() { if (confirmDiscard()) super.doOKAction() }
                 override fun doCancelAction() { if (confirmDiscard()) super.doCancelAction() }
                 private fun confirmDiscard(): Boolean = !preview.hasChanges() ||
-                    com.intellij.openapi.ui.Messages.showYesNoDialog(project, "放弃尚未应用的 ROI 调整？", "关闭图片", null) == com.intellij.openapi.ui.Messages.YES
+                    com.intellij.openapi.ui.Messages.showYesNoDialog(project, "放弃尚未应用的 ROI 调整？", "关闭预览", null) == com.intellij.openapi.ui.Messages.YES
                 override fun show() {
                     SwingUtilities.invokeLater { if (window?.isShowing == true) preview.fitToWindow() }
                     super.show()

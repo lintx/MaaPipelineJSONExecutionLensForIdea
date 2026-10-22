@@ -43,7 +43,7 @@ class PipelineImagePreviewTest : BasePlatformTestCase() {
     }
 
     fun testNativeViewerZoomPanCoordinatesAndCancelNeverModifyDocument() {
-        val source = myFixture.configureByText("ROI.json", """{"A":{"recognition":"OCR","roi":[10,20,100,120],"action":"Click"},"B":{"recognition":"OCR","roi":[400,400,100,80]}}""") as JsonFile
+        val source = myFixture.configureByText("ROI.json", """{"A":{"recognition":"OCR","roi":[10,20,100,120],"roi_offset":[20,30,0,0],"action":"Click"},"B":{"recognition":"OCR","roi":[400,400,100,80]}}""") as JsonFile
         val operations = listOf(PipelineVisualModel.operation(node(source)), PipelineVisualModel.operation(node(source, "B")), PipelineVisualModel.operation(node(source), true))
         val original = myFixture.editor.document.text
         val preview = PipelineImagePreview(project, BufferedImage(1000,800,BufferedImage.TYPE_INT_RGB), operations,
@@ -78,6 +78,7 @@ class PipelineImagePreviewTest : BasePlatformTestCase() {
             it.toolTipText?.startsWith("调整 1.") == true
         }.doClick()
         assertNotNull(preview.region)
+        assertEquals(Rectangle(10,20,100,120), preview.region)
         assertEquals(0, chooser.selectedIndex)
         assertTrue(chooser.isEnabled)
         assertTrue(picture.document.value!!.getRGB(400,450) != java.awt.Color.BLACK.rgb)
@@ -108,6 +109,55 @@ class PipelineImagePreviewTest : BasePlatformTestCase() {
         assertEquals(Rectangle(0,0,100,120), PipelineRoiGesture(Point(40,50), rectangle,300,300,2).move(Point(-100,-100)))
         assertEquals(Rectangle(150,160,50,40), PipelineRoiGesture(Point(200,200), rectangle,300,300,2).move(Point(150,160)))
         assertEquals(Rectangle(10,5,100,135), PipelineRoiGesture(Point(60,20), rectangle,300,300,2).move(Point(60,5)))
+    }
+
+    fun testOriginalRoiAndOffsetWriteIndependentlyAndUndoSeparately() {
+        val source = myFixture.configureByText("ROI.json", """{"A":{"recognition":{"type":"OCR","param":{
+            "roi":[/* @roi [10,20,30,40] */1,2,3,4],"roi_offset":[100,0,0,0]}}}}""") as JsonFile
+        val operations = listOf(PipelineVisualModel.operation(node(source)))
+        val session = PipelineRoiEditSession(project, operations)
+        val original = myFixture.editor.document.text
+        assertTrue(session.apply(PipelinePreviewModel.annotations(operations).single(), Rectangle(50,60,70,80)))
+        val baseEdited = myFixture.editor.document.text
+        assertTrue(baseEdited.contains("@roi [50, 60, 70, 80]"))
+        assertTrue(baseEdited.contains("*/1,2,3,4]"))
+        assertTrue(baseEdited.contains("\"roi_offset\":[100,0,0,0]"))
+        val current = session.currentOperation(operations.single())
+        assertTrue(session.applyOffset(PipelinePreviewModel.annotations(listOf(current)).single(), listOf(-5,6,7,8)))
+        assertEquals(baseEdited.replace("[100,0,0,0]", "[-5, 6, 7, 8]"), myFixture.editor.document.text)
+        val hosted = TextEditorProvider.getInstance().getTextEditor(myFixture.editor)
+        UndoManager.getInstance(project).undo(hosted)
+        assertEquals(baseEdited, myFixture.editor.document.text)
+        UndoManager.getInstance(project).undo(hosted)
+        assertEquals(original, myFixture.editor.document.text)
+
+        val noOffset = current.copy(parameters = current.parameters - "roi_offset", parameterPaths = current.parameterPaths - "roi_offset")
+        val owner = PipelineOperationEdits.objectValue(project, original.replace(",\"roi_offset\":[100,0,0,0]", ""))!!.findProperty("A")!!.value as JsonObject
+        val edit = PipelineOperationEdits.offsetEdit(owner, noOffset, "roi", listOf(1,2,3,4))!!
+        val changed = edit.applyTo(original.replace(",\"roi_offset\":[100,0,0,0]", ""))
+        assertTrue(changed.contains("@roi [10,20,30,40]"))
+        val parsed = PipelineOperationEdits.objectValue(project, changed)!!.findProperty("A")!!.value!!
+        assertEquals("[1, 2, 3, 4]", PipelineOperationEdits.at(parsed, listOf("recognition","param","roi_offset"))!!.text)
+    }
+
+    fun testNumericRoiEditingPreservesNegativeCoordinatesAndSizes() {
+        val source = myFixture.configureByText("ROI.json", """{"A":{"recognition":"OCR","roi":[10,20,30,40],"roi_offset":[1,2,3,4]}}""") as JsonFile
+        val operations = listOf(PipelineVisualModel.operation(node(source)))
+        val original = myFixture.editor.document.text
+        val preview = PipelineImagePreview(project, BufferedImage(1000,800,BufferedImage.TYPE_INT_RGB), operations,
+            roiSession = PipelineRoiEditSession(project, operations))
+        Disposer.register(testRootDisposable, preview)
+        preview.startEditing(1)
+        val previous = com.intellij.openapi.ui.TestDialogManager.setTestInputDialog { "-20, -30, -40, -50" }
+        try {
+            descendants(preview).filterIsInstance<javax.swing.JButton>().single { it.toolTipText == "输入原始 ROI 坐标" }.doClick()
+        } finally { com.intellij.openapi.ui.TestDialogManager.setTestInputDialog(previous) }
+        assertEquals(Rectangle(940,720,40,50), preview.region)
+        descendants(preview).filterIsInstance<javax.swing.JButton>().single { it.toolTipText == "应用原始 ROI（保留 offset）" }.doClick()
+        assertEquals(original.replace("[10,20,30,40]", "[-20, -30, -40, -50]"), myFixture.editor.document.text)
+        val hosted = TextEditorProvider.getInstance().getTextEditor(myFixture.editor)
+        UndoManager.getInstance(project).undo(hosted)
+        assertEquals(original, myFixture.editor.document.text)
     }
 
     private fun node(file: JsonFile, name: String = "A"): PipelineNodeLocation {

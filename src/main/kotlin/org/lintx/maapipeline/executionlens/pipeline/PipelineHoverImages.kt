@@ -1,6 +1,5 @@
 package org.lintx.maapipeline.executionlens.pipeline
 
-import com.intellij.json.psi.JsonFile
 import com.intellij.json.psi.JsonObject
 import com.intellij.json.psi.JsonProperty
 import com.intellij.openapi.application.ApplicationManager
@@ -8,7 +7,6 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiElement
-import com.intellij.psi.PsiManager
 import com.intellij.psi.SmartPointerManager
 import java.awt.image.BufferedImage
 
@@ -19,16 +17,21 @@ internal object PipelineHoverImages {
         val comment = generateSequence(element) { it.parent }.filterIsInstance<com.intellij.psi.PsiComment>().firstOrNull()
         val rawStart = owner.textRange.endOffset - context.location.rawJson.length
         return PipelinePreviewModel.annotations(operations).firstOrNull { annotation ->
-            if (annotation.operation.source?.name != context.node.name || annotation.operation.source?.sourceFile != context.file.virtualFile) return@firstOrNull false
-            if (comment != null) annotation.operation.roiHints[annotation.key]?.range?.shiftRight(rawStart)?.intersects(comment.textRange) == true
-            else annotation.operation.parameterPaths[annotation.key]?.let { path ->
+            val source = annotation.operation.source ?: return@firstOrNull false
+            if (source.name != context.node.name) return@firstOrNull false
+            if (comment != null) annotation.operation.roiHints[annotation.key]?.let { hint ->
+                (hint.sourceFile ?: source.sourceFile) == context.file.virtualFile &&
+                    hint.range.shiftRight(rawStart).intersects(comment.textRange)
+            } == true
+            else source.sourceFile == context.file.virtualFile && annotation.operation.parameterPaths[annotation.key]?.let { path ->
                 val field = PipelineOperationEdits.at(owner, path)?.parent as? JsonProperty
                 field?.textRange?.contains(element.textRange) == true
             } == true
         }
     }
 
-    internal data class Preview(val file: VirtualFile, val image: BufferedImage, val operations: List<PipelineOperation> = emptyList(),
+    internal data class Preview(val file: VirtualFile, val image: BufferedImage, val node: PipelineNodeLocation,
+        val operations: List<PipelineOperation> = emptyList(),
         val catalog: Map<String, PipelineNodeLocation> = emptyMap(),
         val templates: Map<Int, List<PipelineVisualAssets.TemplatePreview>> = emptyMap())
 
@@ -42,7 +45,7 @@ internal object PipelineHoverImages {
                 if (project.isDisposed) null else pointer.element?.let { load(it, key) }
             } ?: return@executeOnPooledThread
             application.invokeLater({
-                if (!project.isDisposed) PipelineImagePreview.show(project, preview.file, preview.image, preview.operations,
+                if (!project.isDisposed) PipelineImagePreview.show(project, preview.node, preview.image, preview.operations,
                     preview.catalog::get, preview.templates)
             }, ModalityState.nonModal())
         }
@@ -53,33 +56,29 @@ internal object PipelineHoverImages {
         val context = PipelineJsonContext.at(element) ?: return null
         val project = element.project
         val source = context.file.virtualFile
-        val catalog = linkedMapOf<String, PipelineNodeLocation>()
-        fun resolve(name: String): PipelineNodeLocation? {
-            catalog[name]?.let { return it }
-            val file = PipelineNavigationIndex.values(project, "node:$name").singleOrNull()?.first ?: return null
-            val psi = PsiManager.getInstance(project).findFile(file) as? JsonFile ?: return null
-            val property = (psi.topLevelValue as? JsonObject)?.findProperty(name) ?: return null
-            return PipelineNodeLocation(name, property.nameElement.textRange, property.textRange, sourceFile = file,
-                rawJson = PipelinePreviewHints.sourceText(property)).also { catalog[name] = it }
-        }
+        val previewContext = PipelinePreviewContext(context)
+        fun resolve(name: String) = previewContext.resolve(name)
+        val environmentId = previewContext.environment.id
         if (key == "preview") {
-            val node = context.location
-            val path = PipelineVisualModel.preview(node.rawJson) ?: return null
-            val file = PipelineVisualAssets.resolve(project, source, path, true) ?: return null
-            val image = PipelineVisualAssets.read(file) ?: return null
+            val node = previewContext.location
+            val hint = PipelinePreviewHints.preview(node)
+            val background = if (hint == null) PipelinePreviewSettings.getInstance().background(source)
+                else PipelineVisualAssets.resolve(project, hint.sourceFile ?: source, hint.path, true, environmentId)
+                    ?.let { file -> PipelineVisualAssets.read(file)?.let { file to it } }
+            val (file, image) = background ?: return null
             val operations = PipelineVisualAssets.leaves(PipelineVisualModel.operation(node, resolve = ::resolve)) +
                 listOf(PipelineVisualModel.operation(node, true, ::resolve)).filter { it.type != "DoNothing" }
             PipelinePreviewModel.annotations(operations, ::resolve)
-            val templates = PipelineVisualAssets.previewTemplates(project, source, operations, ::resolve)
-            return Preview(file, image, operations, catalog.toMap(), templates)
+            val templates = PipelineVisualAssets.previewTemplates(project, source, operations, ::resolve, environmentId)
+            return Preview(file, image, node, operations, previewContext.catalog.toMap(), templates)
         }
         if (key.startsWith("template:")) {
             val url = java.net.URLDecoder.decode(key.removePrefix("template:"), java.nio.charset.StandardCharsets.UTF_8)
             val literals = com.intellij.psi.util.PsiTreeUtil.collectElementsOfType(context.node, com.intellij.json.psi.JsonStringLiteral::class.java)
                 .filter { literal -> generateSequence(literal as PsiElement) { it.parent }.filterIsInstance<JsonProperty>().any { it.name == "template" } }
-            val file = literals.asSequence().flatMap { PipelineVisualAssets.templates(project, source, it.value).asSequence() }
+            val file = literals.asSequence().flatMap { PipelineVisualAssets.templates(project, source, it.value, environmentId).asSequence() }
                 .firstOrNull { it.url == url } ?: return null
-            return PipelineVisualAssets.read(file)?.let { Preview(file, it) }
+            return PipelineVisualAssets.read(file)?.let { Preview(file, it, previewContext.location) }
         }
         if (key == "colors") {
             val owner = generateSequence(element) { it.parent }.filterIsInstance<JsonObject>()
@@ -87,7 +86,7 @@ internal object PipelineHoverImages {
             val operation = PipelineVisualModel.operation(context.location.copy(rawJson = owner?.text ?: context.location.rawJson))
             val colors = PipelineVisualModel.colors(operation) ?: return null
             val image = PipelineVisualAssets.colorImage(colors) ?: return null
-            return Preview(source, image)
+            return Preview(source, image, previewContext.location)
         }
         return null
     }

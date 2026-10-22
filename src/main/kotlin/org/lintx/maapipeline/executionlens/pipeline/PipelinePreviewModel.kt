@@ -9,23 +9,25 @@ internal data class PipelinePreviewAnnotation(
 ) {
     val dynamic: Boolean get() = region.coordinates == null
     val title: String get() = "$number. ${operation.type} · $key" + when {
+        key in operation.simulatedRegions -> " 模拟结果"
         region.fromComment -> " 注释示意"
         !dynamic -> if (operation.isAction) " 固定目标" else " 搜索区域"
         sourceNumber != null -> " ← $sourceNumber. ${region.resultOperation?.type} 的识别结果"
         else -> " · 运行时结果"
     }
     val imageLabel: String get() = "$number ${operation.type} $key" + when {
+        key in operation.simulatedRegions -> " 模拟结果"
         region.fromComment -> " 注释示意"
         !dynamic -> ""
         sourceNumber != null -> " ← $sourceNumber 结果（标注来源区）"
         else -> " 来源搜索区"
     }
 
-    fun imageLines(): List<String> = buildList {
-        add(imageLabel)
+    fun imageLines(rectangle: java.awt.Rectangle? = null): List<String> = buildList {
+        add(imageLabel + if (region.originalCoordinates != null) " · 最终（实线）" else "")
         if (dynamic) {
             region.searchCoordinates?.let { add("来源 roi=$it") }
-        } else add("$key=${region.coordinates}")
+        } else add("$key=${rectangle?.let { listOf(it.x, it.y, it.width, it.height) } ?: region.coordinates}")
         if (!operation.isAction) {
             operation.parameters["expected"]?.let { add("匹配文本：${PipelineVisualModel.display(it)}") }
             operation.parameters["template"]?.let { add("模板：${PipelineVisualModel.display(it)}") }
@@ -41,7 +43,7 @@ internal data class PipelinePreviewAnnotation(
 
     fun details(): List<String> = buildList {
         if (!dynamic) {
-            add("${if (region.fromComment) "预览示意" else if (operation.isAction) "固定目标" else "搜索范围"}：${region.summary}")
+            add("${if (key in operation.simulatedRegions) "模拟结果" else if (region.fromComment) "预览示意" else if (operation.isAction) "固定目标" else "搜索范围"}：${region.summary}")
             if (!operation.isAction && !region.fromComment) add("此框限定查找范围；识别得到的目标框可以只是其中一部分。")
             add(region.explanation)
         } else {
@@ -66,6 +68,12 @@ internal data class PipelinePreviewAnnotation(
 }
 
 internal object PipelinePreviewModel {
+    fun hasPreviewRegion(operations: List<PipelineOperation>, resolve: (String) -> PipelineNodeLocation? = { null }): Boolean =
+        annotations(operations, resolve).any { annotation ->
+            annotation.region.coordinates != null || annotation.region.searchCoordinates != null ||
+                annotation.region.originalCoordinates != null || annotation.region.fromComment
+        }
+
     fun annotations(operations: List<PipelineOperation>, resolve: (String) -> PipelineNodeLocation? = { null }): List<PipelinePreviewAnnotation> {
         val annotations = mutableListOf<PipelinePreviewAnnotation>()
         operations.forEach { operation ->

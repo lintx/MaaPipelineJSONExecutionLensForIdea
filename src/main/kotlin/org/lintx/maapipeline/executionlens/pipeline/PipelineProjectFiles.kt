@@ -8,6 +8,19 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 
 internal object PipelineProjectFiles {
+    data class ResourceLayer(
+        val path: String,
+        val label: String,
+        val isBase: Boolean,
+    )
+
+    data class ResourceSource(
+        val layer: ResourceLayer,
+        val file: VirtualFile?,
+        val manifestDirectory: VirtualFile,
+        val targetRelativePath: String,
+    )
+
     fun base(project: Project): VirtualFile? = project.basePath?.let {
         LocalFileSystem.getInstance().findFileByPath(it)
     }
@@ -19,18 +32,59 @@ internal object PipelineProjectFiles {
         return ancestor ?: root?.findFileByRelativePath("assets/interface.json") ?: root?.findChild("interface.json")
     }
 
-    fun pipelineRoots(project: Project, file: VirtualFile? = null): List<VirtualFile> {
+    fun resourcePaths(text: String, environmentId: String = ""): List<String> {
+        return resourceLayers(text, environmentId).map { it.path }
+    }
+
+    fun resourceLayers(text: String, environmentId: String = ""): List<ResourceLayer> {
+        val root = PipelineVisualModel.parse(text) ?: return emptyList()
+        fun paths(value: com.google.gson.JsonElement?): List<String> =
+            (if (value?.isJsonArray == true) value.asJsonArray.toList() else listOfNotNull(value))
+                .filter { it.isJsonPrimitive }.map { it.asString.removePrefix("./") }
+        val resource = root.get("resource")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.firstOrNull()?.takeIf { it.isJsonObject }?.asJsonObject
+        val controllers = root.get("controller")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.filter { it.isJsonObject }?.map { it.asJsonObject }.orEmpty()
+        val controller = controllers.firstOrNull { environmentId.isNotEmpty() && it.get("name")?.asString == environmentId }
+        val base = paths(resource?.get("path"))
+        val attached = paths(controller?.get("attach_resource_path"))
+        return (base.map { ResourceLayer(it, "基础资源 · ${it.substringAfterLast('/')}", true) } +
+            attached.map { ResourceLayer(it, it.substringAfterLast('/'), false) })
+            .distinctBy { it.path }
+    }
+
+    fun resourceLayerFiles(
+        manifestDirectory: VirtualFile?,
+        source: VirtualFile,
+        layers: List<ResourceLayer>,
+    ): List<ResourceSource> {
+        val resourceRoot = manifestDirectory ?: return emptyList()
+        val relative = layers.asSequence().mapNotNull { layer ->
+            resourcePipelinePath(layer)?.let(resourceRoot::findFileByRelativePath)
+        }.firstOrNull { pipeline -> source.path.startsWith(pipeline.path.trimEnd('/') + "/") }
+            ?.let { pipeline -> source.path.removePrefix(pipeline.path.trimEnd('/') + "/") }
+            ?: source.name
+        return layers.mapNotNull { layer ->
+            val pipelinePath = resourcePipelinePath(layer) ?: return@mapNotNull null
+            val target = "$pipelinePath/$relative"
+            val file = resourceRoot.findFileByRelativePath(target)
+            ResourceSource(layer, file, resourceRoot, target)
+        }
+    }
+
+    private fun resourcePipelinePath(layer: ResourceLayer): String? {
+        val segments = layer.path.replace('\\', '/').split('/').filter { it.isNotBlank() && it != "." }
+        if (segments.isEmpty() || segments.any { it == ".." || it.contains(':') }) return null
+        return (segments + "pipeline").joinToString("/")
+    }
+
+    fun pipelineRoots(project: Project, file: VirtualFile? = null, environmentId: String = ""): List<VirtualFile> {
         val manifest = manifest(project, file)
         val roots = mutableListOf<VirtualFile>()
         if (manifest != null) {
-            val root = json(manifest)
-            // 不混入不同控制器的附加资源，默认使用 manifest 的第一个资源域。
-            val resource = root?.get("resource")?.takeIf { it.isJsonArray }?.asJsonArray
-                ?.firstOrNull()?.takeIf { it.isJsonObject }?.asJsonObject
-            val paths = resource?.get("path")
-            val values = if (paths?.isJsonArray == true) paths.asJsonArray.toList() else listOfNotNull(paths)
-            values.filter { it.isJsonPrimitive }.forEach { path ->
-                manifest.parent.findFileByRelativePath(path.asString.removePrefix("./") + "/pipeline")?.let(roots::add)
+            resourceLayers(text(manifest), environmentId).forEach { layer ->
+                val path = layer.path
+                manifest.parent.findFileByRelativePath("$path/pipeline")?.let(roots::add)
             }
         }
         val containing = file?.let { generateSequence(it.parent) { parent -> parent.parent }
@@ -45,8 +99,9 @@ internal object PipelineProjectFiles {
         return roots.distinct()
     }
 
-    fun pipelineFiles(project: Project, file: VirtualFile? = null): List<VirtualFile> =
-        pipelineRoots(project, file).flatMap(::jsonFiles).distinct().ifEmpty { listOfNotNull(file) }
+    fun pipelineFiles(project: Project, file: VirtualFile? = null, environmentId: String = ""): List<VirtualFile> =
+        pipelineRoots(project, file, environmentId).flatMap { jsonFiles(it).sortedBy(VirtualFile::getPath) }
+            .distinct().ifEmpty { listOfNotNull(file) }
 
     fun taskFiles(project: Project, file: VirtualFile): List<VirtualFile> {
         val manifest = manifest(project, file)
@@ -111,6 +166,6 @@ internal object PipelineProjectFiles {
     }
 
     private fun json(file: VirtualFile) = runCatching {
-        JsonParser.parseString(text(file)).takeIf { it.isJsonObject }?.asJsonObject
+        PipelineJsonc.parse(text(file)).takeIf { it.isJsonObject }?.asJsonObject
     }.getOrNull()
 }

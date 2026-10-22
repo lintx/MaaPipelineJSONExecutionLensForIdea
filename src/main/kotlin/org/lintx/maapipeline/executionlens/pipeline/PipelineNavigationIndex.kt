@@ -14,7 +14,7 @@ import com.intellij.util.io.EnumeratorStringDescriptor
 
 class PipelineNavigationIndex : FileBasedIndexExtension<String, String>() {
     override fun getName() = NAME
-    override fun getVersion() = 1
+    override fun getVersion() = 3
     override fun dependsOnFileContent() = true
     override fun getKeyDescriptor() = EnumeratorStringDescriptor()
     override fun getValueExternalizer() = EnumeratorStringDescriptor()

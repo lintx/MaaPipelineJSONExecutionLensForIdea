@@ -76,7 +76,7 @@ internal object PipelineOperationEdits {
     }
 
     private fun mergeValue(project: Project, original: String, incoming: String): String {
-        if (runCatching { JsonParser.parseString(original) == JsonParser.parseString(incoming) }.getOrDefault(false)) return original
+        if (runCatching { PipelineJsonc.parse(original) == PipelineJsonc.parse(incoming) }.getOrDefault(false)) return original
         val oldObject = objectValue(project, original)
         val newObject = objectValue(project, incoming)
         if (oldObject != null && newObject != null) {
@@ -120,32 +120,45 @@ internal object PipelineOperationEdits {
         (PsiFileFactory.getInstance(project).createFileFromText("Value.json", JsonFileType.INSTANCE, text) as? JsonFile)?.topLevelValue
 
     fun roiEdit(project: Project, owner: JsonObject, operation: PipelineOperation, key: String,
-        rectangle: java.awt.Rectangle): PipelineTextEdit? {
+        rectangle: java.awt.Rectangle): PipelineTextEdit? = roiValuesEdit(owner, operation, key,
+            listOf(rectangle.x, rectangle.y, rectangle.width, rectangle.height))
+
+    fun roiValuesEdit(owner: JsonObject, operation: PipelineOperation, key: String, values: List<Int>): PipelineTextEdit? {
+        if (values.size !in setOf(2, 4)) return null
         if (PipelineVisualModel.region(operation, key).coordinates == null) return null
-        val offset = PipelineVisualModel.integers(operation.parameters["${key}_offset"]) ?: listOf(0, 0, 0, 0)
-        if (offset.size != 4) return null
-        val values = listOf(rectangle.x, rectangle.y, rectangle.width, rectangle.height).zip(offset) { value, delta -> value - delta }
         val replacement = values.toString()
         if (PipelineVisualModel.region(operation, key).fromComment) {
             val hint = operation.roiHints[key] ?: return null
             val property = owner.parent as? com.intellij.json.psi.JsonProperty
             val raw = property?.let(PipelinePreviewHints::sourceText) ?: owner.text
-            val current = PipelinePreviewHints.read(raw)[hint.path]?.regions?.lastOrNull { (it.key ?: "roi") == key } ?: return null
+            val current = PipelinePreviewHints.read(raw)[hint.path]?.regions?.lastOrNull {
+                (it.key ?: "roi") == key && it.controller.equals(hint.controller, true)
+            } ?: return null
             val start = owner.textRange.startOffset - (raw.length - owner.textLength)
             return PipelineTextEdit(current.range.shiftRight(start), replacement)
         }
-        val path = operation.parameterPaths[key] ?: if (key == "roi" && !operation.isAction) {
+        return regionValueEdit(owner, operation, key, replacement)
+    }
+
+    fun offsetEdit(owner: JsonObject, operation: PipelineOperation, key: String, values: List<Int>): PipelineTextEdit? {
+        if (values.size != 4) return null
+        return regionValueEdit(owner, operation, "${key}_offset", values.toString())
+    }
+
+    private fun regionValueEdit(owner: JsonObject, operation: PipelineOperation, key: String, replacement: String): PipelineTextEdit? {
+        val baseKey = key.removeSuffix("_offset")
+        val path = operation.parameterPaths[key] ?: operation.parameterPaths[baseKey]?.dropLast(1)?.plus(key) ?: run {
             val operationOwner = at(owner, operation.ownerPath) as? JsonObject ?: return null
-            val typed = operationOwner.findProperty("recognition")?.value as? JsonObject
+            val typed = operationOwner.findProperty(if (operation.isAction) "action" else "recognition")?.value as? JsonObject
                 ?: operationOwner.takeIf { it.findProperty("type") != null }
-            val typedPath = if (typed === operationOwner) operation.ownerPath else operation.ownerPath + "recognition"
+            val typedPath = if (typed === operationOwner) operation.ownerPath else operation.ownerPath + if (operation.isAction) "action" else "recognition"
             val param = typed?.findProperty("param")?.value as? JsonObject
             when {
                 param != null -> typedPath + listOf("param", key)
                 typed != null -> typedPath + listOf("param", key)
                 else -> operation.ownerPath + key
             }
-        } else return null
+        }
         val value = at(owner, path)
         if (value != null) return PipelineTextEdit(value.textRange, replacement)
         val container = at(owner, path.dropLast(1)) as? JsonObject

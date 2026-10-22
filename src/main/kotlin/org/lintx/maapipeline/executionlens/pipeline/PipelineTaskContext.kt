@@ -51,7 +51,7 @@ internal data class PipelineTaskDefinitions(
 
 internal object PipelineTaskContext {
     fun parse(text: String): PipelineTaskDefinitions {
-        val root = JsonParser.parseString(text).takeIf { it.isJsonObject }?.asJsonObject
+        val root = PipelineJsonc.parse(text).takeIf { it.isJsonObject }?.asJsonObject
             ?: return PipelineTaskDefinitions(emptyList(), emptyList())
         val tasks = root.getAsJsonArrayOrNull("task")?.mapIndexedNotNull { index, value ->
             val task = value.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapIndexedNotNull null

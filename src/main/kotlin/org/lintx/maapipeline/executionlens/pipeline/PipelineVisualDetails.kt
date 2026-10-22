@@ -28,7 +28,6 @@ import javax.swing.JPanel
 import javax.swing.JTextArea
 import javax.swing.JViewport
 import javax.swing.SwingUtilities
-import javax.swing.text.DefaultCaret
 import javax.swing.text.View
 
 internal fun pipelineActionForeground(): java.awt.Color = JBColor.lazy {
@@ -50,8 +49,10 @@ internal fun pipelineCollapsedSection(title: String, content: JPanel): JComponen
     }
 }
 
-internal class PipelineWrappingLabel(value: String) : JTextArea(value) {
+internal class PipelineWrappingLabel(value: String) : JTextArea() {
     init {
+        caret = PipelineSelectionCaret()
+        text = value
         lineWrap = true
         wrapStyleWord = false
         isEditable = false
@@ -63,8 +64,6 @@ internal class PipelineWrappingLabel(value: String) : JTextArea(value) {
         selectedTextColor = JBColor.namedColor("TextField.selectionForeground", UIUtil.getLabelForeground())
         alignmentX = LEFT_ALIGNMENT
         margin = JBUI.insets(2, 4)
-        // 数据刷新不能让只读文本的光标抢走流程滚动；用户的选择、复制仍由 Swing 处理。
-        (caret as? DefaultCaret)?.updatePolicy = DefaultCaret.NEVER_UPDATE
     }
 
     private fun availableWidth(): Int {
@@ -127,6 +126,7 @@ internal class PipelineVisualDetails(
     private val open: (VirtualFile) -> Unit,
     private val blocked: (VirtualFile) -> Boolean = { false },
     private val defaults: (PipelineNodeLocation?) -> com.google.gson.JsonObject = { com.google.gson.JsonObject() },
+    private val environmentId: String = "",
 ) {
     fun operation(operation: PipelineOperation): JComponent = column().apply { appendOperation(this, operation, 0) }
 
@@ -138,9 +138,7 @@ internal class PipelineVisualDetails(
             property.value?.let { property.name to it }
         }.toMap())
         val title = operation.title + operation.reference?.takeIf { operation.type != "Reference" }?.let { " · $it" }.orEmpty()
-        if (depth > 0) container.add(PipelineWrappingLabel(title).apply {
-            font = font.deriveFont(java.awt.Font.BOLD)
-            if (operation.isAction) foreground = pipelineActionForeground()
+        if (depth > 0) container.add(PipelineStyledText(title).apply {
             toolTipText = if (operation.isAction) PipelineVisualModel.actionHelp(operation)
                 else PipelineVisualModel.fieldHelp("recognition")
         })
@@ -200,18 +198,55 @@ internal class PipelineVisualDetails(
     }
 
     fun referenceImage(node: PipelineNodeLocation, recognition: PipelineOperation, action: PipelineOperation): JComponent? {
-        val path = PipelineVisualModel.preview(node.rawJson) ?: return null
+        val operations = PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
+        val preview = PipelinePreviewHints.preview(node)
+        if (preview == null && !PipelinePreviewModel.hasPreviewRegion(operations, resolve)) {
+            return column().apply {
+                add(PipelineWrappingLabel("暂无可预览区域").apply {
+                    foreground = com.intellij.util.ui.UIUtil.getContextHelpForeground()
+                })
+            }
+        }
+        if (preview == null) return defaultReference(node, recognition, action)
         return column().apply {
-            add(PipelineWrappingLabel("参考图 · $path").apply {
-                toolTipText = "// @preview 路径：参考图应与运行时截图使用相同尺寸。实线表示固定 ROI；虚线表示动态目标的来源搜索区，或 @roi 注释提供的示意范围。"
+            add(PipelineWrappingLabel("参考图 · ${preview.path}").apply {
+                toolTipText = "// @preview [控制器] 路径：参考图应与运行时截图使用相同尺寸。实线表示固定 ROI；虚线表示动态目标的来源搜索区，或 @roi 注释提供的示意范围。"
             })
-            val operations = PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
-            addImage(this, path, node.sourceFile ?: source, true, operations)
+            addImage(this, preview.path, preview.sourceFile ?: node.sourceFile ?: source, true, operations, node)
         }
     }
 
+    private fun defaultReference(node: PipelineNodeLocation, recognition: PipelineOperation, action: PipelineOperation): JComponent {
+        val row = column()
+        val title = PipelineWrappingLabel("默认预览 · 加载中…")
+        row.add(title)
+        val operations = PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val background = PipelinePreviewSettings.getInstance().background(node.sourceFile ?: source)
+            val templates = PipelineVisualAssets.previewTemplates(project, node.sourceFile ?: source, operations, resolve, environmentId)
+            val thumbnail = background?.let { (_, image) -> PipelineVisualAssets.scaled(
+                PipelineVisualAssets.overlay(image, operations, resolve, templatePreviews = templates), JBUI.scale(360), JBUI.scale(190)) }
+            ApplicationManager.getApplication().invokeLater({
+                if (project.isDisposed || row.parent == null) return@invokeLater
+                title.text = if (background == null) "默认预览图片不可用，请检查 MaaPipeline 设置" else "默认预览"
+                if (background != null && thumbnail != null) row.add(JBLabel(ImageIcon(thumbnail)).apply {
+                    toolTipText = "点击查看或编辑 ROI；默认预览可在设置 → 工具 → MaaPipeline 中修改"
+                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    addMouseListener(object : MouseAdapter() {
+                        override fun mouseClicked(event: MouseEvent) {
+                            if (event.button == MouseEvent.BUTTON1) PipelineImagePreview.show(project, node, background.second,
+                                operations, resolve, templates, blocked)
+                        }
+                    })
+                })
+                row.revalidate(); row.repaint()
+            }, ModalityState.nonModal())
+        }
+        return row
+    }
+
     private fun addImage(container: JPanel, path: String, sourceFile: VirtualFile, preview: Boolean,
-        operations: List<PipelineOperation> = emptyList()) {
+        operations: List<PipelineOperation> = emptyList(), node: PipelineNodeLocation? = null) {
         val row = column()
         val label = PipelineWrappingLabel(if (preview) "加载参考图…" else "模板：$path")
         row.add(label)
@@ -219,10 +254,10 @@ internal class PipelineVisualDetails(
         val application = ApplicationManager.getApplication()
         application.executeOnPooledThread {
             val files = ReadAction.compute<List<VirtualFile>, RuntimeException> {
-                if (project.isDisposed) emptyList() else if (preview) listOfNotNull(PipelineVisualAssets.resolve(project, sourceFile, path, true))
-                else PipelineVisualAssets.templates(project, sourceFile, path)
+                if (project.isDisposed) emptyList() else if (preview) listOfNotNull(PipelineVisualAssets.resolve(project, sourceFile, path, true, environmentId))
+                else PipelineVisualAssets.templates(project, sourceFile, path, environmentId)
             }
-            val templatePreviews = if (preview) PipelineVisualAssets.previewTemplates(project, sourceFile, operations, resolve) else emptyMap()
+            val templatePreviews = if (preview) PipelineVisualAssets.previewTemplates(project, sourceFile, operations, resolve, environmentId) else emptyMap()
             val decoded = files.map { file ->
                 val original = PipelineVisualAssets.read(file)
                 val image = original?.let {
@@ -246,7 +281,7 @@ internal class PipelineVisualDetails(
                         addMouseListener(object : MouseAdapter() {
                             override fun mouseClicked(event: MouseEvent) {
                                 if (event.button != MouseEvent.BUTTON1) return
-                                if (popup != null && original != null) PipelineImagePreview.show(project, file, original, operations, resolve, templatePreviews, blocked)
+                                if (popup != null && original != null && node != null) PipelineImagePreview.show(project, node, original, operations, resolve, templatePreviews, blocked)
                                 else open(file)
                             }
                         })

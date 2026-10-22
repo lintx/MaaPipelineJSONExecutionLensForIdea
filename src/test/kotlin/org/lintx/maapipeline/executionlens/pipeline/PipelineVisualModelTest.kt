@@ -5,12 +5,62 @@ import java.awt.Color
 import java.awt.Rectangle
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class PipelineVisualModelTest {
     private fun node(raw: String, name: String = "Test") = PipelineNodeLocation(name, TextRange(0, 1), TextRange(0, 1), rawJson = raw)
+
+    @Test
+    fun defaultPreviewRequiresARegionUnlessAnExplicitPreviewImageExists() {
+        val noRegion = node("""{"action":"Click"}""")
+        val noRegionOperations = listOf(PipelineVisualModel.operation(noRegion), PipelineVisualModel.operation(noRegion, true))
+        assertFalse(PipelinePreviewModel.hasPreviewRegion(noRegionOperations))
+        assertTrue(PipelinePreviewModel.hasPreviewRegion(listOf(PipelineVisualModel.operation(node("""{"recognition":"OCR"}""")))))
+
+        val annotated = node("""{
+            // @roi [10,20,30,40]
+            "recognition":"OCR"
+        }""")
+        assertTrue(PipelinePreviewModel.hasPreviewRegion(listOf(PipelineVisualModel.operation(annotated))))
+        assertTrue(PipelineVisualModel.preview("""{
+            // @preview images/sample.png
+            "recognition":"OCR"
+        }""") != null)
+    }
+
+    @Test
+    fun controllerAnnotationsPreferTheNamedControllerThenItsTypeThenDefaults() {
+        val source = node("""{
+            // @preview adb mobile.png
+            // @preview CloudADB cloud.png
+            // @preview desktop.png
+            // @roi adb [10,20,30,40]
+            // @roi CloudADB [20,30,40,50]
+            // @roi [1,2,3,4]
+            // @roi target [5,6,7,8]
+            // @roi adb target [50,60,70,80]
+            "recognition":"OCR","action":"Click"
+        }""")
+        fun selected(id: String, type: String) = source.copy(environmentId = id, controllerType = type)
+        val mobile = selected("Mobile", "Adb")
+        assertEquals("mobile.png", PipelinePreviewHints.preview(mobile)?.path)
+        assertEquals(listOf(10,20,30,40), PipelineVisualModel.region(PipelineVisualModel.operation(mobile)).coordinates)
+        assertEquals(listOf(50,60,70,80), PipelineVisualModel.region(PipelineVisualModel.operation(mobile, true)).coordinates)
+        val cloud = selected("CloudADB", "Adb")
+        assertEquals("cloud.png", PipelinePreviewHints.preview(cloud)?.path)
+        assertEquals(listOf(20,30,40,50), PipelineVisualModel.region(PipelineVisualModel.operation(cloud)).coordinates)
+        val desktop = selected("Desktop", "Win32")
+        assertEquals("desktop.png", PipelinePreviewHints.preview(desktop)?.path)
+        assertEquals(listOf(1,2,3,4), PipelineVisualModel.region(PipelineVisualModel.operation(desktop)).coordinates)
+        assertEquals(listOf(5,6,7,8), PipelineVisualModel.region(PipelineVisualModel.operation(desktop, true)).coordinates)
+        val nested = source.copy(rawJson = """{"recognition":{"type":"OCR","param":{
+            "roi":[/* @roi [1,2,3,4] */ /* @roi adb [10,20,30,40] */ 0,0,0,0]}}}""",
+            environmentId = "ADB", controllerType = "Adb")
+        assertEquals(listOf(10,20,30,40), PipelineVisualModel.region(PipelineVisualModel.operation(nested)).coordinates)
+    }
 
     @Test
     fun readsV1V2AndReferencedCombinationsWithoutLosingParameters() {
@@ -36,6 +86,54 @@ class PipelineVisualModelTest {
         assertEquals(listOf(5, 5, 5, 5), fixed.coordinates)
         assertEquals(Rectangle(80, 60, 20, 40), PipelineRegionInfo.rectangle(listOf(-20, -40, 0, 0), 100, 100))
         assertEquals(Rectangle(20, 20, 10, 20), PipelineRegionInfo.rectangle(listOf(30, 40, -10, -20), 100, 100))
+    }
+
+    @Test
+    fun negativeSizesUseTheCurrentCornerAndActionOffsetsFollowFrameworkOrder() {
+        fun region(raw: String, action: Boolean = true) = PipelineVisualModel.region(PipelineVisualModel.operation(node(raw), action))
+        val pictured = region("""{"action":"Click","target":[683,411,28,34],"target_offset":[100,100,-56,0]}""")
+        assertEquals(Rectangle(755,511,28,34), pictured.rectangle(1280,720))
+        assertTrue(PipelinePreviewModel.annotations(listOf(PipelineVisualModel.operation(node("""{"action":"Click","target":[683,411,28,34],"target_offset":[100,100,-56,0]}"""), true)))
+            .single().imageLines(pictured.rectangle(1280,720)).contains("target=[755, 511, 28, 34]"))
+        assertEquals(Rectangle(70,40,10,20), PipelineRegionInfo.rectangle(listOf(-20,-40,-10,-20),100,100))
+        assertEquals(Rectangle(65,66,30,12), region("""{"action":"Click","target":[80,70,-20,-10],"target_offset":[5,6,10,2]}""").rectangle(100,100))
+        assertEquals(Rectangle(75,68,10,8), region("""{"recognition":"OCR","roi":[80,70,-20,-10],"roi_offset":[5,6,10,2]}""", false).rectangle(100,100))
+        assertEquals(Rectangle(0,0,10,10), region("""{"action":"Click","target":[20,20,10,10],"target_offset":[-30,-40,0,0]}""").rectangle(100,100))
+        assertEquals(Rectangle(90,80,10,10), region("""{"recognition":"OCR","roi":[20,20,10,10],"roi_offset":[-30,-40,0,0]}""", false).rectangle(100,100))
+        assertEquals(Rectangle(10,20,90,80), region("""{"action":"Click","target":[0,0,0,0],"target_offset":[10,20,-10,-20]}""").rectangle(100,100))
+        assertNull(region("""{"action":"Click","target":[10,10,20,20],"target_offset":[0,0,-20,0]}""").rectangle(100,100))
+        assertEquals(Rectangle(11,22,4,5), region("""{"action":"Click","target":[10,20],"target_offset":[1,2,3,4]}""").rectangle(100,100))
+    }
+
+    @Test
+    fun comparesOriginalAndFinalOffsetRegionsWithoutAddingSemanticTargets() {
+        val operation = PipelineVisualModel.operation(node("""{
+            // @roi [10,20,30,40]
+            "recognition":"OCR","roi":[1,2,3,4],"roi_offset":[20,10,5,6]
+        }"""))
+        val annotation = PipelinePreviewModel.annotations(listOf(operation)).single()
+        assertEquals(listOf(10, 20, 30, 40), annotation.region.originalCoordinates)
+        assertEquals(listOf(30, 30, 35, 46), annotation.region.coordinates)
+        val regions = PipelineVisualAssets.overlayRegions(100, 100, listOf(operation))
+        assertEquals(listOf(Rectangle(10, 20, 30, 40), Rectangle(30, 30, 35, 46)), regions.map { it.rectangle })
+        assertEquals(listOf(true, false), regions.map { it.dashed })
+        assertEquals(listOf(1, 1), regions.flatMap { it.annotations }.map { it.number })
+
+        val zero = operation.copy(parameters = operation.parameters +
+            ("roi_offset" to com.google.gson.JsonParser.parseString("[0,0,0,0]")))
+        val merged = PipelineVisualAssets.overlayRegions(100, 100, listOf(zero)).single()
+        assertEquals(1, merged.annotations.size)
+        assertEquals(2, merged.marks.size)
+        assertTrue(!merged.dashed)
+        val clipped = operation.copy(parameters = operation.parameters +
+            ("roi_offset" to com.google.gson.JsonParser.parseString("[-20,-30,0,0]")))
+        assertEquals(2, PipelineVisualAssets.overlayRegions(100, 100, listOf(clipped)).size)
+
+        val simulated = operation.copy(simulatedRegions = mapOf("roi" to listOf(30, 30, 35, 46)))
+        assertEquals(annotation.region.coordinates, PipelineVisualModel.region(simulated).coordinates)
+        assertEquals(annotation.region.originalCoordinates, PipelineVisualModel.region(simulated).originalCoordinates)
+        val defaultRoi = operation.copy(parameters = mapOf("roi_offset" to com.google.gson.JsonParser.parseString("[10,20,-10,-20]")), roiHints = emptyMap())
+        assertEquals(listOf(0, 0, 0, 0), PipelineVisualModel.region(defaultRoi).originalCoordinates)
     }
 
     @Test

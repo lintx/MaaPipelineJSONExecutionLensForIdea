@@ -6,7 +6,7 @@ import java.nio.charset.StandardCharsets
 
 internal object PipelineFileDetector {
     private val pipelineExtensions = setOf("json", "jsonc")
-    private val pipelineDirectoryMarker = "/assets/resource/pipeline/"
+    private val pipelineDirectoryMarker = "/pipeline/"
     private val pipelineFields = setOf("recognition", "action", "next", "on_error", "anchor")
 
     fun isPipelineFile(file: VirtualFile): Boolean {
@@ -25,7 +25,7 @@ internal object PipelineFileDetector {
         if (normalizedPath.contains(pipelineDirectoryMarker, ignoreCase = true)) return true
         // 目录外只识别节点对象的直接字段，不能把任务覆盖、注释或普通字符串当成 Pipeline。
         return runCatching {
-            val root = JsonParser.parseString(text).takeIf { it.isJsonObject }?.asJsonObject
+            val root = PipelineJsonc.parse(text).takeIf { it.isJsonObject }?.asJsonObject
                 ?: return@runCatching false
             root.entrySet().any { (_, value) ->
                 value.isJsonObject && value.asJsonObject.entrySet().any { (name, field) ->

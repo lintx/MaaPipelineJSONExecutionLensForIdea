@@ -26,6 +26,8 @@ class PipelineReadingState {
     var sourceOffset: Int = 0
     var applyOverrides: Boolean = true
     var nodeBudget: Int = 200
+    var environmentId: String = "Win32"
+    var temporaryOverrides: String = "{}"
 }
 
 class PipelineWorkspaceStorage {

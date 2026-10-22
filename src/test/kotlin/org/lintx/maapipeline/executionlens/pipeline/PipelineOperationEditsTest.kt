@@ -6,6 +6,19 @@ import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Rectangle
 
 class PipelineOperationEditsTest : BasePlatformTestCase() {
+    fun testObjectReferenceEditsKeepFlagsCommentsAndUseWholeObjectForDeletion() {
+        val text = """{"A":{"next":[{"name":"B",/* preserve */"jump_back":true,"anchor":true}]},"B":{"action":"Click"}}"""
+        val file = myFixture.addFileToProject("assets/resource/pipeline/References.json", text).virtualFile
+        val reference = PipelineDocumentIndexer.index(project, file).nodes.single { it.name == "A" }.next.single()
+        val edit = PipelineReferenceEdits.edit(project, text, reference, "B")!!
+        val updated = edit.applyTo(text)
+        assertTrue(updated.contains("/* preserve */"))
+        assertTrue(updated.contains("\"jump_back\":false"))
+        assertTrue(updated.contains("\"anchor\":false"))
+        val range = PipelineReferenceEdits.range(project, text, reference)
+        assertTrue(text.substring(range.startOffset, range.endOffset).startsWith("{\"name\""))
+        assertNotNull(PipelineOperationEdits.objectValue(project, updated))
+    }
     fun testPreviewHintsKeepTheirScopeAndEditingAHintNeverReplacesRuntimeParameters() {
         val text = """
             {"A"
@@ -28,7 +41,7 @@ class PipelineOperationEditsTest : BasePlatformTestCase() {
         assertEquals("images/example.png", PipelineVisualModel.preview(raw))
         val recognition = PipelineVisualModel.operation(node)
         assertEquals(listOf(10, 20, 30, 40), PipelineVisualModel.region(recognition.children[0]).coordinates)
-        assertEquals(listOf(5, 6, 7, 8), PipelineVisualModel.region(recognition.children[1]).coordinates)
+        assertEquals(listOf(90, 90, 90, 90), PipelineVisualModel.region(recognition.children[1]).coordinates)
         val action = PipelineVisualModel.operation(node, true)
         assertEquals(listOf(40, 50, 60, 70), PipelineVisualModel.region(action).coordinates)
         val edit = PipelineOperationEdits.roiEdit(project, owner, recognition.children[0], "roi", Rectangle(21,22,23,24))!!
@@ -81,7 +94,7 @@ class PipelineOperationEditsTest : BasePlatformTestCase() {
         assertNotNull(PipelineOperationEdits.validateFragment(project, """{"next":["Wrong"]}""", false))
     }
 
-    fun testRoiWritesTheSecondNestedConditionAndReversesOffset() {
+    fun testRoiWritesTheSecondNestedConditionAndPreservesOffset() {
         val text = """{"A":{"recognition":{"type":"And","param":{"all_of":[{"recognition":"OCR","roi":[1,2,3,4]}, {"type":"TemplateMatch","param":{"roi":[10,20,30,40],"roi_offset":[2,3,4,5]}}]}},"action":"Click"}}"""
         val owner = PipelineOperationEdits.objectValue(project, text)!!.findProperty("A")!!.value as JsonObject
         val node = PipelineNodeLocation("A", TextRange(0, 1), TextRange(0, text.length), rawJson = owner.text)
@@ -90,7 +103,7 @@ class PipelineOperationEditsTest : BasePlatformTestCase() {
         val edit = PipelineOperationEdits.roiEdit(project, owner, operation, "roi", Rectangle(50,60,70,80))!!
         val result = edit.applyTo(text)
         assertTrue(result.contains("\"roi\":[1,2,3,4]"))
-        assertTrue(result.contains("[48, 57, 66, 75]"))
+        assertTrue(result.contains("[50, 60, 70, 80]"))
         assertTrue(result.contains("\"roi_offset\":[2,3,4,5]"))
         val action = PipelineVisualModel.operation(node, true)
         assertNull(PipelineOperationEdits.roiEdit(project, owner, action, "target", Rectangle(1,2,3,4)))
