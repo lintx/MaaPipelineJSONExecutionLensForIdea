@@ -62,6 +62,8 @@ internal class PipelineImagePreview(
     private val status = JBLabel()
     // 显示筛选与编辑目标独立；切换可见区域时保留尚未应用的编辑框。
     private var editingNumber: Int? = null
+    private var editingOffset = false
+    private var offsetBase: List<Int>? = null
     private val editing: Boolean get() = editingNumber != null
     private var changed = false
     internal var region: Rectangle? = null
@@ -117,7 +119,7 @@ internal class PipelineImagePreview(
                 val bounds = screenRectangle(rectangle)
                 val pen = graphics.create() as Graphics2D
                 try {
-                    PipelineVisualAssets.drawRoiFrame(pen, bounds, (editingNumber ?: 1) - 1, original = true,
+                    PipelineVisualAssets.drawRoiFrame(pen, bounds, (editingNumber ?: 1) - 1, original = !editingOffset,
                         dashed = true, PipelinePreviewSettings.lineWidth())
                     pen.color = JBColor.BLUE
                     PipelineRoiGesture.handles(bounds).forEach { point -> pen.fillRect(point.x - 3, point.y - 3, 7, 7) }
@@ -147,12 +149,13 @@ internal class PipelineImagePreview(
                     val left = moved.x + if (reverseX) moved.width else 0
                     val top = moved.y + if (reverseY) moved.height else 0
                     // 拖动保留原有的右/下边缘参照和负尺寸方向；数值输入则原样保存。
-                    regionValues = listOf(left - if (basis.getOrElse(0) { 0 } < 0) original.width else 0,
-                        top - if (basis.getOrElse(1) { 0 } < 0) original.height else 0,
+                    val edgeRelative = !editingOffset || editingAnnotation()?.operation?.isAction != true
+                    regionValues = listOf(left - if (edgeRelative && basis.getOrElse(0) { 0 } < 0) original.width else 0,
+                        top - if (edgeRelative && basis.getOrElse(1) { 0 } < 0) original.height else 0,
                         if (reverseX) -moved.width else if (basis.getOrElse(2) { 1 } == 0 && moved.x + moved.width == original.width) 0 else moved.width,
                         if (reverseY) -moved.height else if (basis.getOrElse(3) { 1 } == 0 && moved.y + moved.height == original.height) 0 else moved.height)
                     region = moved; changed = true
-                    status.text = "原始 ${editingAnnotation()?.key} = $regionValues"
+                    status.text = if (editingOffset) "${editingAnnotation()?.key}_offset = ${offsetValues()}" else "原始 ${editingAnnotation()?.key} = $regionValues"
                     apply.isEnabled = true; updateImage(); return
                 }
                 val start = panStart ?: return
@@ -195,7 +198,8 @@ internal class PipelineImagePreview(
         val zoom = viewer.zoomModel.zoomFactor
         picture.document.setValue(if (displayOperations.isEmpty()) original else
             PipelineVisualAssets.overlay(original, displayOperations, resolve, selected()?.number, templates,
-                excludedAnnotation = editingNumber, originalDraft = regionValues))
+                excludedAnnotation = editingNumber, originalDraft = regionValues.takeUnless { editingOffset },
+                finalDraft = regionValues.takeIf { editingOffset }))
         viewer.zoomModel.zoomFactor = zoom
         positionButtons()
         picture.repaint()
@@ -205,6 +209,7 @@ internal class PipelineImagePreview(
         if (editing) return
         val annotation = annotations.firstOrNull { it.number == number } ?: return
         if (roiSession?.unavailable(annotation) != null || roiSession == null) return
+        editingOffset = false
         regionValues = annotation.region.originalCoordinates ?: annotation.region.coordinates ?: return
         editBasis = regionValues
         region = originalRectangle(annotation)
@@ -213,7 +218,8 @@ internal class PipelineImagePreview(
     }
 
     internal fun stopEditing() {
-        editingNumber = null; changed = false; region = null; regionValues = null; editBasis = null; gesture = null
+        editingNumber = null; editingOffset = false; offsetBase = null
+        changed = false; region = null; regionValues = null; editBasis = null; gesture = null
         updateImage(); updateControls()
     }
 
@@ -223,7 +229,10 @@ internal class PipelineImagePreview(
         apply.isVisible = editingVisible(); apply.isEnabled = changed
         cancel.isVisible = editingVisible()
         numeric.isVisible = editingVisible()
-        status.text = if (editing) "调整原始 ROI；offset 保持不变" else reason.orEmpty()
+        status.text = if (editingOffset) "拖动或拉框调整最终 ROI；仅写入 offset，原始 ROI 保持不变"
+            else if (editing) "调整原始 ROI；offset 保持不变" else reason.orEmpty()
+        apply.toolTipText = if (editingOffset) "应用 offset（保留原始 ROI）" else "应用原始 ROI（保留 offset）"
+        numeric.toolTipText = if (editingOffset) "输入最终 ROI 坐标并计算 offset" else "输入原始 ROI 坐标"
         picture.cursor = Cursor.getPredefinedCursor(if (editingVisible()) Cursor.CROSSHAIR_CURSOR else Cursor.HAND_CURSOR)
         positionButtons()
     }
@@ -288,38 +297,47 @@ internal class PipelineImagePreview(
     private fun editCoordinates() {
         val current = regionValues ?: return
         val input = com.intellij.openapi.ui.Messages.showInputDialog(project,
-            "x, y, width, height（支持负数；宽高为 0 表示延伸至边缘）", "原始 ROI 坐标", null,
+            "x, y, width, height（支持负数；宽高为 0 表示延伸至边缘）", if (editingOffset) "最终 ROI 坐标" else "原始 ROI 坐标", null,
             current.joinToString(", "),
             object : com.intellij.openapi.ui.InputValidator {
                 override fun checkInput(inputString: String): Boolean {
                     val parts = inputString.trim().removeSurrounding("[", "]").split(',')
-                    return parts.size in setOf(2, 4) && parts.all { it.trim().toIntOrNull() != null }
+                    return parts.size in (if (editingOffset) setOf(4) else setOf(2, 4)) && parts.all { it.trim().toIntOrNull() != null }
                 }
                 override fun canClose(inputString: String) = checkInput(inputString)
             }) ?: return
         val values = input.trim().removeSurrounding("[", "]").split(',').map { it.trim().toInt() }
         regionValues = values; editBasis = values
-        region = PipelineRegionInfo.rectangle(values, original.width, original.height); changed = true
-        status.text = "原始 ${editingAnnotation()?.key} = $values" + if (region == null) "（当前画布内无可见区域）" else ""
+        region = if (editingOffset && editingAnnotation()?.operation?.isAction == true) {
+            editingAnnotation()?.region?.copy(originalCoordinates = offsetBase, coordinateOffset = offsetValues())?.rectangle(original.width, original.height)
+        } else PipelineRegionInfo.rectangle(values, original.width, original.height)
+        changed = true
+        status.text = (if (editingOffset) "${editingAnnotation()?.key}_offset = ${offsetValues()}" else "原始 ${editingAnnotation()?.key} = $values") +
+            if (region == null) "（当前画布内无可见区域）" else ""
         apply.isEnabled = true; updateImage()
     }
 
-    private fun editOffset(number: Int) {
+    internal fun editOffset(number: Int) {
         val annotation = annotations.firstOrNull { it.number == number } ?: return
         if (editing || roiSession == null || roiSession.unavailable(annotation, offset = true) != null) return
-        val current = PipelineVisualModel.integers(annotation.operation.parameters["${annotation.key}_offset"]) ?: listOf(0, 0, 0, 0)
-        fun values(text: String): List<Int>? {
-            val parts = text.trim().removeSurrounding("[", "]").split(',')
-            if (parts.size != 4) return null
-            return parts.map { it.trim().toIntOrNull() ?: return null }
-        }
-        val input = com.intellij.openapi.ui.Messages.showInputDialog(project,
-            "Δx, Δy, Δwidth, Δheight（可为负数）", "${annotation.key}_offset", null, current.joinToString(", "),
-            object : com.intellij.openapi.ui.InputValidator {
-                override fun checkInput(inputString: String): Boolean = values(inputString) != null
-                override fun canClose(inputString: String): Boolean = checkInput(inputString)
-            }) ?: return
-        if (roiSession.applyOffset(annotation, values(input) ?: return)) refreshOperations()
+        val values = annotation.region.originalCoordinates ?: annotation.region.coordinates ?: return
+        val base = if (values.size == 2) values + listOf(1, 1) else values
+        // 动作先解析原始目标框再应用偏移；识别 ROI 则先逐分量相加再解析负坐标。
+        offsetBase = if (annotation.operation.isAction) PipelineRegionInfo.normalized(base, original.width, original.height) else base
+        val origin = offsetBase ?: return
+        val delta = PipelineVisualModel.integers(annotation.operation.parameters["${annotation.key}_offset"]) ?: listOf(0, 0, 0, 0)
+        regionValues = origin.zip(delta) { value, shift -> value + shift }
+        editBasis = regionValues
+        editingOffset = true
+        editingNumber = number
+        changed = false
+        region = annotation.region.rectangle(original.width, original.height)
+        updateImage(); updateControls()
+    }
+
+    private fun offsetValues(): List<Int>? {
+        val base = offsetBase ?: return null
+        return regionValues?.zip(base) { value, origin -> value - origin }
     }
 
     private fun refreshOperations() {
@@ -331,7 +349,9 @@ internal class PipelineImagePreview(
     private fun applyRegion() {
         val annotation = editingAnnotation() ?: return
         val values = regionValues ?: return
-        if (!changed || roiSession?.apply(annotation, values) != true) return
+        if (!changed) return
+        val applied = if (editingOffset) offsetValues()?.let { roiSession?.applyOffset(annotation, it) } else roiSession?.apply(annotation, values)
+        if (applied != true) return
         refreshOperations()
     }
 

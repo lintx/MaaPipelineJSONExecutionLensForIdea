@@ -31,7 +31,8 @@ internal class PipelineFileEditor(private val project: Project, private val file
     init {
         Disposer.register(this, source)
         ReadAction.nonBlocking<VirtualFile?> {
-            workspace.requestedFile
+            (file as? PipelineWorkspaceFile)?.nodeRequest?.first?.let { VirtualFileManager.getInstance().findFileByUrl(it) }
+                ?: workspace.requestedFile
                 ?: VirtualFileManager.getInstance().findFileByUrl(workspace.data.lastSourceUrl)
                     ?.takeIf { it.isValid && PipelineFileDetector.isPipelineFile(it) }
                 ?: PipelineProjectFiles.pipelineFiles(project).firstOrNull()
@@ -41,7 +42,7 @@ internal class PipelineFileEditor(private val project: Project, private val file
             if (seed == null) {
                 component.add(JBLabel("未找到 Pipeline。可在 Pipeline JSON 中右键选择“从此处查看流程”。"))
             } else {
-                val panel = PipelineFlowPanel(project, seed, source.editorFor(seed).editor, source, workspace)
+                val panel = PipelineFlowPanel(project, seed, source.editorFor(seed).editor, source, workspace, file as? PipelineWorkspaceFile)
                 flow = panel
                 Disposer.register(this, panel)
                 component.add(panel, BorderLayout.CENTER)
@@ -54,7 +55,8 @@ internal class PipelineFileEditor(private val project: Project, private val file
 
     internal fun acceptSourceRequest() {
         val panel = flow ?: return
-        workspace.requestedFile?.let { panel.openFromSource(it, workspace.requestedOffset) }
+        if ((file as? PipelineWorkspaceFile)?.nodeRequest == null)
+            workspace.requestedFile?.let { panel.openFromSource(it, workspace.requestedOffset) }
     }
 
     override fun getComponent(): JComponent = component

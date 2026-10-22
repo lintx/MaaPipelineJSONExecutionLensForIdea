@@ -241,17 +241,28 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             environment.selectedItem = (0 until environment.itemCount).map { environment.getItemAt(it) }
                 .single { (it as PipelineEnvironment).id == "ADB" }
             PlatformTestUtil.waitWithEventsDispatching("控制器切换未应用到工作区", { current().environmentId == "ADB" && ready() }, 30)
-            val selector = descendants(panel).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
-            val search = field("nodeSearch").get(panel) as com.intellij.ui.SearchTextField
-            search.text = "移动端终点"
-            assertEquals(1, selector.itemCount)
-            assertEquals("Left", (selector.getItemAt(0) as PipelineNodeLocation).name)
-            search.text = "Shared"
-            assertEquals(1, selector.itemCount)
-            assertEquals("Shared", (selector.getItemAt(0) as PipelineNodeLocation).name)
-            search.text = ""
+            val popup = PipelineFlowPanel::class.java.getDeclaredMethod("nodeChooser").apply { isAccessible = true }
+                .invoke(panel) as com.intellij.openapi.ui.popup.JBPopup
+            try {
+                val search = descendants(popup.content).filterIsInstance<com.intellij.ui.SearchTextField>().single()
+                assertTrue("搜索框应始终可见", search.isVisible)
+                val list = descendants(popup.content).filterIsInstance<javax.swing.JList<*>>().single()
+                val filtered = descendants(popup.content).filterIsInstance<com.intellij.ui.speedSearch.ListWithFilter<*>>().single()
+                search.text = "移动端终点"
+                filtered.speedSearch.updatePattern(search.text)
+                filtered.speedSearch.update()
+                com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+                assertEquals(1, list.model.size)
+                assertEquals("Left", (list.model.getElementAt(0) as PipelineNodeLocation).name)
+                search.text = "Shared"
+                filtered.speedSearch.updatePattern(search.text)
+                filtered.speedSearch.update()
+                com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+                assertEquals(1, list.model.size)
+                assertEquals("Shared", (list.model.getElementAt(0) as PipelineNodeLocation).name)
+            } finally { com.intellij.openapi.util.Disposer.dispose(popup) }
             val shared = current().projectNodes.single { it.name == "Shared" }
-            selector.selectedItem = shared
+            selectDetailNode(panel, "Shared")
             val logic = field("logicPanel").get(panel) as PipelineRowsPanel
             val components = logic.components.toList()
             assertTrue(logic.findRows("共享终点").isNotEmpty())
@@ -289,6 +300,21 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 .apply { isAccessible = true }.invoke(panel, patch.file, patch.range)
             assertTrue(manager.isFileOpen(overlay))
             assertTrue(manager.openFiles.toSet().containsAll(nativeTabs))
+            val taskContext = workspace.data.lastContext
+            workspace.openNode(shared, "ADB")
+            val separate = manager.openFiles.filterIsInstance<PipelineWorkspaceFile>().single { it.nodeContext != null }
+            try {
+                assertSame(separate, com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(separate.url))
+                val editor = manager.getEditors(separate).filterIsInstance<PipelineFileEditor>().single()
+                PlatformTestUtil.waitWithEventsDispatching("独立节点标签未恢复", {
+                    descendants(editor.component).filterIsInstance<PipelineFlowPanel>().any {
+                        val root = PipelineFlowPanel::class.java.getDeclaredMethod("currentRoot").apply { isAccessible = true }.invoke(it) as? PipelineNodeLocation
+                        root?.name == "Shared"
+                    }
+                }, 30)
+                assertEquals("独立标签不能改变原任务上下文", taskContext, workspace.data.lastContext)
+                assertNotNull(field("selectedEntry").get(panel))
+            } finally { manager.closeFile(separate) }
         } finally { manager.closeFile(workspace.file) }
         workspace.open()
         try {
@@ -355,9 +381,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             runs(logic).single { it.toolTipText.contains("next → Left") }.doClick()
             assertEquals("Left", cursor().frame?.nodeName)
             toolbar.seek(1)
-            val selector = field("nodeSelector").get(panel) as JComboBox<*>
-            selector.selectedItem = (0 until selector.itemCount).map(selector::getItemAt)
-                .single { (it as PipelineNodeLocation).name == "Right" }
+            selectDetailNode(panel, "Right")
             runs(details).single().doClick()
             assertEquals("Right", cursor().frame?.nodeName)
             assertEquals("从历史分岔后应丢弃旧路径", 3, cursor().size)
@@ -409,9 +433,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 .apply { isAccessible = true }.invoke(panel, false)
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals("同节点刷新保留阅读位置", 180, scroll.viewport.viewPosition.y)
-            val selector = field("nodeSelector") as JComboBox<*>
-            selector.selectedItem = (0 until selector.itemCount).map(selector::getItemAt)
-                .single { (it as PipelineNodeLocation).name == "Child" }
+            selectDetailNode(panel, "Child")
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals("切节点应回到开头", 0, scroll.viewport.viewPosition.y)
             moveDown()
@@ -419,9 +441,20 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             tabs.selectedIndex = 1
             tabs.selectedIndex = 0
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
-            assertEquals("切回详情应回到开头", 0, scroll.viewport.viewPosition.y)
+            assertEquals("同节点切换视图应保留阅读位置", 180, scroll.viewport.viewPosition.y)
         } finally { manager.closeFile(workspace.file) }
     }
+
+    private fun selectDetailNode(panel: PipelineFlowPanel, name: String) {
+        val model = PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }.get(panel) as PipelineDocumentModel
+        PipelineFlowPanel::class.java.getDeclaredMethod("inspectNode", PipelineNodeLocation::class.java, Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(panel, model.projectNodes.single { it.name == name }, true)
+    }
+
+    private fun selectedDetailIn(component: Component): PipelineNodeLocation? =
+        descendants(component).filterIsInstance<PipelineFlowPanel>().firstOrNull()?.let { panel ->
+            PipelineFlowPanel::class.java.getDeclaredMethod("selectedDetail").apply { isAccessible = true }.invoke(panel) as? PipelineNodeLocation
+        }
 
     fun testMissingControllerOverlayCanBeDeclinedOrCreatedAsNodeOnlyJson() {
         val file = fixture(maaEnd = false)
@@ -904,6 +937,20 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals(1, labels().count { it.text == "CHILD_BODY" })
             toggle()
             assertEquals(2, labels().count { it.text == "CHILD_BODY" })
+            fun invoke(name: String) = PipelineFlowPanel::class.java.getDeclaredMethod(name).apply { isAccessible = true }.invoke(panel)
+            invoke("startSimulation")
+            val simulationField = PipelineFlowPanel::class.java.getDeclaredField("simulation").apply { isAccessible = true }
+            val simulation = simulationField.get(panel) as PipelineSimulation
+            PipelineFlowPanel::class.java.getDeclaredMethod("advanceSimulation", PipelineSimulationChoice::class.java)
+                .apply { isAccessible = true }.invoke(panel, simulation.choices(0).single { it.node?.name == "Caller" })
+            val step = PipelineFlowPanel::class.java.getDeclaredMethod("chooseSimulationStep", Boolean::class.javaPrimitiveType).apply { isAccessible = true }
+            repeat(4) { step.invoke(panel, false) }
+            assertEquals("Caller", simulation.frames.last().node.name)
+            assertEquals("父流程进入 next 后应收起已完成 subtask", 1, labels().count { it.text == "CHILD_BODY" })
+            val fold = descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.toolTipText == "展开 subtask" }
+            fold.doClick()
+            assertEquals(2, labels().count { it.text == "CHILD_BODY" })
+            invoke("stopSimulation")
         } finally { manager.closeFile(workspace.file) }
     }
 
@@ -921,7 +968,11 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             PlatformTestUtil.waitWithEventsDispatching("工作区尚未加载", {
-                descendants(host.component).filterIsInstance<JComboBox<*>>().any { it.itemCount > 0 }
+                descendants(host.component).filterIsInstance<PipelineFlowPanel>().any { panel ->
+                    val current = PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }
+                        .get(panel) as PipelineDocumentModel
+                    current.indexedVersions.containsKey(remote)
+                }
             }, 30)
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
             val catalog = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, seed) }
@@ -943,20 +994,6 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             }
             assertFalse(components.filterIsInstance<javax.swing.JComponent>().any { it.toolTipText?.contains("来自其它文件") == true })
             val source = components.filterIsInstance<PipelineWorkspaceSource>().single()
-            val seedDocument = source.editorFor(seed).editor.document
-            val seedText = seedDocument.text
-            val remoteEditor = source.editorFor(remote)
-            val remoteDocument = remoteEditor.editor.document
-            val remoteText = remoteDocument.text
-            val marker = components.filterIsInstance<javax.swing.JToggleButton>().first { it.text == "回" }
-            assertTrue(marker.isEnabled)
-            val previous = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.YES }
-            try { marker.doClick() } finally { com.intellij.openapi.ui.TestDialogManager.setTestDialog(previous) }
-            assertTrue(remoteDocument.text.contains("[JumpBack]Done"))
-            assertEquals(seedText, seedDocument.text)
-            assertTrue(UndoManager.getInstance(project).isUndoAvailable(remoteEditor))
-            UndoManager.getInstance(project).undo(remoteEditor)
-            assertEquals(remoteText, remoteDocument.text)
             val embeddedBefore = source.currentFile
             val psi = ReadAction.compute<com.intellij.psi.PsiFile?, RuntimeException> {
                 com.intellij.psi.PsiManager.getInstance(project).findFile(remote)
@@ -1219,7 +1256,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         PlatformTestUtil.waitWithEventsDispatching("源码未恢复", {
             descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().any { it.currentFile == file }
         }, 30)
-        val selector = descendants(host.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
+        val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
         val source = descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().single()
         com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
         val textEditor = source.editorFor(file).editor
@@ -1235,7 +1272,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         })
         val expectedCaret = textEditor.caretModel.offset
         PlatformTestUtil.waitWithEventsDispatching("多文件变更没有合并同步", {
-            val nodes = (0 until selector.model.size).map { selector.model.getElementAt(it) as PipelineNodeLocation }
+            val nodes = (PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }.get(panel) as PipelineDocumentModel).projectNodes
             nodes.any { it.name == "Start" && it.rawJson.contains("\"OCR\"") } &&
                 nodes.any { it.name == "Helper" && it.rawJson.contains("after") }
         }, 30)
@@ -1244,7 +1281,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         println("双文档编辑到视图更新：${(System.nanoTime() - started) / 1_000_000}ms（测试夹具，含提交、合并等待与 UI 回调）")
         assertEquals(file, source.currentFile)
         assertEquals(expectedCaret, textEditor.caretModel.offset)
-        assertEquals("Child", (selector.selectedItem as PipelineNodeLocation).name)
+        assertEquals("Child", selectedDetailIn(panel)?.name)
         manager.closeFile(workspace.file)
     }
 
@@ -1330,7 +1367,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("工作区没有恢复", {
-            descendants(host.component).filterIsInstance<JComboBox<*>>().any { (it.selectedItem as? PipelineNodeLocation)?.name == "Child" }
+            selectedDetailIn(host.component)?.name == "Child"
         }, 30)
         val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
         val tabs = descendants(panel).filterIsInstance<JTabbedPane>().single { it.name == "pipeline-detail-tabs" }
@@ -1358,13 +1395,13 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         assertEquals(other.stableId, workspace.data.lastContext)
         panel.activateTask(transfer)
         PlatformTestUtil.waitWithEventsDispatching("任务阅读状态丢失", {
-            descendants(panel).filterIsInstance<JComboBox<*>>().any { (it.selectedItem as? PipelineNodeLocation)?.name == "Child" }
+            selectedDetailIn(panel)?.name == "Child"
         }, 30)
         manager.closeFile(workspace.file)
         workspace.open()
         PlatformTestUtil.waitWithEventsDispatching("重新打开工作区没有恢复选择", {
             manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().any { editor ->
-                descendants(editor.component).filterIsInstance<JComboBox<*>>().any { (it.selectedItem as? PipelineNodeLocation)?.name == "Child" }
+                selectedDetailIn(editor.component)?.name == "Child"
             }
         }, 30)
         manager.closeFile(workspace.file)
@@ -1436,7 +1473,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertTrue(descendants(logic).filterIsInstance<javax.swing.JToggleButton>().none { it.text in setOf("回", "锚") })
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text == "↩ 回到此层" }.doClick()
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
-            assertEquals("Start", (descendants(host.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem as PipelineNodeLocation).name)
+            assertEquals("Start", selectedDetailIn(host.component)?.name)
         } finally {
             if (attach) logic.removeNotify()
             manager.closeFile(workspace.file)
@@ -1464,9 +1501,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.open()
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
-        val selector = descendants(panel).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
-            workspace.reading(entry.stableId).rootNode.endsWith("#Start") && selector.selectedItem != null
+            workspace.reading(entry.stableId).rootNode.endsWith("#Start") && selectedDetailIn(panel) != null
         }, 30)
         val logic = descendants(panel).filterIsInstance<PipelineRowsPanel>().single()
         val viewport = logic.parent as javax.swing.JViewport
@@ -1486,7 +1522,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             textEditor.caretModel.moveToOffset(child.nameRange.startOffset)
             repeat(8) { textEditor.caretModel.moveToOffset(child.nameRange.startOffset + it % 3) }
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
-            assertEquals("Child", (selector.selectedItem as PipelineNodeLocation).name)
+            assertEquals("Child", selectedDetailIn(panel)?.name)
             assertEquals(originalRows, logic.components.toList())
             assertEquals(originalDetails, textComponents(tabs.getComponentAt(0)))
             tabs.selectedIndex = 0
@@ -1495,7 +1531,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             })
             assertEquals(originalRows, logic.components.toList())
 
-            val previousModel = selector.model
+            val modelField = PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }
+            val previousModel = modelField.get(panel)
             val document = ReadAction.compute<com.intellij.openapi.editor.Document?, RuntimeException> {
                 FileDocumentManager.getInstance().getDocument(unrelated)
             }!!
@@ -1503,14 +1540,14 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 val start = document.text.indexOf("before")
                 document.replaceString(start, start + 6, "after")
             })
-            PlatformTestUtil.waitWithEventsDispatching("无关文件修改未索引", { selector.model !== previousModel }, 30)
+            PlatformTestUtil.waitWithEventsDispatching("无关文件修改未索引", { modelField.get(panel) !== previousModel }, 30)
             com.intellij.openapi.application.impl.NonBlockingReadActionImpl.waitForAsyncTaskCompletion()
             PlatformTestUtil.waitWithEventsDispatching("更新后流程尚未就绪", {
                 textComponents(logic).any { it.text.contains("Start") }
             }, 30)
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals(originalRows, logic.components.toList())
-            val updated = (0 until selector.model.size).map { selector.model.getElementAt(it) as PipelineNodeLocation }
+            val updated = (modelField.get(panel) as PipelineDocumentModel).projectNodes
                 .single { it.name == "Unrelated" }
             assertTrue(updated.rawJson.contains("after"))
         } finally {
@@ -1533,13 +1570,13 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             }, 30)
             return host
         }
-        assertNull(descendants(readyHost().component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem)
+        assertNull(selectedDetailIn(readyHost().component))
         assertEquals("", workspace.data.lastContext)
         manager.closeFile(workspace.file)
         workspace.data.lastContext = "${file.url}#task:Removed"
         workspace.open()
         val restored = readyHost()
-        assertNull(descendants(restored.component).filterIsInstance<JComboBox<*>>().single { it.name == "pipeline-node-selector" }.selectedItem)
+        assertNull(selectedDetailIn(restored.component))
         assertTrue(textComponents(restored.component).any { it.text.contains("上次任务或流程已不存在") })
         manager.closeFile(workspace.file)
     }

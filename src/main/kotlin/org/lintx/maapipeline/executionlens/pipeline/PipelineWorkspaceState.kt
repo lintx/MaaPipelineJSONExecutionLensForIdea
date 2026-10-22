@@ -64,6 +64,18 @@ internal class PipelineWorkspaceState(private val project: Project) : Persistent
     }
 
     fun clearSourceRequest() { requestedFile = null }
+    fun openNode(node: PipelineNodeLocation, environmentId: String) {
+        val source = node.sourceFile ?: return
+        val context = "node:${source.url}#${node.name}"
+        reading(context).apply {
+            rootNode = "${source.url}#${node.name}"
+            selectedNode = rootNode
+            this.environmentId = environmentId
+        }
+        val target = VirtualFileManager.getInstance().getFileSystem(PipelineWorkspaceFileSystem.PROTOCOL)
+            .findFileByPath(PipelineWorkspaceFileSystem.nodePath(project.locationHash, source.url, node.name)) ?: return
+        FileEditorManager.getInstance(project).openFile(target, true)
+    }
     fun reading(context: String): PipelineReadingState = if (context.isEmpty()) emptyReading else
         storage.sessions.getOrPut(context) { PipelineReadingState() }
 

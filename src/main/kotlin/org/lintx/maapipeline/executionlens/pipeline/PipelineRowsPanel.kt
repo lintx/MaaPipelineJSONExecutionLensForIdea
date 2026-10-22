@@ -132,6 +132,11 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
         repaint()
     }
 
+    fun activateNode(headers: List<String>) {
+        val current = headers.firstOrNull { activeRowKey?.startsWith(it.removeSuffix(":header")) == true }
+        (current ?: headers.firstOrNull())?.let(::activateRow)
+    }
+
     fun setPlaybackRow(key: String?) {
         if (playbackRowKey == key) return
         playbackRowKey = key
@@ -186,10 +191,15 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
         val selected = scheme.getColor(EditorColors.SELECTED_INDENT_GUIDE_COLOR) ?: regular
         val active = indentation.at(rows.indexOfFirst { it.key == activeRowKey })
         val clip = graphics.clipBounds ?: Rectangle(0, 0, width, height)
-        rowComponents[playbackRowKey]?.let { component ->
-            graphics.color = scheme.getColor(EditorColors.CARET_ROW_COLOR) ?: UIUtil.getListSelectionBackground(false)
+        listOfNotNull(playbackRowKey, activeRowKey).distinct().forEach { key -> rowComponents[key]?.let { component ->
+            val selection = UIUtil.getListSelectionBackground(true)
+            val base = background
+            graphics.color = java.awt.Color((selection.red + base.red * 2) / 3,
+                (selection.green + base.green * 2) / 3, (selection.blue + base.blue * 2) / 3)
             graphics.fillRect(0, component.y, width, component.height)
-        }
+            graphics.color = selection
+            graphics.fillRect(0, component.y, JBUI.scale(3), component.height)
+        } }
         for (scope in indentation.scopes) {
             val first = getComponent(scope.firstRow)
             val last = getComponent(scope.lastRow)

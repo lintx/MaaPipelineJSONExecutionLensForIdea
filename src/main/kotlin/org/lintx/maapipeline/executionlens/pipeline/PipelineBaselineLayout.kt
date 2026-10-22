@@ -14,8 +14,11 @@ internal class PipelineBaselineLayout : BorderLayout() {
         val buttonSize = button?.preferredSize ?: Dimension()
         val width = (parent.width.takeIf { it > 0 } ?: 480) - parent.insets.left - parent.insets.right
         val valueWidth = (width - labelSize.width - buttonSize.width).coerceAtLeast(0)
-        val valueSize = if (value is PipelineWrappingLabel) value.preferredSizeForWidth(valueWidth)
-            else value?.preferredSize ?: Dimension()
+        val valueSize = when (value) {
+            is PipelineWrappingLabel -> value.preferredSizeForWidth(valueWidth)
+            is PipelineStyledText -> value.preferredSizeForWidth(valueWidth)
+            else -> value?.preferredSize ?: Dimension()
+        }
         return listOfNotNull(label?.let { it to labelSize }, value?.let { it to Dimension(valueWidth, valueSize.height) },
             button?.let { it to buttonSize })
     }

@@ -34,11 +34,7 @@ internal class PipelineFlowSearch(private val rows: PipelineRowsPanel) : JPanel(
             isOpaque = false
             add(count)
             fun button(icon: javax.swing.Icon, tooltip: String, action: () -> Unit) {
-                add(JButton(icon).apply {
-                    toolTipText = tooltip
-                    isFocusable = false
-                    addActionListener { action() }
-                })
+                add(pipelineIconButton(icon, tooltip, action))
             }
             button(AllIcons.Actions.PreviousOccurence, "上一个匹配") { move(-1) }
             button(AllIcons.Actions.NextOccurence, "下一个匹配") { move(1) }

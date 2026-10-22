@@ -50,6 +50,8 @@ internal data class PipelineRegionInfo(
     }
 
     companion object {
+        fun normalized(values: List<Int>, width: Int, height: Int): List<Int>? =
+            normalize(values, width, height)?.map { it.toInt() }
         private fun normalize(values: List<Int>, width: Int, height: Int): List<Long>? {
             if (values.size !in setOf(2, 4)) return null
             var left = values[0].toLong().let { if (it < 0) width + it else it }

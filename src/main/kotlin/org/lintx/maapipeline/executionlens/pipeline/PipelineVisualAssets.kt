@@ -206,12 +206,21 @@ internal object PipelineVisualAssets {
     fun overlay(image: BufferedImage, operations: List<PipelineOperation>,
         resolve: (String) -> PipelineNodeLocation? = { null }, selectedAnnotation: Int? = null,
         templatePreviews: Map<Int, List<TemplatePreview>> = emptyMap(), compact: Boolean = false,
-        excludedAnnotation: Int? = null, originalDraft: List<Int>? = null): BufferedImage {
+        excludedAnnotation: Int? = null, originalDraft: List<Int>? = null, finalDraft: List<Int>? = null): BufferedImage {
         val draft = if (excludedAnnotation != null && originalDraft != null) excludedAnnotation to originalDraft else null
-        val regions = overlayRegions(image.width, image.height, operations, resolve, draft).mapNotNull { region ->
+        val sourceRegions = overlayRegions(image.width, image.height, operations, resolve, draft).toMutableList()
+        if (finalDraft != null) {
+            PipelinePreviewModel.annotations(operations, resolve).firstOrNull { it.number == excludedAnnotation }
+                ?.takeIf { it.region.originalCoordinates == null }?.let { annotation ->
+                    annotation.region.coordinates?.let { PipelineRegionInfo.rectangle(it, image.width, image.height) }?.let { rectangle ->
+                        sourceRegions += OverlayRegion(rectangle, listOf(OverlayMark(annotation, original = true)))
+                    }
+                }
+        }
+        val regions = sourceRegions.mapNotNull { region ->
             // 原始框由交互编辑框接管，最终框仍由基础值与 offset 计算，且不影响其它区域。
             val marks = region.marks.filter { it.annotation.number != excludedAnnotation ||
-                (!it.original && it.annotation.region.originalCoordinates != null) }
+                if (finalDraft != null) it.original else (!it.original && it.annotation.region.originalCoordinates != null) }
             if (marks.isEmpty()) null else region.copy(marks = marks)
         }
         val visible = regions.filter { selectedAnnotation == null || it.annotations.any { item -> item.number == selectedAnnotation } }

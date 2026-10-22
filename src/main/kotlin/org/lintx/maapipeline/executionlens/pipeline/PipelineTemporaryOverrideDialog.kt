@@ -17,7 +17,15 @@ internal class PipelineTemporaryOverrideDialog(private val project: Project, nod
                 add(javax.swing.JButton("添加属性…").apply {
                     addActionListener {
                         com.intellij.openapi.ui.popup.JBPopupFactory.getInstance().createPopupChooserBuilder(properties.keySet().sorted())
-                            .setTitle("选择要覆盖的属性").setNamerForFiltering { it }
+                            .setTitle("选择要覆盖的属性").setNamerForFiltering { it }.setFilterAlwaysVisible(true)
+                            .setRenderer(object : javax.swing.DefaultListCellRenderer() {
+                                override fun getListCellRendererComponent(list: javax.swing.JList<*>, value: Any?, index: Int,
+                                    selected: Boolean, focus: Boolean): java.awt.Component {
+                                    super.getListCellRendererComponent(list, value, index, selected, focus)
+                                    border = com.intellij.util.ui.JBUI.Borders.empty(5, 10)
+                                    return this
+                                }
+                            })
                             .setItemChosenCallback { key ->
                                 val patch = PipelineVisualModel.parse(editor.value) ?: return@setItemChosenCallback
                                 if (!patch.has(key)) {
@@ -39,10 +47,8 @@ internal class PipelineTemporaryOverrideDialog(private val project: Project, nod
     }
 
     override fun doValidate(): ValidationInfo? {
-        val patch = PipelineVisualModel.parse(value)?.takeIf { it.isJsonObject }?.asJsonObject
+        PipelineVisualModel.parse(value)?.takeIf { it.isJsonObject }?.asJsonObject
             ?: return ValidationInfo("请输入节点属性的 JSON 对象", editor.field)
-        if (patch.entrySet().any { !it.value.isJsonObject })
-            return ValidationInfo("每个节点属性的值都必须是 JSON 对象", editor.field)
         return null
     }
 }

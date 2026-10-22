@@ -13,6 +13,7 @@ import java.awt.Rectangle
 internal class PipelineRoiEditSession(private val project: Project, operations: List<PipelineOperation>,
     private val blocked: (VirtualFile) -> Boolean = { false }) {
     private data class Source(val document: Document, var snapshot: PipelineEditSnapshot)
+    private val appliedValues = mutableMapOf<Pair<String, List<String>>, MutableMap<String, com.google.gson.JsonElement>>()
     private val sources = ReadAction.compute<Map<VirtualFile, Source>, RuntimeException> {
         operations.flatMap { operation -> listOfNotNull(operation.source?.sourceFile) +
             operation.roiHints.values.mapNotNull { it.sourceFile } +
@@ -29,10 +30,12 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         if (!offset && PipelineVisualModel.region(definition, annotation.key).coordinates == null)
             return@compute "运行时目标；请调整其来源条件的 ROI"
         if (!file.isWritable || blocked(file) || generated(source.snapshot.text)) return@compute "源文件只读或由生成器维护"
-        val owner = PipelineOperationEdits.objectValue(project, source.snapshot.text)?.findProperty(node.name)?.value
+        PipelineOperationEdits.objectValue(project, source.snapshot.text)?.findProperty(node.name)?.value
             ?: return@compute "无法定位节点定义"
-        if (!editingComment(annotation, offset) &&
-            runCatching { PipelineJsonc.parse(owner.text) != PipelineJsonc.parse(node.rawJson) }.getOrDefault(true))
+        val actual = sourceOperation(annotation, file)
+        val key = if (offset) "${annotation.key}_offset" else annotation.key
+        if (!editingComment(annotation, offset) && (actual == null ||
+            actual.parameters[key] != annotation.operation.parameters[key]))
             return@compute "当前值包含任务覆盖，请在对应的原始 JSON 中调整 ROI"
         null
     }
@@ -41,11 +44,14 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         listOf(rectangle.x, rectangle.y, rectangle.width, rectangle.height))
 
     fun apply(annotation: PipelinePreviewAnnotation, values: List<Int>): Boolean = applyEdit(annotation, annotation.key) { owner ->
-        PipelineOperationEdits.roiValuesEdit(owner, annotation.operation.copy(simulatedRegions = annotation.operation.simulatedRegions - annotation.key), annotation.key, values)
+        val operation = sourceFile(annotation, false)?.let { sourceOperation(annotation, it) } ?: annotation.operation
+        PipelineOperationEdits.roiValuesEdit(owner, operation.copy(roiHints = annotation.operation.roiHints,
+            simulatedRegions = operation.simulatedRegions - annotation.key), annotation.key, values)
     }
 
     fun applyOffset(annotation: PipelinePreviewAnnotation, values: List<Int>): Boolean = applyEdit(annotation, "${annotation.key}_offset") { owner ->
-        PipelineOperationEdits.offsetEdit(owner, annotation.operation, annotation.key, values)
+        val operation = sourceFile(annotation, true)?.let { sourceOperation(annotation, it) } ?: annotation.operation
+        PipelineOperationEdits.offsetEdit(owner, operation, annotation.key, values)
     }
 
     private fun applyEdit(annotation: PipelinePreviewAnnotation, field: String,
@@ -69,6 +75,10 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
             }
         })
         if (!applied) Messages.showWarningDialog(project, "源文件已修改，未覆盖任何内容。请重新打开参考图后调整。", "ROI 已过期")
+        if (applied && !(annotation.region.fromComment && !field.endsWith("_offset"))) {
+            val current = sourceOperation(annotation, file)?.parameters?.get(field)
+            if (current != null) appliedValues.getOrPut(node.name to annotation.operation.ownerPath) { mutableMapOf() }[field] = current
+        }
         return applied
     }
 
@@ -77,7 +87,6 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         val text = sources[source.sourceFile]?.snapshot?.text ?: return@compute operation
         val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(source.name) ?: return@compute operation
         val layered = source.previewSources.isNotEmpty()
-        if (!layered && PipelineJsonc.parse(property.value?.text ?: "{}") != PipelineJsonc.parse(source.rawJson)) return@compute operation
         val updatedSources = if (!layered) emptyList() else source.previewSources.map { layer ->
             val currentText = sources[layer.sourceFile]?.snapshot?.text
             val currentProperty = currentText?.let { PipelineOperationEdits.objectValue(project, it)?.findProperty(source.name) }
@@ -90,15 +99,35 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
             previewSource = null, previewSources = updatedSources), operation.isAction)
         fun find(candidate: PipelineOperation): PipelineOperation? =
             if (candidate.ownerPath == operation.ownerPath) candidate else candidate.children.firstNotNullOfOrNull(::find)
-        (find(root) ?: operation).copy(reference = operation.reference)
+        val result = find(root) ?: operation
+        result.copy(reference = operation.reference,
+            parameters = result.parameters + appliedValues[source.name to operation.ownerPath].orEmpty())
     }
 
     private fun editingComment(annotation: PipelinePreviewAnnotation, offset: Boolean): Boolean =
         !offset && annotation.region.fromComment
 
-    private fun sourceFile(annotation: PipelinePreviewAnnotation, offset: Boolean): VirtualFile? =
-        if (editingComment(annotation, offset)) annotation.operation.roiHints[annotation.key]?.sourceFile ?: annotation.operation.source?.sourceFile
-        else annotation.operation.source?.sourceFile
+    private fun sourceOperation(annotation: PipelinePreviewAnnotation, file: VirtualFile): PipelineOperation? =
+        ReadAction.compute<PipelineOperation?, RuntimeException> {
+        val node = annotation.operation.source ?: return@compute null
+        val text = sources[file]?.snapshot?.text ?: return@compute null
+        val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(node.name) ?: return@compute null
+        val root = PipelineVisualModel.operation(node.copy(sourceFile = file, rawJson = PipelinePreviewHints.sourceText(property),
+            previewSource = null, previewSources = emptyList()), annotation.operation.isAction)
+        fun find(operation: PipelineOperation): PipelineOperation? = if (operation.ownerPath == annotation.operation.ownerPath) operation
+            else operation.children.firstNotNullOfOrNull(::find)
+        find(root)
+    }
+
+    private fun sourceFile(annotation: PipelinePreviewAnnotation, offset: Boolean): VirtualFile? {
+        val node = annotation.operation.source ?: return null
+        if (editingComment(annotation, offset)) return annotation.operation.roiHints[annotation.key]?.sourceFile ?: node.sourceFile
+        val key = if (offset) "${annotation.key}_offset" else annotation.key
+        // 控制器资源只覆盖部分字段；按当前字段定位最后一个真实定义层，不能比较整个合并节点。
+        return PipelinePreviewHints.sources(node).asReversed().mapNotNull { it.sourceFile }.firstOrNull {
+            sourceOperation(annotation, it)?.parameters?.containsKey(key) == true
+        } ?: node.sourceFile
+    }
 
     private fun generated(text: String): Boolean = text.lineSequence().take(40).map(String::trim)
         .filter { it.startsWith("//") || it.startsWith("/*") || it.startsWith("*") }

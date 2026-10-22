@@ -51,10 +51,14 @@ internal class PipelineStyledText(value: String) : JTextPane() {
     }
     override fun getPreferredSize(): Dimension {
         val available = (width.takeIf { it > 0 } ?: parent?.width?.takeIf { it > 0 } ?: JBUI.scale(420))
+        return preferredSizeForWidth(available)
+    }
+    fun preferredSizeForWidth(available: Int): Dimension {
         val view = getUI().getRootView(this)
         view.setSize((available - insets.left - insets.right).coerceAtLeast(1).toFloat(), Float.MAX_VALUE)
         return Dimension(available, kotlin.math.ceil(view.getPreferredSpan(View.Y_AXIS).toDouble()).toInt() + insets.top + insets.bottom)
     }
+    override fun getBaseline(width: Int, height: Int): Int = insets.top + getFontMetrics(font).ascent
     override fun getMinimumSize() = Dimension(0, preferredSize.height)
     override fun getMaximumSize() = Dimension(Int.MAX_VALUE, preferredSize.height)
 }

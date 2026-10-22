@@ -165,9 +165,6 @@ internal class PipelineVisualDetails(
                 toolTipText = if (key in setOf("method", "detector", "only_rec") && mode != null) mode.second else property.explanation
             })
         }
-        listOf("all_of", "any_of").forEach { key ->
-            byName[key]?.let { property -> container.add(PipelineWrappingLabel("$key：${operation.children.size} 个子条件${property.suffix}")) }
-        }
         operation.parameters["template"]?.let { template ->
             val paths = if (template.isJsonArray) template.asJsonArray.toList() else listOf(template)
             paths.filter { it.isJsonPrimitive }.forEach { path ->
@@ -190,10 +187,10 @@ internal class PipelineVisualDetails(
             if (colors.ranges.isEmpty()) container.add(PipelineWrappingLabel("lower：${operation.text("lower") ?: "未设置"}\nupper：${operation.text("upper") ?: "未设置"}"))
         }
         if (defaultContent.componentCount > 0) container.add(pipelineDefaultProperties(defaultContent, defaultContent.componentCount))
-        operation.children.forEach { child ->
+        operation.children.forEachIndexed { index, child ->
             val body = column().apply { border = JBUI.Borders.empty(4, 12, 4, 0) }
             if (depth < 16) appendOperation(body, child, depth + 1)
-            container.add(body)
+            container.add(pipelineCollapsedSection("${index + 1}. ${child.type}", body))
         }
     }
 

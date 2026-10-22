@@ -44,7 +44,7 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
     init { title = "任务选项 · ${entry.label}"; setOKButtonText("应用到流程视图"); init(); updateActive() }
 
     override fun createCenterPanel(): JComponent {
-        val body = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
+        val body = JPanel(com.intellij.ui.components.panels.VerticalLayout(0))
         body.add(JBLabel("仅当前分支的选项生效；不会修改任务 JSON。").apply { border = JBUI.Borders.emptyBottom(8) })
         options.forEach { option ->
             val row = JPanel(BorderLayout(8, 4)).apply { border = JBUI.Borders.empty(5) }
@@ -78,7 +78,7 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
                     val chooser = javax.swing.JButton(option.cases.firstOrNull { it.name in chosen }?.label ?: "选择…")
                     chooser.addActionListener {
                         com.intellij.openapi.ui.popup.JBPopupFactory.getInstance().createPopupChooserBuilder(option.cases)
-                            .setTitle(option.label).setRenderer(renderer)
+                            .setTitle(option.label).setRenderer(renderer).setFilterAlwaysVisible(true)
                             .setNamerForFiltering { "${it.name} ${it.label} ${it.description}" }
                             .setItemChosenCallback { item ->
                                 selectedValues[option.name] = listOf(item.name)
