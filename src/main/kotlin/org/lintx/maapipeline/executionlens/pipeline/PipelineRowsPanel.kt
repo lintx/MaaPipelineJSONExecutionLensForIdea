@@ -83,6 +83,7 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
         rowComponents.putAll(nextComponents)
         rows = newRows
         indentation = PipelineIndentScopes(rows.map { it.depth })
+        listOfNotNull(activeRowKey, playbackRowKey).forEach(::updateRowText)
         findRows(searchQuery)
         revalidate()
         repaint()
@@ -128,8 +129,19 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
 
     fun activateRow(key: String) {
         if (key == activeRowKey) return
+        val previous = activeRowKey
         activeRowKey = key
+        previous?.let(::updateRowText)
+        updateRowText(key)
         repaint()
+    }
+
+    fun revealRowIfNeeded(key: String) {
+        followPlaybackRow(null)
+        val component = rowComponents[key] ?: return
+        val visible = viewport?.viewRect ?: return
+        if (component.y >= visible.y && component.y + component.height <= visible.y + visible.height) return
+        followPlaybackRow(key)
     }
 
     fun activateNode(headers: List<String>) {
@@ -139,8 +151,21 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
 
     fun setPlaybackRow(key: String?) {
         if (playbackRowKey == key) return
+        val previous = playbackRowKey
         playbackRowKey = key
+        previous?.let(::updateRowText)
+        key?.let(::updateRowText)
         repaint()
+    }
+
+    private fun updateRowText(key: String) {
+        if (!key.endsWith(":header") && !key.endsWith(":card")) return
+        val selected = key == activeRowKey || key == playbackRowKey
+        fun update(component: Component) {
+            if (component is PipelineStyledText) component.setFlowSelected(selected)
+            if (component is Container) component.components.forEach(::update)
+        }
+        rowComponents[key]?.let(::update)
     }
 
     fun findRows(query: String): List<String> {

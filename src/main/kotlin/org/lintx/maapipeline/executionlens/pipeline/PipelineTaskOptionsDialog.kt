@@ -77,14 +77,15 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
                 } else {
                     val chooser = javax.swing.JButton(option.cases.firstOrNull { it.name in chosen }?.label ?: "选择…")
                     chooser.addActionListener {
-                        com.intellij.openapi.ui.popup.JBPopupFactory.getInstance().createPopupChooserBuilder(option.cases)
-                            .setTitle(option.label).setRenderer(renderer).setFilterAlwaysVisible(true)
-                            .setNamerForFiltering { "${it.name} ${it.label} ${it.description}" }
-                            .setItemChosenCallback { item ->
+                        pipelineSearchPopup(option.cases, chooser, option.label,
+                            display = { "${it.label} [${it.name}]" },
+                            searchable = { "${it.name} ${it.label} ${it.description}" },
+                            selected = option.cases.firstOrNull { it.name in (selectedValues[option.name] ?: option.defaults) },
+                            choose = { item ->
                                 selectedValues[option.name] = listOf(item.name)
                                 chooser.text = item.label
                                 updateActive()
-                            }.createPopup().showUnderneathOf(chooser)
+                            }).showUnderneathOf(chooser)
                     }
                     row.add(chooser, BorderLayout.CENTER)
                 }

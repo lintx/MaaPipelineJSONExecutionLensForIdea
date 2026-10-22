@@ -246,17 +246,13 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             try {
                 val search = descendants(popup.content).filterIsInstance<com.intellij.ui.SearchTextField>().single()
                 assertTrue("搜索框应始终可见", search.isVisible)
+                assertTrue("搜索框必须允许获得输入焦点", search.textEditor.isFocusable)
                 val list = descendants(popup.content).filterIsInstance<javax.swing.JList<*>>().single()
-                val filtered = descendants(popup.content).filterIsInstance<com.intellij.ui.speedSearch.ListWithFilter<*>>().single()
                 search.text = "移动端终点"
-                filtered.speedSearch.updatePattern(search.text)
-                filtered.speedSearch.update()
                 com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
                 assertEquals(1, list.model.size)
                 assertEquals("Left", (list.model.getElementAt(0) as PipelineNodeLocation).name)
                 search.text = "Shared"
-                filtered.speedSearch.updatePattern(search.text)
-                filtered.speedSearch.update()
                 com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
                 assertEquals(1, list.model.size)
                 assertEquals("Shared", (list.model.getElementAt(0) as PipelineNodeLocation).name)
@@ -266,6 +262,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val logic = field("logicPanel").get(panel) as PipelineRowsPanel
             val components = logic.components.toList()
             assertTrue(logic.findRows("共享终点").isNotEmpty())
+            assertEquals("共享节点在每个调用处展开", 2, textComponents(logic).count { it.text == "共享终点" })
             assertEquals("查找不能重建流程", components, logic.components.toList())
             logic.findRows("")
             val locate = PipelineFlowPanel::class.java.getDeclaredMethod("locateDetailInFlow").apply { isAccessible = true }
@@ -871,7 +868,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             {"Start":{"next":["Disabled","Shared","Caller","OtherCall"]},
              "Disabled":{"enabled":false,"desc":"DISABLED_BODY","next":["Done"]},
              "Shared":{"next":["Done"]},"Done":{},
-             "Caller":{"action":{"type":"Custom","custom_action":"SubTask","custom_action_param":{"sub":["Child"]}}},
+             "Caller":{"action":{"type":"Custom","custom_action":"SubTask","custom_action_param":{"sub":["Child"]}},"next":["After"]},"After":{},
              "OtherCall":{"action":{"type":"Custom","param":{"custom_action":"SubTask","custom_action_param":{"sub":["Child"]}}}},
              "Child":{"desc":"CHILD_BODY","action":"Click","target":[1,2,3,4],"rate_limit":123,"timeout":345,"next":["Shared"]}}
         """.trimIndent())
@@ -944,11 +941,16 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             PipelineFlowPanel::class.java.getDeclaredMethod("advanceSimulation", PipelineSimulationChoice::class.java)
                 .apply { isAccessible = true }.invoke(panel, simulation.choices(0).single { it.node?.name == "Caller" })
             val step = PipelineFlowPanel::class.java.getDeclaredMethod("chooseSimulationStep", Boolean::class.javaPrimitiveType).apply { isAccessible = true }
-            repeat(4) { step.invoke(panel, false) }
+            repeat(3) { step.invoke(panel, false) }
             assertEquals("Caller", simulation.frames.last().node.name)
             assertEquals("父流程进入 next 后应收起已完成 subtask", 1, labels().count { it.text == "CHILD_BODY" })
-            val fold = descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.toolTipText == "展开 subtask" }
-            fold.doClick()
+            assertTrue("返回父流程即显示下一候选的运行按钮", descendants(logic).filterIsInstance<javax.swing.JButton>().any {
+                it.name == "pipeline-simulation-run" && it.isVisible && it.toolTipText.contains("next → After")
+            })
+            val fold = descendants(logic).filterIsInstance<javax.swing.JComponent>().single { it.toolTipText == "展开Child" }
+            val event = java.awt.event.MouseEvent(fold, java.awt.event.MouseEvent.MOUSE_CLICKED, 0, 0,
+                2, 2, 1, false, java.awt.event.MouseEvent.BUTTON1)
+            fold.mouseListeners.forEach { it.mouseClicked(event) }
             assertEquals(2, labels().count { it.text == "CHILD_BODY" })
             invoke("stopSimulation")
         } finally { manager.closeFile(workspace.file) }

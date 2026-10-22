@@ -25,6 +25,10 @@ class PipelineRowsPanelTest {
         }
         SwingUtilities.invokeAndWait {
             assertEquals(420, viewport.viewPosition.y)
+            panel.revealRowIfNeeded("row-25")
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals(420, viewport.viewPosition.y, "目标已经可见时不移动视口")
             panel.followPlaybackRow("row-1")
         }
         SwingUtilities.invokeAndWait {

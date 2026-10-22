@@ -1,6 +1,7 @@
 package org.lintx.maapipeline.executionlens.pipeline
 
 import com.intellij.openapi.editor.colors.EditorColorsManager
+import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.Dimension
@@ -20,6 +21,8 @@ internal class PipelineSelectionCaret : DefaultCaret() {
 }
 
 internal class PipelineStyledText(value: String) : JTextPane() {
+    private var flowSelected = false
+    private var flowHovered = false
     init {
         editorKit = object : StyledEditorKit() {
             override fun getViewFactory(): ViewFactory = ViewFactory { element ->
@@ -41,12 +44,41 @@ internal class PipelineStyledText(value: String) : JTextPane() {
         foreground = UIUtil.getLabelForeground()
         margin = JBUI.insets(2, 4)
         alignmentX = LEFT_ALIGNMENT
+        updateTextColors()
+    }
+
+    fun setFlowSelected(selected: Boolean) {
+        if (flowSelected == selected) return
+        flowSelected = selected
+        updateTextColors()
+    }
+
+    fun setFlowHovered(hovered: Boolean) {
+        if (flowHovered == hovered) return
+        flowHovered = hovered
+        updateTextColors()
+    }
+
+    private fun updateTextColors() {
+        val highlighted = flowSelected || flowHovered
+        val normal = UIUtil.getLabelForeground()
+        val base = if (highlighted) JBColor.namedColor("Link.hoverForeground", normal) else normal
+        val plain = SimpleAttributeSet().apply { StyleConstants.setForeground(this, base) }
+        styledDocument.setCharacterAttributes(0, document.length, plain, false)
         val scheme = EditorColorsManager.getInstance().globalScheme
-        PipelineTokenColors.ranges(value).forEach { (range, key) ->
+        PipelineTokenColors.ranges(text).forEach { (range, key) ->
             val attributes = SimpleAttributeSet()
-            scheme.getAttributes(key)?.foregroundColor?.let { StyleConstants.setForeground(attributes, it) }
+            if (!highlighted) scheme.getAttributes(key)?.foregroundColor?.let { StyleConstants.setForeground(attributes, it) }
             StyleConstants.setBold(attributes, key != com.intellij.openapi.editor.DefaultLanguageHighlighterColors.NUMBER)
             styledDocument.setCharacterAttributes(range.startOffset, range.length, attributes, false)
+        }
+        Regex("[→{}]").findAll(text).forEach { match ->
+            val attributes = SimpleAttributeSet().apply { StyleConstants.setForeground(this, normal) }
+            styledDocument.setCharacterAttributes(match.range.first, match.value.length, attributes, false)
+        }
+        Regex("（默认）").findAll(text).forEach { match ->
+            val attributes = SimpleAttributeSet().apply { StyleConstants.setForeground(this, UIUtil.getContextHelpForeground()) }
+            styledDocument.setCharacterAttributes(match.range.first, match.value.length, attributes, false)
         }
     }
     override fun getPreferredSize(): Dimension {

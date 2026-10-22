@@ -9,16 +9,16 @@ import kotlin.test.assertTrue
 class PipelineExpansionPolicyTest {
     @Test fun canContinuePastInitialBudgetWithoutUnrollingCycles() {
         assertEquals(PipelineExpansionBoundary.BUDGET,
-            PipelineExpansionPolicy.boundary("Next", emptySet(), emptySet(), false, 200, 200))
-        assertNull(PipelineExpansionPolicy.boundary("Next", emptySet(), emptySet(), false, 200, 400))
+            PipelineExpansionPolicy.boundary("Next", emptySet(), 200, 200))
+        assertNull(PipelineExpansionPolicy.boundary("Next", emptySet(), 200, 400))
         assertEquals(PipelineExpansionBoundary.CYCLE,
-            PipelineExpansionPolicy.boundary("Root", setOf("Root"), setOf("Root"), true, 1, 400))
+            PipelineExpansionPolicy.boundary("Root", setOf("Root"), 1, 400))
     }
 
     @Test fun sharedNodeCanExpandAtAnIndependentInstance() {
-        assertEquals(PipelineExpansionBoundary.SHARED,
-            PipelineExpansionPolicy.boundary("Shared", emptySet(), setOf("Shared"), false, 2, 200))
-        assertNull(PipelineExpansionPolicy.boundary("Shared", emptySet(), setOf("Shared"), true, 2, 200))
+        assertNull(PipelineExpansionPolicy.boundary("Shared", emptySet(), 2, 200))
+        assertEquals(PipelineExpansionBoundary.BUDGET,
+            PipelineExpansionPolicy.boundary("Shared", emptySet(), 200, 200))
         val first = PipelineExpansionPolicy.instanceKey("left:next:0", "Shared")
         assertEquals(first, PipelineExpansionPolicy.instanceKey("left:next:0", "Shared"))
         assertNotEquals(first, PipelineExpansionPolicy.instanceKey("right:next:0", "Shared"))

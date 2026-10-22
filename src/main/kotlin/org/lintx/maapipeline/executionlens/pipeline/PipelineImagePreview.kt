@@ -232,7 +232,7 @@ internal class PipelineImagePreview(
         status.text = if (editingOffset) "拖动或拉框调整最终 ROI；仅写入 offset，原始 ROI 保持不变"
             else if (editing) "调整原始 ROI；offset 保持不变" else reason.orEmpty()
         apply.toolTipText = if (editingOffset) "应用 offset（保留原始 ROI）" else "应用原始 ROI（保留 offset）"
-        numeric.toolTipText = if (editingOffset) "输入最终 ROI 坐标并计算 offset" else "输入原始 ROI 坐标"
+        numeric.toolTipText = if (editingOffset) "输入 offset 数值" else "输入原始 ROI 坐标"
         picture.cursor = Cursor.getPredefinedCursor(if (editingVisible()) Cursor.CROSSHAIR_CURSOR else Cursor.HAND_CURSOR)
         positionButtons()
     }
@@ -295,9 +295,10 @@ internal class PipelineImagePreview(
     }
 
     private fun editCoordinates() {
-        val current = regionValues ?: return
+        val current = (if (editingOffset) offsetValues() else regionValues) ?: return
         val input = com.intellij.openapi.ui.Messages.showInputDialog(project,
-            "x, y, width, height（支持负数；宽高为 0 表示延伸至边缘）", if (editingOffset) "最终 ROI 坐标" else "原始 ROI 坐标", null,
+            if (editingOffset) "dx, dy, dwidth, dheight（直接修改偏移量，支持负数）"
+            else "x, y, width, height（支持负数；宽高为 0 表示延伸至边缘）", if (editingOffset) "offset 数值" else "原始 ROI 坐标", null,
             current.joinToString(", "),
             object : com.intellij.openapi.ui.InputValidator {
                 override fun checkInput(inputString: String): Boolean {
@@ -307,10 +308,11 @@ internal class PipelineImagePreview(
                 override fun canClose(inputString: String) = checkInput(inputString)
             }) ?: return
         val values = input.trim().removeSurrounding("[", "]").split(',').map { it.trim().toInt() }
-        regionValues = values; editBasis = values
+        regionValues = if (editingOffset) offsetBase?.zip(values) { origin, offset -> origin + offset } ?: return else values
+        editBasis = regionValues
         region = if (editingOffset && editingAnnotation()?.operation?.isAction == true) {
             editingAnnotation()?.region?.copy(originalCoordinates = offsetBase, coordinateOffset = offsetValues())?.rectangle(original.width, original.height)
-        } else PipelineRegionInfo.rectangle(values, original.width, original.height)
+        } else PipelineRegionInfo.rectangle(regionValues!!, original.width, original.height)
         changed = true
         status.text = (if (editingOffset) "${editingAnnotation()?.key}_offset = ${offsetValues()}" else "原始 ${editingAnnotation()?.key} = $values") +
             if (region == null) "（当前画布内无可见区域）" else ""

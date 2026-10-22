@@ -7,6 +7,9 @@ import javax.swing.JButton
 internal fun pipelineIconButton(icon: Icon, tooltip: String, action: () -> Unit): JButton = JButton(icon).apply {
     toolTipText = tooltip
     isFocusable = false
+    isContentAreaFilled = false
+    isBorderPainted = false
+    border = JBUI.Borders.empty()
     margin = JBUI.emptyInsets()
     preferredSize = JBUI.size(24, 24)
     minimumSize = preferredSize

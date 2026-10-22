@@ -135,6 +135,12 @@ class PipelineImagePreviewTest : BasePlatformTestCase() {
         assertEquals(original.replace("[20,30,0,0]", "[40, 50, 0, 0]"), myFixture.editor.document.text)
         preview.editOffset(1)
         assertEquals("再次编辑应使用更新后的 offset", Rectangle(50,70,100,120), preview.region)
+        val previousInput = com.intellij.openapi.ui.TestDialogManager.setTestInputDialog { "-10, -20, 5, -6" }
+        try {
+            descendants(preview).filterIsInstance<javax.swing.JButton>().single { it.toolTipText == "输入 offset 数值" }.doClick()
+        } finally { com.intellij.openapi.ui.TestDialogManager.setTestInputDialog(previousInput) }
+        assertEquals("数值输入直接修改 offset，画布显示计算后的最终 ROI", Rectangle(0,0,105,114), preview.region)
+        assertEquals(0, chooser.selectedIndex)
         preview.stopEditing()
         UndoManager.getInstance(project).undo(TextEditorProvider.getInstance().getTextEditor(myFixture.editor))
         assertEquals(original, myFixture.editor.document.text)

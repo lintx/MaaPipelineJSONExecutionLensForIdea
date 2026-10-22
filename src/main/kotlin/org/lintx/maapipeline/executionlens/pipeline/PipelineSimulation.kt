@@ -132,6 +132,15 @@ internal class PipelineSimulation(private val nodes: List<PipelineNodeLocation>,
         !it.ended && it.node.onError.isEmpty() && it.returns.any { continuation -> continuation.subtask }
     } == true
 
+    fun completeReturns() {
+        // 子流程末端的返回不需要用户再次选择；保留每个返回帧，仍可回放完整执行链。
+        while (true) {
+            val frame = frames.lastOrNull() ?: return
+            if (frame.ended || frame.failed || frame.pending.isNotEmpty() || frame.node.next.isNotEmpty() || frame.returns.isEmpty()) return
+            if (!finish(frames.lastIndex)) return
+        }
+    }
+
     fun finish(index: Int, error: Boolean = false, outcome: PipelineSimulationParentOutcome? = null): Boolean {
         val current = frames.getOrNull(index) ?: return false
         if (current.ended || !error && (current.failed || current.pending.isNotEmpty() || current.node.next.isNotEmpty()) || error && current.node.onError.isNotEmpty()) return false

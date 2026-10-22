@@ -47,8 +47,8 @@ internal class PipelinePlaybackToolbar(
                 override fun actionPerformed(event: AnActionEvent) { pause(); operation() }
             })
         }
-        action("回到首步", AllIcons.Actions.PreviousOccurence, { session?.canPrevious == true }) { seek(0) }
-        action("后退一步", AllIcons.Actions.Back, { session?.canPrevious == true }) { seek(session?.previousPosition ?: -1) }
+        action("回到首步", AllIcons.Actions.Play_first, { session?.canPrevious == true }) { seek(0) }
+        action("后退一步", AllIcons.Actions.Play_back, { session?.canPrevious == true }) { seek(session?.previousPosition ?: -1) }
         actions.add(object : DumbAwareAction("播放", "自动回放日志", AllIcons.Actions.Execute) {
             override fun getActionUpdateThread() = ActionUpdateThread.EDT
             override fun update(event: AnActionEvent) {
@@ -60,8 +60,8 @@ internal class PipelinePlaybackToolbar(
                 if (timer.isRunning) pause() else if (session?.canNext == true) { timer.start(); refresh() }
             }
         })
-        action("前进一步", AllIcons.Actions.Forward, { session?.canNext == true }) { seek((session?.position ?: -1) + 1) }
-        action("跳到末步", AllIcons.Actions.NextOccurence, { session?.canNext == true }) { seek((session?.size ?: 0) - 1) }
+        action("下一步", AllIcons.Actions.Play_forward, { session?.canNext == true }) { seek((session?.position ?: -1) + 1) }
+        action("跳到末步", AllIcons.Actions.Play_last, { session?.canNext == true }) { seek((session?.size ?: 0) - 1) }
         actions.addSeparator()
         actions.add(object : ComboBoxAction() {
             override fun getActionUpdateThread() = ActionUpdateThread.EDT

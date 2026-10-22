@@ -1,15 +1,14 @@
 package org.lintx.maapipeline.executionlens.pipeline
 
-internal enum class PipelineExpansionBoundary { CYCLE, SHARED, BUDGET }
+internal enum class PipelineExpansionBoundary { CYCLE, BUDGET }
 
 internal object PipelineExpansionPolicy {
     fun instanceKey(parent: String, target: String): String = "flow:" + java.util.UUID.nameUUIDFromBytes(
         "$parent:$target".toByteArray(Charsets.UTF_8))
 
-    fun boundary(target: String, ancestors: Set<String>, seen: Set<String>, expandShared: Boolean,
+    fun boundary(target: String, ancestors: Set<String>,
         rendered: Int, budget: Int): PipelineExpansionBoundary? = when {
         target in ancestors -> PipelineExpansionBoundary.CYCLE
-        target in seen && !expandShared -> PipelineExpansionBoundary.SHARED
         rendered >= budget -> PipelineExpansionBoundary.BUDGET
         else -> null
     }
