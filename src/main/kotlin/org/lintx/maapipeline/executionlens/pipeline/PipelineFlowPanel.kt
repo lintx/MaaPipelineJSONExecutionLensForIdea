@@ -1330,7 +1330,7 @@ internal class PipelineFlowPanel(
         bold: Boolean = false, tooltip: String? = null,
     ) {
         appendLogicRow(rows, key, depth, revision = listOf(text, foreground, bold, tooltip)) { panel ->
-            panel.add((if (key.endsWith(":action")) PipelineStyledText(text) else PipelineWrappingLabel(text)).apply {
+            panel.add((if (key.endsWith(":action") || key.endsWith(":subtask:repeat")) PipelineStyledText(text) else PipelineWrappingLabel(text)).apply {
                 this.foreground = foreground
                 font = font.deriveFont(if (bold) Font.BOLD else Font.PLAIN)
                 toolTipText = tooltip
@@ -1427,6 +1427,7 @@ internal class PipelineFlowPanel(
         instanceKey: String = logicNodeKey(location.name, location.sourceFile ?: file),
         anchorContext: PipelineAnchorContext = PipelineAnchorContext(),
         revealIndex: Int = -1,
+        jumpBackReturn: LogicJumpBackReturn? = null,
     ) {
         val sourceFile = location.sourceFile ?: file
         val nodeKey = logicNodeKey(location.name, sourceFile)
@@ -1447,9 +1448,9 @@ internal class PipelineFlowPanel(
         val bindings = currentReadingGraph().anchorFlow.afterNode(location, anchorContext)
         val anchorChanges = currentReadingGraph().visibleAnchorChanges(location)
         val subTasks = effective.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }
-        val hasBody = effective.action != null || effective.description != null || anchorChanges.isNotEmpty() ||
+        val hasBody = effective.action != null || PipelineConditionSummary.repeatPrefix(effective, defaults).isNotEmpty() || anchorChanges.isNotEmpty() ||
             policySummary != null || overrides.isNotEmpty() || effective.next.isNotEmpty() || effective.onError.isNotEmpty() ||
-            effective.embeddedReferences.any { it.kind == PipelineReferenceKind.SUBTASK }
+            subTasks.isNotEmpty() || jumpBackReturn != null
         val previousRow = activeLogicRows.put(nodeKey, "$instanceKey:header")
         scheduleLogic {
             if (previousRow == null) activeLogicRows.remove(nodeKey) else activeLogicRows[nodeKey] = previousRow
@@ -1458,29 +1459,29 @@ internal class PipelineFlowPanel(
         logicRowByNode.putIfAbsent(nodeKey, "$instanceKey:header")
         logicOccurrences.getOrPut(nodeKey, ::mutableListOf).add("$instanceKey:header")
         appendLogicRow(rows, "$instanceKey:header", depth,
-            revision = listOf(effective, incoming, isCollapsed, currentTrace, hasBody, overrides)) { panel ->
+            revision = listOf(effective, incoming, isCollapsed, currentTrace, hasBody, overrides, jumpBackReturn)) { panel ->
             val header = JPanel(BorderLayout()).apply { isOpaque = false }
-            val headerText = if (!effectiveNode(location).enabled) "已禁用（enabled=false） → ${location.name}" else incoming?.let {
+            val branch = incoming?.let {
                     logicCandidateHeading(
                     index = it.index,
                     reference = it.reference,
-                    traceNodeName = it.sourceLocation.name,
-                    showTargetName = true,
                     conditionSummary = PipelineConditionSummary.flowCondition(effectiveNode(location)),
                     fieldName = it.fieldName,
                     boundTargetName = location.name.takeIf { _ -> it.reference.isAnchor },
                     anchorMayBeUnset = it.anchorMayBeUnset,
+                    subtaskSource = it.sourceLocation,
+                    referenceCount = it.referenceCount,
                 )
-            } ?: "${PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(effectiveNode(location)))} → ${location.name}"
+            } ?: PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(effective))
             val overrideHint = if (overrides.isEmpty()) "" else if (overrides.any { it.active }) {
                 if (traceOverrides() != null) " · 日志覆盖" else " · 任务覆盖"
             } else " · 可由任务选项覆盖"
             header.add(createLogicHeading(
-                headerText + overrideHint + if (hasBody && !isCollapsed) " {" else "", location,
+                logicBlockHeading(branch, effective, incoming?.reference, hasBody, isCollapsed, suffix = overrideHint), location,
                 incoming?.reference, incoming?.fieldName ?: "next", incoming?.sourceLocation?.name,
                 incoming?.anchorHint, bold = true, subtaskSource = incoming?.sourceLocation,
             ), BorderLayout.CENTER)
-            header.add(createFoldMarker(!isCollapsed, location.name) { isExpanded ->
+            header.add(logicFoldGutter(if (hasBody) createFoldMarker(!isCollapsed, location.name) { isExpanded ->
                 if (isExpanded) {
                     collapsedLogicNodes -= instanceKey; collapsedLogicNodes -= nodeKey
                     explicitlyExpandedNodes += instanceKey
@@ -1492,14 +1493,10 @@ internal class PipelineFlowPanel(
                 }
                 renderLogicView(currentRoot())
                 saveSession()
-            }, BorderLayout.WEST)
+            } else null), BorderLayout.WEST)
             panel.add(header)
         }
-        if (isCollapsed) return
-        effective.description?.let {
-            appendLogicNote(rows, "$instanceKey:description", depth + 1, it,
-                foreground = UIUtil.getLabelForeground(), tooltip = PipelineVisualModel.fieldHelp("desc"))
-        }
+        if (hasBody && isCollapsed) return
         if (overrides.isNotEmpty()) {
             val active = overrides.filter { it.active }
             val fields = active.flatMap { it.fields.entries }.associate { it.toPair() }
@@ -1530,9 +1527,12 @@ internal class PipelineFlowPanel(
             appendLogicNote(rows, "$instanceKey:policy", depth + 1, policySummary,
                 tooltip = PipelineFlowTooltip.render(details, getFontMetrics(UIUtil.getLabelFont())))
         }
-        if (subTasks.isEmpty()) PipelineConditionSummary.action(effective)?.let { action ->
+        if (subTasks.isEmpty()) PipelineConditionSummary.action(effective, defaults)?.let { action ->
             val operation = PipelineVisualModel.operation(effective, isAction = true)
             val details = listOf(PipelineConditionDetail(PipelineVisualModel.actionHelp(operation))) +
+                listOfNotNull(PipelineConditionSummary.repeatPrefix(effective, defaults).takeIf { it.isNotEmpty() }?.let {
+                    PipelineConditionDetail("$it：重复动作，不在每次动作之前重新识别条件。", 1)
+                }) +
                 PipelinePropertyCatalog.operationProperties(operation, defaults)
                     .filter { it.name in operation.parameters }.flatMap { property -> listOf(
                         PipelineConditionDetail("${property.name} = ${property.value?.let(PipelineVisualModel::display)}", 1),
@@ -1567,12 +1567,27 @@ internal class PipelineFlowPanel(
         }
         scheduleLogic { appendVirtualLogicBranch(location, effective.onError, "on_error", rows, depth + 1, ancestors, instanceKey, bindings,
             revealIndex = revealIndex) }
+        if (effective.next.isEmpty() && effective.enabled && jumpBackReturn != null &&
+            PipelineVisualModel.operation(effective, isAction = true).type != "StopTask") scheduleLogic {
+            appendLogicRow(rows, "$instanceKey:break", depth + 1, revision = jumpBackReturn) { panel ->
+                panel.add(createFlowSelectionLabel("break", location, navigationLink = PipelineTextLink(
+                    TextRange(0, 5), jumpBackReturnTooltip(jumpBackReturn), { revealLogicReturn(jumpBackReturn) },
+                )))
+            }
+        }
         scheduleLogic { appendVirtualLogicBranch(location, effective.next, "next", rows, depth + 1, ancestors, instanceKey, bindings,
-            revealIndex = revealIndex) }
+            revealIndex = revealIndex, jumpBackReturn = jumpBackReturn) }
         if (subTasks.isNotEmpty()) scheduleLogic {
-            // RunTask 是独立子流程；保留祖先检查防止递归无限展开。
-            appendVirtualLogicBranch(location, subTasks, "subtask", rows, depth + 1, ancestors, instanceKey, bindings,
-                revealIndex = revealIndex)
+            val repeat = PipelineConditionSummary.repeatPrefix(effective, defaults)
+            val repeatedList = subTasks.size > 1 && repeat.isNotEmpty()
+            if (repeatedList) {
+                appendLogicNote(rows, "$instanceKey:subtask:repeat", depth + 1, "${repeat}subtask {",
+                    foreground = UIUtil.getLabelForeground(), tooltip = "重复整个 SubTask 动作，即每次重新调用整个子任务列表。")
+                scheduleLogic { appendLogicNote(rows, "$instanceKey:subtask:repeat:close", depth + 1, "}") }
+            }
+            // RunTask 拥有独立返回栈，不能继承调用者的 JumpBack 返回点。
+            appendVirtualLogicBranch(location, subTasks, "subtask", rows, depth + if (repeatedList) 2 else 1,
+                ancestors, instanceKey, bindings, revealIndex = revealIndex)
         }
     }
 
@@ -1591,6 +1606,8 @@ internal class PipelineFlowPanel(
         anchorContext: PipelineAnchorContext,
         candidateAnchor: String? = null,
         revealIndex: Int = -1,
+        jumpBackReturn: LogicJumpBackReturn? = null,
+        allowJumpBack: Boolean = true,
     ) {
         val branchKey = "$instanceKey:$fieldName"
         val editableFieldName = fieldName
@@ -1639,7 +1656,7 @@ internal class PipelineFlowPanel(
             if (boundary != null) {
                 if (targetKey != null) logicOccurrences.getOrPut(targetKey, ::mutableListOf).add("$candidateKey:card")
                 appendLogicRow(rows, "$candidateKey:card", depth,
-                    revision = listOf(reference, location, targetLocation?.let(::effectiveNode), editableFieldName, fieldName, index, references.size, currentTrace, expansionBoundary, anchorResolution)) {
+                    revision = listOf(reference, location, targetLocation?.let(::effectiveNode), editableFieldName, fieldName, index, references.size, currentTrace, expansionBoundary, anchorResolution, targetRow)) {
                     addLogicCandidateCard(
                         index = index,
                         reference = reference,
@@ -1650,9 +1667,9 @@ internal class PipelineFlowPanel(
                         sourceLocation = location,
                         referenceCount = references.size,
                         targetLocation = targetLocation,
-                        showTargetName = true,
                         boundaryKind = expansionBoundary,
                         anchorResolution = anchorResolution,
+                        cycleTargetRow = targetRow,
                     )
                 }
                 if (!reference.isAnchor && expansionBoundary != PipelineExpansionBoundary.CYCLE) {
@@ -1660,22 +1677,11 @@ internal class PipelineFlowPanel(
                 }
                 if (reference.isAnchor && targetLocation == null) {
                     appendAnchorCandidates(location, reference, candidateKey, rows, depth, ancestors, bindings, anchorResolution!!,
-                        revealIndex)
-                } else if (targetLocation != null) {
+                        revealIndex, jumpBackReturn, allowJumpBack && fieldName != "on_error")
+                } else if (targetLocation != null && expansionBoundary != PipelineExpansionBoundary.CYCLE) {
                     appendLogicRow(rows, "$candidateKey:continue", depth,
                         revision = listOf(targetLocation, targetRow, candidateKey, expansionBoundary)) { panel ->
-                        if (expansionBoundary == PipelineExpansionBoundary.CYCLE) {
-                            panel.add(JButton("↩ 回到此层").apply {
-                                isFocusable = false
-                                alignmentX = LEFT_ALIGNMENT
-                                addActionListener {
-                                    logicPanel.scrollAnchor()?.let(readingHistory::addLast)
-                                    targetRow?.let { logicPanel.revealRowIfNeeded(it); logicPanel.activateRow(it) }
-                                    inspectNode(targetLocation)
-                                }
-                            })
-                        }
-                        if (expansionBoundary != PipelineExpansionBoundary.CYCLE) panel.add(JButton(
+                        panel.add(JButton(
                             if (expansionBoundary == PipelineExpansionBoundary.BUDGET) "继续展开（下一批）" else "在此展开"
                         ).apply {
                             isFocusable = false
@@ -1698,6 +1704,12 @@ internal class PipelineFlowPanel(
                     instanceKey = PipelineExpansionPolicy.instanceKey(candidateKey, targetKey),
                     anchorContext = candidateAnchor?.let { bindings.bind(it, reference.targetName) } ?: bindings,
                     revealIndex = if (revealTarget) revealIndex + 1 else -1,
+                    jumpBackReturn = when {
+                        fieldName == "subtask" || fieldName == "on_error" -> null
+                        reference.isJumpBack && allowJumpBack -> LogicJumpBackReturn(
+                            PipelineExpansionPolicy.instanceKey(candidateKey, targetKey) + ":header", targetLocation, location.name)
+                        else -> jumpBackReturn
+                    },
                     incoming = LogicIncomingBranch(
                         index = index,
                         reference = reference,
@@ -1715,7 +1727,8 @@ internal class PipelineFlowPanel(
 
     private fun appendAnchorCandidates(location: PipelineNodeLocation, reference: PipelineReference, key: String,
         rows: MutableList<PipelineRow>, depth: Int, ancestors: Set<String>,
-        bindings: PipelineAnchorContext, resolution: PipelineAnchorResolution, revealIndex: Int = -1) {
+        bindings: PipelineAnchorContext, resolution: PipelineAnchorResolution, revealIndex: Int = -1,
+        jumpBackReturn: LogicJumpBackReturn? = null, allowJumpBack: Boolean = true) {
         val candidates = resolution.targets.map { target ->
             reference.copy(targetName = target.name, displayName = target.name, isAnchor = false,
                 targetExists = true, isAnchorUnresolved = false, target = PipelineNodeTarget(target.sourceFile ?: file, target.name, target.nameRange,
@@ -1734,7 +1747,7 @@ internal class PipelineFlowPanel(
         }
         if (key in expandedBranches) scheduleLogic {
             appendVirtualLogicBranch(location, candidates, "anchor_candidate", rows, depth + 1,
-                ancestors, "$key:dynamic", bindings, reference.targetName, revealIndex)
+                ancestors, "$key:dynamic", bindings, reference.targetName, revealIndex, jumpBackReturn, allowJumpBack)
         }
     }
 
@@ -1807,35 +1820,42 @@ internal class PipelineFlowPanel(
         sourceLocation: PipelineNodeLocation? = null,
         referenceCount: Int = 1,
         targetLocation: PipelineNodeLocation? = null,
-        showTargetName: Boolean = true,
         boundaryKind: PipelineExpansionBoundary? = null,
         anchorResolution: PipelineAnchorResolution? = null,
+        cycleTargetRow: String? = null,
     ) {
             val heading = logicCandidateHeading(
                 index = index,
                 reference = reference,
-                traceNodeName = traceNodeName,
-                showTargetName = showTargetName,
                 conditionSummary = targetLocation?.let { PipelineConditionSummary.flowCondition(effectiveNode(it)) },
                 fieldName = fieldName,
                 boundTargetName = targetLocation?.name.takeIf { reference.isAnchor },
                 clearedAnchor = anchorResolution?.isCleared == true,
                 anchorMayBeUnset = anchorResolution?.value?.mayBeUnset == true,
+                subtaskSource = sourceLocation,
+                referenceCount = referenceCount,
             )
         val card = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = JBUI.Borders.empty(2, 0)
             alignmentX = LEFT_ALIGNMENT
         }
-        val boundaryLabel = when (boundaryKind) {
-            PipelineExpansionBoundary.CYCLE -> " · ↩ 循环"
-            else -> ""
-        }
+        val cycle = boundaryKind == PipelineExpansionBoundary.CYCLE
+        val text = logicBlockHeading(heading, targetLocation?.let(::effectiveNode), reference, hasBody = false, cycle = cycle)
+        val cycleLink = if (cycle && targetLocation != null && cycleTargetRow != null) {
+            val start = text.indexOf("[循环引用]")
+            PipelineTextLink(TextRange(start, start + "[循环引用]".length), PipelineFlowTooltip.render(listOf(
+                PipelineConditionDetail("重新检查该节点的条件；满足后继续执行。"),
+            ), getFontMetrics(UIUtil.getLabelFont()))) {
+                revealLogicReturn(LogicJumpBackReturn(cycleTargetRow, targetLocation, traceNodeName.orEmpty()))
+            }
+        } else null
         card.add(
-            createLogicHeading(heading + boundaryLabel, targetLocation, reference, fieldName, traceNodeName,
-                anchorResolution?.hint(), subtaskSource = sourceLocation),
+            createLogicHeading(text, targetLocation, reference, fieldName, traceNodeName,
+                anchorResolution?.hint(), subtaskSource = sourceLocation, navigationLink = cycleLink),
             BorderLayout.CENTER,
         )
+        card.add(logicFoldGutter(null), BorderLayout.WEST)
         card.maximumSize = Dimension(Int.MAX_VALUE, card.preferredSize.height)
         container.add(card)
     }
@@ -1843,34 +1863,61 @@ internal class PipelineFlowPanel(
     private fun logicCandidateHeading(
         index: Int,
         reference: PipelineReference,
-        traceNodeName: String?,
-        showTargetName: Boolean,
         conditionSummary: String? = null,
         fieldName: String = "next",
         boundTargetName: String? = null,
         clearedAnchor: Boolean = false,
         anchorMayBeUnset: Boolean = false,
+        subtaskSource: PipelineNodeLocation? = null,
+        referenceCount: Int = 1,
     ): String {
-        if (fieldName == "subtask") return "${index + 1}. subtask → ${reference.targetName}"
-        if (fieldName == "anchor_candidate") return "可能目标（运行时绑定） → ${reference.targetName}"
-        val jumpBack = if (reference.isJumpBack) {
-            "[JumpBack] "
-        } else ""
+        if (fieldName == "subtask") {
+            val repeat = if (referenceCount == 1 && subtaskSource != null) {
+                PipelineConditionSummary.repeatPrefix(effectiveNode(subtaskSource), PipelinePropertyCatalog.resourceDefaults(subtaskSource, currentModel))
+            } else ""
+            return "${repeat}subtask"
+        }
         if (reference.isAnchor && boundTargetName == null) {
-            return "${index + 1}. $jumpBack${if (clearedAnchor) "skip" else PipelineConditionSummary.candidatePrefix(index, fieldName)} ${reference.targetName}${if (clearedAnchor) "（已清除）" else " 已绑定"} · 运行时绑定"
+            return if (clearedAnchor) "skip" else PipelineConditionSummary.flowBranch(index, fieldName, "${reference.targetName} 已绑定")
         }
-        return buildString {
-            append("${index + 1}. ")
-            append(jumpBack)
-            val condition = PipelineConditionSummary.flowCandidateCondition(reference, conditionSummary)
-            append(PipelineConditionSummary.flowBranch(index, fieldName,
-                if (reference.isAnchor) PipelineConditionSummary.anchorCondition(condition, reference.targetName, anchorMayBeUnset) else condition))
-            append(if (showTargetName) " → ${boundTargetName ?: reference.targetName}" else " →")
-            if (boundTargetName != null) {
-                append(" · 运行时绑定")
-            }
-        }
+        val condition = PipelineConditionSummary.flowCandidateCondition(reference, conditionSummary)
+        return PipelineConditionSummary.flowBranch(index, fieldName,
+            if (reference.isAnchor) PipelineConditionSummary.anchorCondition(condition, reference.targetName, anchorMayBeUnset) else condition)
     }
+
+    private fun logicBlockHeading(branch: String, location: PipelineNodeLocation?, reference: PipelineReference?,
+        hasBody: Boolean, collapsed: Boolean = false, cycle: Boolean = false, suffix: String = ""): String = buildString {
+        append(branch).append(" {\n")
+        if (cycle) append("[循环引用]")
+        if (reference?.isJumpBack == true) append("[jumpback]")
+        if (reference?.isAnchor == true) append("[anchor]")
+        append(location?.name ?: reference?.targetName.orEmpty())
+        val description = (location?.description ?: reference?.target?.description)?.replace(Regex("\\s+"), " ")?.trim()
+        if (!description.isNullOrEmpty()) append('(').append(description).append(')')
+        append(suffix)
+        if (collapsed && hasBody) append(" …")
+        if (!hasBody || collapsed) append("\n}")
+    }
+
+    private fun logicFoldGutter(marker: JComponent?): JComponent = JPanel(BorderLayout()).apply {
+        isOpaque = false
+        preferredSize = JBUI.size(if (marker == null) 0 else 16, 24)
+        if (marker != null) add(marker, BorderLayout.NORTH)
+    }
+
+    private fun revealLogicReturn(target: LogicJumpBackReturn) {
+        logicPanel.scrollAnchor()?.let(readingHistory::addLast)
+        inspectNode(target.location)
+        logicPanel.activateRow(target.rowKey)
+        logicPanel.revealRowIfNeeded(target.rowKey)
+    }
+
+    private fun jumpBackReturnTooltip(target: LogicJumpBackReturn): String = PipelineFlowTooltip.render(listOf(
+        PipelineConditionDetail("当前子链正常结束，回到 [jumpback]${target.location.name} 的调用处。"),
+        PipelineConditionDetail("从父节点 ${target.parentName} 的 next 第一项重新识别，不重新执行父节点条件或动作。", 1),
+        PipelineConditionDetail("next 全不命中会先重试至超时并进入 on_error，不直接在这里返回。", 1),
+        PipelineConditionDetail("按 IDEA 的转到声明手势点击 break，定位到对应 JumpBack 调用位置。", 1),
+    ), getFontMetrics(UIUtil.getLabelFont()))
 
     private fun createLogicHeading(
         text: String,
@@ -1881,6 +1928,7 @@ internal class PipelineFlowPanel(
         anchorHint: String? = null,
         bold: Boolean = false,
         subtaskSource: PipelineNodeLocation? = null,
+        navigationLink: PipelineTextLink? = null,
     ): JComponent {
         val recognition = location?.let { effectiveNode(it).recognition }
         val conditionDetails = if (location != null) recognition?.readingDetails?.takeIf { it.isNotEmpty() }
@@ -1896,7 +1944,7 @@ internal class PipelineFlowPanel(
             operationHint = if (location != null) "点击查看详情 · Ctrl+点击跳转源码" else "目标暂时无法在流程索引中展开",
         )
         fun label(part: String): JComponent {
-            val component = if (location != null) createFlowSelectionLabel(part, location, fieldName == "on_error")
+            val component = if (location != null) createFlowSelectionLabel(part, location, fieldName == "on_error", navigationLink = navigationLink)
                 else reference?.let { createFlowReferenceLabel(part, it, null, fieldName == "on_error") } ?: JBLabel(part)
             if (bold) component.font = component.font.deriveFont(Font.BOLD)
             component.toolTipText = tooltip
@@ -1917,8 +1965,14 @@ internal class PipelineFlowPanel(
             listOf("continue", "strict").forEach { name ->
                 parameters?.get(name)?.let { add(PipelineConditionDetail("$name = $it", 1)) }
             }
+            PipelineConditionSummary.repeatPrefix(source, PipelinePropertyCatalog.resourceDefaults(source, currentModel))
+                .takeIf { it.isNotEmpty() }?.let {
+                    add(PipelineConditionDetail("$it：重复整个 SubTask 动作，每次重新执行子任务调用列表。", 1))
+                }
         }
     }
+
+    private data class LogicJumpBackReturn(val rowKey: String, val location: PipelineNodeLocation, val parentName: String)
 
     private data class LogicIncomingBranch(
         val index: Int,
@@ -3705,15 +3759,25 @@ internal class PipelineFlowPanel(
         location: PipelineNodeLocation,
         errorBranch: Boolean = false,
         onSelect: (() -> Unit)? = null,
+        navigationLink: PipelineTextLink? = null,
     ): JComponent = PipelineStyledText(text).apply {
-        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        this.navigationLink = navigationLink
+        cursor = Cursor.getDefaultCursor()
         foreground = UIUtil.getLabelForeground()
         border = JBUI.Borders.empty(2, 4)
         maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
         toolTipText = "点击在右侧查看详情；按 Ctrl+点击跳转源码"
+        fun updateHover(event: MouseEvent) {
+            val overText = textOffsetAt(event.point) != null
+            setFlowHovered(overText)
+            cursor = if (overText) Cursor.getPredefinedCursor(Cursor.HAND_CURSOR) else Cursor.getDefaultCursor()
+        }
+        addMouseMotionListener(object : java.awt.event.MouseMotionAdapter() {
+            override fun mouseMoved(event: MouseEvent) = updateHover(event)
+        })
         addMouseListener(object : MouseAdapter() {
             override fun mouseEntered(event: MouseEvent) {
-                setFlowHovered(true)
+                updateHover(event)
             }
 
             override fun mouseExited(event: MouseEvent) {
@@ -3721,8 +3785,9 @@ internal class PipelineFlowPanel(
             }
 
             override fun mouseClicked(event: MouseEvent) {
+                if (textOffsetAt(event.point) == null) return
                 if (selectedText.isNullOrEmpty() && isFlowSourceNavigationGesture(event)) {
-                    navigateToFileRange(location.sourceFile ?: file, location.nameRange)
+                    if (!navigateLink(event)) navigateToFileRange(location.sourceFile ?: file, location.nameRange)
                 } else if (event.button == MouseEvent.BUTTON1 && selectedText.isNullOrEmpty()) {
                     if (onSelect != null) onSelect() else inspectNode(location)
                 }
@@ -3731,16 +3796,22 @@ internal class PipelineFlowPanel(
     }
 
     private fun isFlowSourceNavigationGesture(event: MouseEvent): Boolean {
+        if (event.button == MouseEvent.BUTTON1 && !event.isControlDown && !event.isMetaDown &&
+            !event.isAltDown && !event.isShiftDown) return false
         val configured = KeymapManager.getInstance().activeKeymap
             .getShortcuts(IdeActions.ACTION_GOTO_DECLARATION)
             .filterIsInstance<MouseShortcut>()
-        if (configured.isNotEmpty()) return configured.any { shortcut ->
+        if (configured.any { shortcut ->
                 shortcut.button == event.button && shortcut.clickCount == event.clickCount &&
                     configuredMouseModifiersMatch(shortcut.modifiers, event)
-            }
-        // Windows 的 MouseEvent.modifiers 与 IDEA MouseShortcut.modifiers 可能使用不同掩码；
-        // 即使当前 keymap 没有暴露鼠标快捷键，也保留 IDEA 通用的 Ctrl/Meta+点击约定。
-        return event.button == MouseEvent.BUTTON1 && (event.isControlDown || event.isMetaDown)
+            }) return true
+        val keyboardModifiers = InputEvent.CTRL_MASK or InputEvent.CTRL_DOWN_MASK or
+            InputEvent.ALT_MASK or InputEvent.ALT_DOWN_MASK or InputEvent.SHIFT_MASK or InputEvent.SHIFT_DOWN_MASK or
+            InputEvent.META_MASK or InputEvent.META_DOWN_MASK
+        if (configured.any { it.button == MouseEvent.BUTTON1 && it.modifiers and keyboardModifiers != 0 }) return false
+        // 默认键位可能只列出中键跳转；这种情况下仍保留平台的 Ctrl/Meta+左键约定。
+        return event.button == MouseEvent.BUTTON1 && (event.isControlDown || event.isMetaDown) &&
+            !event.isAltDown && !event.isShiftDown
     }
 
     private fun configuredMouseModifiersMatch(configured: Int, event: MouseEvent): Boolean {

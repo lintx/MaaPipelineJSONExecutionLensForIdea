@@ -5,7 +5,10 @@ import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import java.awt.Dimension
+import java.awt.Point
 import java.awt.Rectangle
+import java.awt.event.MouseEvent
+import com.intellij.openapi.util.TextRange
 import javax.swing.JTextPane
 import javax.swing.text.*
 
@@ -20,9 +23,12 @@ internal class PipelineSelectionCaret : DefaultCaret() {
     }
 }
 
+internal data class PipelineTextLink(val range: TextRange, val tooltip: String, val navigate: () -> Unit)
+
 internal class PipelineStyledText(value: String) : JTextPane() {
     private var flowSelected = false
     private var flowHovered = false
+    var navigationLink: PipelineTextLink? = null
     init {
         editorKit = object : StyledEditorKit() {
             override fun getViewFactory(): ViewFactory = ViewFactory { element ->
@@ -59,6 +65,35 @@ internal class PipelineStyledText(value: String) : JTextPane() {
         updateTextColors()
     }
 
+    fun navigateLink(event: MouseEvent): Boolean {
+        val link = navigationLink ?: return false
+        val offset = textOffsetAt(event.point) ?: return false
+        if (offset !in link.range.startOffset until link.range.endOffset) return false
+        link.navigate()
+        return true
+    }
+
+    fun textOffsetAt(point: Point): Int? {
+        if (!contains(point)) return null
+        val nearest = viewToModel2D(point)
+        // Swing 返回最近的插入位置；必须检查字符矩形，避免空白被当成链接。
+        return listOf(nearest, nearest - 1).firstOrNull { offset ->
+            if (offset !in text.indices || text[offset].isWhitespace()) return@firstOrNull false
+            val start = modelToView2D(offset) ?: return@firstOrNull false
+            val end = modelToView2D(offset + 1) ?: return@firstOrNull false
+            val characterWidth = if (start.y == end.y) end.x - start.x
+                else getFontMetrics(font).charWidth(text[offset]).toDouble()
+            point.x >= start.x && point.x < start.x + characterWidth &&
+                point.y >= start.y && point.y < start.y + start.height
+        }
+    }
+
+    override fun getToolTipText(event: MouseEvent): String? {
+        val offset = textOffsetAt(event.point) ?: return null
+        return navigationLink?.takeIf { offset in it.range.startOffset until it.range.endOffset }?.tooltip
+            ?: super.getToolTipText(event)
+    }
+
     private fun updateTextColors() {
         val highlighted = flowSelected || flowHovered
         val normal = UIUtil.getLabelForeground()
@@ -68,7 +103,9 @@ internal class PipelineStyledText(value: String) : JTextPane() {
         val scheme = EditorColorsManager.getInstance().globalScheme
         PipelineTokenColors.ranges(text).forEach { (range, key) ->
             val attributes = SimpleAttributeSet()
-            if (!highlighted) scheme.getAttributes(key)?.foregroundColor?.let { StyleConstants.setForeground(attributes, it) }
+            if (!highlighted || key == com.intellij.openapi.editor.DefaultLanguageHighlighterColors.METADATA) {
+                scheme.getAttributes(key)?.foregroundColor?.let { StyleConstants.setForeground(attributes, it) }
+            }
             StyleConstants.setBold(attributes, key != com.intellij.openapi.editor.DefaultLanguageHighlighterColors.NUMBER)
             styledDocument.setCharacterAttributes(range.startOffset, range.length, attributes, false)
         }

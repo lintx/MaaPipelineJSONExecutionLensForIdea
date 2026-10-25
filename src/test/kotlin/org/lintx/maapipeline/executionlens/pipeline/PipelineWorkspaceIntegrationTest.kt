@@ -262,7 +262,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val logic = field("logicPanel").get(panel) as PipelineRowsPanel
             val components = logic.components.toList()
             assertTrue(logic.findRows("共享终点").isNotEmpty())
-            assertEquals("共享节点在每个调用处展开", 2, textComponents(logic).count { it.text == "共享终点" })
+            assertEquals("共享节点在每个调用处展开", 2, textComponents(logic).count { it.text.contains("Shared(共享终点)") })
             assertEquals("查找不能重建流程", components, logic.components.toList())
             logic.findRows("")
             val locate = PipelineFlowPanel::class.java.getDeclaredMethod("locateDetailInFlow").apply { isAccessible = true }
@@ -351,7 +351,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val details = field("detailsPanel").get(panel) as javax.swing.JPanel
             PlatformTestUtil.waitWithEventsDispatching("模拟流程未就绪", {
                 (field("currentModel").get(panel) as PipelineDocumentModel).version >= 0 &&
-                    !field("contextLoading").getBoolean(panel) && textComponents(logic).any { it.text.contains("→ Branch") }
+                    !field("contextLoading").getBoolean(panel) && textComponents(logic).any { it.text.contains("\nBranch") }
             }, 30)
             fun invoke(name: String) = PipelineFlowPanel::class.java.getDeclaredMethod(name).apply { isAccessible = true }.invoke(panel)
             fun step() = PipelineFlowPanel::class.java.getDeclaredMethod("chooseSimulationStep", Boolean::class.javaPrimitiveType)
@@ -363,7 +363,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val click = java.awt.event.MouseEvent(fold, java.awt.event.MouseEvent.MOUSE_CLICKED,
                 System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
             fold.mouseListeners.forEach { it.mouseClicked(click) }
-            assertFalse(textComponents(logic).any { it.text.contains("→ Left") })
+            assertFalse(textComponents(logic).any { it.text.contains("\nLeft") })
             invoke("startSimulation")
             assertEquals(1, runs(logic).size)
             val toolbar = field("playbackToolbar").get(panel) as PipelinePlaybackToolbar
@@ -371,7 +371,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             step()
             assertEquals("Branch", cursor().frame?.nodeName)
             assertEquals(2, cursor().size)
-            assertTrue("进入已折叠节点应自动展开，与跟随滚动开关无关", textComponents(logic).any { it.text.contains("→ Left") })
+            assertTrue("进入已折叠节点应自动展开，与跟随滚动开关无关", textComponents(logic).any { it.text.contains("\nLeft") })
             step()
             assertEquals("多候选等待就地选择，不能擅自前进", 2, cursor().size)
             assertEquals(3, runs(logic).size)
@@ -901,13 +901,15 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 return rowsField.get(logic) as List<PipelineRow>
             }
             fun labels(): List<Component> = rows().flatMap { textComponents(it.createComponent()) }
-            PlatformTestUtil.waitWithEventsDispatching("子任务流程未展开", { labels().count { it.text.contains("CHILD_BODY") } == 2 }, 30)
-            assertFalse(labels().any { it.text.contains("DISABLED_BODY") })
+            PlatformTestUtil.waitWithEventsDispatching("子任务流程未展开", { labels().count { it.text.contains("Child(CHILD_BODY)") } == 2 }, 30)
+            assertTrue("折叠的禁用节点仍保留名称与说明", labels().any { it.text.contains("Disabled(DISABLED_BODY)") })
+            val disabledIndex = rows().indexOfFirst { row -> textComponents(row.createComponent()).any { it.text.contains("Disabled(DISABLED_BODY)") } }
+            assertTrue("禁用节点的 next 主体应保持折叠", textComponents(rows()[disabledIndex + 1].createComponent()).any { it.text.contains("\nShared") })
             assertTrue(labels().any { it.text.contains("可由任务选项覆盖") })
             assertFalse(labels().any { it.text.contains("SubTask ·") || it.text.contains("call →") || it.text.contains("rate_limit") })
-            val subtaskRow = rows().first { row -> textComponents(row.createComponent()).any { it.text.contains("subtask → Child") } }
+            val subtaskRow = rows().first { row -> textComponents(row.createComponent()).any { it.text.startsWith("subtask {\nChild(CHILD_BODY)") } }
             val subtaskIndex = rows().indexOf(subtaskRow)
-            assertTrue(textComponents(rows()[subtaskIndex + 1].createComponent()).any { it.text == "CHILD_BODY" })
+            assertTrue(textComponents(rows()[subtaskIndex + 1].createComponent()).any { it.text == "timeout=345" })
             val action = labels().filterIsInstance<PipelineStyledText>().first { it.text.startsWith("执行动作 Click") }
             assertFalse("只强调关键字，不能整行加粗", action.font.isBold)
             assertTrue(action.toolTipText.contains("target"))
@@ -931,9 +933,10 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 marker.mouseListeners.forEach { it.mouseClicked(event) }
             }
             toggle()
-            assertEquals(1, labels().count { it.text == "CHILD_BODY" })
+            assertEquals("折叠保留两个调用处的节点标题", 2, labels().count { it.text.contains("Child(CHILD_BODY)") })
+            assertEquals(1, labels().count { it.text == "timeout=345" })
             toggle()
-            assertEquals(2, labels().count { it.text == "CHILD_BODY" })
+            assertEquals(2, labels().count { it.text == "timeout=345" })
             fun invoke(name: String) = PipelineFlowPanel::class.java.getDeclaredMethod(name).apply { isAccessible = true }.invoke(panel)
             invoke("startSimulation")
             val simulationField = PipelineFlowPanel::class.java.getDeclaredField("simulation").apply { isAccessible = true }
@@ -943,7 +946,8 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val step = PipelineFlowPanel::class.java.getDeclaredMethod("chooseSimulationStep", Boolean::class.javaPrimitiveType).apply { isAccessible = true }
             repeat(3) { step.invoke(panel, false) }
             assertEquals("Caller", simulation.frames.last().node.name)
-            assertEquals("父流程进入 next 后应收起已完成 subtask", 1, labels().count { it.text == "CHILD_BODY" })
+            assertEquals("父流程进入 next 后应收起已完成 subtask", 1, labels().count { it.text == "timeout=345" })
+            assertEquals("自动收起仍保留子任务标题", 2, labels().count { it.text.contains("Child(CHILD_BODY)") })
             assertTrue("返回父流程即显示下一候选的运行按钮", descendants(logic).filterIsInstance<javax.swing.JButton>().any {
                 it.name == "pipeline-simulation-run" && it.isVisible && it.toolTipText.contains("next → After")
             })
@@ -951,7 +955,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val event = java.awt.event.MouseEvent(fold, java.awt.event.MouseEvent.MOUSE_CLICKED, 0, 0,
                 2, 2, 1, false, java.awt.event.MouseEvent.BUTTON1)
             fold.mouseListeners.forEach { it.mouseClicked(event) }
-            assertEquals(2, labels().count { it.text == "CHILD_BODY" })
+            assertEquals(2, labels().count { it.text == "timeout=345" })
             invoke("stopSimulation")
         } finally { manager.closeFile(workspace.file) }
     }
@@ -1452,12 +1456,15 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val openBefore = manager.openFiles.toSet()
             descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text.contains("个可能目标") }.doClick()
             PlatformTestUtil.waitWithEventsDispatching("候选未展开", {
-                labels().any { it.text.contains("→ Target") }
+                labels().any { it.text.contains("\nTarget") }
             }, 30)
-            val label = labels().single { it.text.contains("→ Target") }
-            assertTrue(label.text.contains("可能目标（运行时绑定）"))
+            val label = labels().filterIsInstance<PipelineStyledText>().single { it.text.contains("\nTarget") }
+            assertTrue(label.text.startsWith("if (OCR) {\nTarget"))
+            label.setSize(1000, 100)
+            val targetBounds = label.modelToView2D(label.text.indexOf("Target")).bounds
             val click = java.awt.event.MouseEvent(label, java.awt.event.MouseEvent.MOUSE_CLICKED,
-                System.currentTimeMillis(), 0, 3, 3, 1, false, java.awt.event.MouseEvent.BUTTON1)
+                System.currentTimeMillis(), 0, targetBounds.x + 1, targetBounds.y + targetBounds.height / 2,
+                1, false, java.awt.event.MouseEvent.BUTTON1)
             label.mouseListeners.forEach { it.mouseClicked(click) }
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals(other, source.currentFile)
@@ -1468,18 +1475,105 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertEquals(labels().sumOf { it.text.count { character -> character == '{' } },
                 labels().sumOf { it.text.count { character -> character == '}' } })
             assertTrue(logic.componentCount < 60)
-            val cycle = labels().single { it.text.contains("· ↩ 循环") }
+            val cycle = labels().filterIsInstance<PipelineStyledText>().single { it.text.contains("[循环引用]") }
             val header = cycle.parent as javax.swing.JPanel
             val controls = (header.layout as java.awt.BorderLayout).getLayoutComponent(java.awt.BorderLayout.SOUTH)
             assertNull("左侧循环候选只负责阅读，不应保留编辑操作", controls)
             assertTrue(descendants(logic).filterIsInstance<javax.swing.JToggleButton>().none { it.text in setOf("回", "锚") })
-            descendants(logic).filterIsInstance<javax.swing.JButton>().single { it.text == "↩ 回到此层" }.doClick()
+            assertTrue(descendants(logic).filterIsInstance<javax.swing.JButton>().none { it.text == "↩ 回到此层" })
+            val link = cycle.navigationLink!!
+            cycle.setSize(1000, 100)
+            val bounds = cycle.modelToView2D(link.range.startOffset + 1).bounds
+            fun cycleEvent(x: Int, y: Int, modifiers: Int = 0, count: Int = 1) = java.awt.event.MouseEvent(
+                cycle, java.awt.event.MouseEvent.MOUSE_CLICKED, System.currentTimeMillis(), modifiers,
+                x, y, count, false, java.awt.event.MouseEvent.BUTTON1)
+            val overLink = cycleEvent(bounds.x + 1, bounds.y + bounds.height / 2)
+            assertEquals(link.tooltip, cycle.getToolTipText(overLink))
+            assertFalse(link.tooltip.contains("当前路径"))
+            val nameBounds = cycle.modelToView2D(link.range.endOffset).bounds
+            assertFalse(link.tooltip == cycle.getToolTipText(cycleEvent(nameBounds.x + 1, nameBounds.y + nameBounds.height / 2)))
+            val emptySpace = cycleEvent(950, bounds.y + bounds.height / 2)
+            assertNull("文字右侧的空白不能出现提示", cycle.getToolTipText(emptySpace))
+            assertFalse("文字右侧的空白不能命中循环链接", cycle.navigateLink(emptySpace))
+            val belowText = cycleEvent(bounds.x + 1, 95)
+            assertNull("文字下方的空白不能出现提示", cycle.getToolTipText(belowText))
+            tabs.selectedIndex = 0
+            for (count in 1..2) {
+                val ordinaryClick = cycleEvent(overLink.x, overLink.y, count = count)
+                cycle.mouseListeners.forEach { it.mouseClicked(ordinaryClick) }
+                com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+                assertEquals("Start", selectedDetailIn(host.component)?.name)
+                assertEquals("普通点击只能查看详情，不能打开源码标签", openBefore, manager.openFiles.toSet())
+            }
+            label.mouseListeners.forEach { it.mouseClicked(click) }
+            assertEquals("Target", selectedDetailIn(host.component)?.name)
+            cycle.setSize(1000, 100)
+            cycle.select(0, 0)
+            val navigationBounds = cycle.modelToView2D(link.range.startOffset + 1).bounds
+            val configured = com.intellij.openapi.keymap.KeymapManager.getInstance().activeKeymap
+                .getShortcuts(com.intellij.openapi.actionSystem.IdeActions.ACTION_GOTO_DECLARATION)
+                .filterIsInstance<com.intellij.openapi.actionSystem.MouseShortcut>().firstOrNull {
+                    it.modifiers and (java.awt.event.InputEvent.CTRL_MASK or java.awt.event.InputEvent.CTRL_DOWN_MASK or
+                        java.awt.event.InputEvent.ALT_MASK or java.awt.event.InputEvent.ALT_DOWN_MASK or
+                        java.awt.event.InputEvent.META_MASK or java.awt.event.InputEvent.META_DOWN_MASK or
+                        java.awt.event.InputEvent.SHIFT_MASK or java.awt.event.InputEvent.SHIFT_DOWN_MASK) != 0
+                }
+            val navigate = java.awt.event.MouseEvent(cycle, java.awt.event.MouseEvent.MOUSE_CLICKED,
+                System.currentTimeMillis(), configured?.modifiers ?: java.awt.event.InputEvent.CTRL_DOWN_MASK,
+                navigationBounds.x + 1, navigationBounds.y + navigationBounds.height / 2, configured?.clickCount ?: 1, false,
+                configured?.button ?: java.awt.event.MouseEvent.BUTTON1)
+            cycle.mouseListeners.forEach { it.mouseClicked(navigate) }
             com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
             assertEquals("Start", selectedDetailIn(host.component)?.name)
         } finally {
             if (attach) logic.removeNotify()
             manager.closeFile(workspace.file)
         }
+    }
+
+    fun testJumpBackEndsRespectNestedCallsErrorsAndIndependentSubTasks() {
+        val file = fixture()
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """
+            {"Start":{"next":["[JumpBack]Outer","Tail"]},
+             "Outer":{"next":["[JumpBack]Inner","Caller","OuterEnd","Stop"],"on_error":["OuterError"]},
+             "Inner":{"next":["InnerEnd"],"on_error":["ErrorEnd"]},
+             "InnerEnd":{},"OuterEnd":{},"OuterError":{},"ErrorEnd":{},"Tail":{},"Stop":{"action":"StopTask"},
+             "Caller":{"repeat":3,"action":{"type":"Custom","param":{"custom_action":"SubTask","custom_action_param":{"sub":["Child"]}}}},
+             "Child":{"desc":"仅识别条件","recognition":{"type":"And","param":{"all_of":["Check"]}}},
+             "Check":{"recognition":"OCR","expected":"ready"},
+             "Mixed":{"recognition":{"type":"And","param":{"all_of":[
+               {"recognition":{"type":"Or","param":{"any_of":["Check",{"recognition":"OCR"}]}}},"Child"]}}}}
+        """.trimIndent())
+        val model = ReadAction.compute<PipelineDocumentModel, RuntimeException> { PipelineDocumentIndexer.index(project, file) }
+        val workspace = PipelineWorkspaceState.getInstance(project)
+        workspace.loadState(PipelineWorkspaceStorage())
+        workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
+        workspace.data.lastSourceUrl = file.url
+        val manager = FileEditorManager.getInstance(project)
+        workspace.open()
+        try {
+            val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
+            fun breaks() = textComponents(logic).filterIsInstance<PipelineStyledText>().filter { it.text == "break" }
+            PlatformTestUtil.waitWithEventsDispatching("JumpBack 终点未显示", { breaks().size == 3 }, 30)
+            val text = textComponents(logic)
+            assertTrue(text.any { it.text == "[repeat:3]subtask {\nChild(仅识别条件)\n}" })
+            val child = model.projectNodes.single { it.name == "Child" }
+            assertEquals("{Check}", PipelineConditionSummary.flowCondition(child))
+            assertEquals("if (({Check} or OCR) and {Child})", PipelineConditionSummary.flowBranch(0, "next",
+                PipelineConditionSummary.flowCondition(model.projectNodes.single { it.name == "Mixed" })))
+            assertTrue("空节点不显示折叠箭头", descendants(logic).filterIsInstance<javax.swing.JComponent>().none {
+                it.toolTipText in setOf("展开Child", "收起Child")
+            })
+            assertEquals(2, breaks().count { it.navigationLink!!.tooltip.contains("[jumpback]Outer") })
+            val innerEnd = breaks().single { it.navigationLink!!.tooltip.contains("[jumpback]Inner") }
+            assertTrue(innerEnd.navigationLink!!.tooltip.contains("父节点 Outer"))
+            val openBefore = manager.openFiles.toSet()
+            innerEnd.navigationLink!!.navigate()
+            assertEquals("Inner", selectedDetailIn(host.component)?.name)
+            assertEquals("流程内返回定位不能打开源码标签", openBefore, manager.openFiles.toSet())
+            assertTrue(text.none { it.text.startsWith("1.") || it.text.contains("→ Outer") || it.text.contains("repeat=3") })
+        } finally { manager.closeFile(workspace.file) }
     }
 
     private fun replaceFixtureFile(path: String, text: String) {

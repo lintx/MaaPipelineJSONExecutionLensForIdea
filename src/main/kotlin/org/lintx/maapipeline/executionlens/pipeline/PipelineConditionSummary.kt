@@ -43,15 +43,26 @@ internal object PipelineConditionSummary {
     fun flowBranch(index: Int, field: String, condition: String): String {
         val prefix = if (field == "on_error") "on_error: " else ""
         val branch = if (condition == "无条件执行") {
-            if (index == 0) condition else "else $condition"
-        } else "${if (index == 0) "if" else "else if"} $condition"
+            if (index == 0) condition else "else"
+        } else "${if (index == 0) "if" else "else if"} (${unwrapCondition(condition)})"
         return prefix + branch
+    }
+
+    private fun unwrapCondition(condition: String): String {
+        if (!condition.startsWith('(') || !condition.endsWith(')')) return condition
+        var depth = 0
+        for ((index, character) in condition.withIndex()) {
+            if (character == '(') depth++
+            if (character == ')') depth--
+            if (depth == 0 && index < condition.lastIndex) return condition
+        }
+        return condition.substring(1, condition.lastIndex)
     }
 
     fun anchorCondition(condition: String, name: String, mayBeUnset: Boolean): String = when {
         !mayBeUnset -> condition
         condition == "无条件执行" -> "$name 已绑定"
-        else -> "$name 已绑定 && $condition"
+        else -> "$name 已绑定 and (${unwrapCondition(condition)})"
     }
 
     fun anchorChange(definition: PipelineAnchorDefinition, ownerName: String): String =
@@ -64,8 +75,17 @@ internal object PipelineConditionSummary {
         "JumpBack：此节点及其 next 链正常结束后，从${parentName?.let { "父节点 $it 的" } ?: "父节点的"} next 第一项重新尝试；不重新执行父节点动作。"
     }
 
-    fun action(node: PipelineNodeLocation): String? =
-        node.action?.summary?.let { "执行动作 $it" }
+    fun repeatPrefix(node: PipelineNodeLocation, resource: com.google.gson.JsonObject = com.google.gson.JsonObject()): String {
+        val repeat = (PipelineVisualModel.parse(node.rawJson)?.get("repeat")
+            ?: resource.get("Default")?.takeIf { it.isJsonObject }?.asJsonObject?.get("repeat"))?.toString() ?: "1"
+        return if (repeat == "1") "" else "[repeat:$repeat]"
+    }
+
+    fun action(node: PipelineNodeLocation, resource: com.google.gson.JsonObject = com.google.gson.JsonObject()): String? {
+        val prefix = repeatPrefix(node, resource)
+        val action = node.action?.summary ?: if (prefix.isNotEmpty()) "DoNothing" else return null
+        return "${prefix}执行动作 $action"
+    }
 
     fun anchor(node: PipelineNodeLocation): String? =
         node.anchor?.summary?.let { "设置 Anchor $it" }

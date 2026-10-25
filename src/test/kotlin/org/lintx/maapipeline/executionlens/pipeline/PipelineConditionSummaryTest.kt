@@ -107,12 +107,15 @@ class PipelineConditionSummaryTest {
         assertEquals("无条件执行", PipelineConditionSummary.flowCondition(direct))
         assertEquals("无条件执行", PipelineConditionSummary.entryCondition(direct))
         val conditional = node.copy(recognition = PipelineFieldLocation("recognition", "And（很长的完整参数）", TextRange(0, 1),
-            readingSummary = "And(OCR, TemplateMatch)"))
-        assertEquals("And(OCR, TemplateMatch)", PipelineConditionSummary.flowCondition(conditional))
-        assertEquals("if And(OCR, TemplateMatch)", PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(conditional)))
+            readingSummary = "(OCR and TemplateMatch)"))
+        assertEquals("(OCR and TemplateMatch)", PipelineConditionSummary.flowCondition(conditional))
+        assertEquals("if (OCR and TemplateMatch)", PipelineConditionSummary.flowBranch(0, "next", PipelineConditionSummary.flowCondition(conditional)))
+        assertEquals("if ((OCR or TemplateMatch) and ColorMatch)", PipelineConditionSummary.flowBranch(0, "next", "((OCR or TemplateMatch) and ColorMatch)"))
         assertEquals("无条件执行", PipelineConditionSummary.flowBranch(0, "next", "无条件执行"))
-        assertEquals("else 无条件执行", PipelineConditionSummary.flowBranch(1, "next", "无条件执行"))
-        assertEquals("on_error: else if OCR", PipelineConditionSummary.flowBranch(1, "on_error", "OCR"))
+        assertEquals("else", PipelineConditionSummary.flowBranch(1, "next", "无条件执行"))
+        assertEquals("on_error: else if (OCR)", PipelineConditionSummary.flowBranch(1, "on_error", "OCR"))
+        val repeated = node.copy(action = PipelineFieldLocation("action", "Click", TextRange(0, 1)), rawJson = """{"repeat":3}""")
+        assertEquals("[repeat:3]执行动作 Click", PipelineConditionSummary.action(repeated))
     }
 
     @Test
@@ -128,8 +131,8 @@ class PipelineConditionSummaryTest {
     @Test
     fun optionalAnchorAddsAnEntryGuardAndCertainBindingsStayCompact() {
         assertEquals("Resume 已绑定", PipelineConditionSummary.anchorCondition("无条件执行", "Resume", true))
-        assertEquals("Resume 已绑定 && And(OCR, TemplateMatch)",
-            PipelineConditionSummary.anchorCondition("And(OCR, TemplateMatch)", "Resume", true))
+        assertEquals("Resume 已绑定 and (OCR and TemplateMatch)",
+            PipelineConditionSummary.anchorCondition("(OCR and TemplateMatch)", "Resume", true))
         assertEquals("无条件执行", PipelineConditionSummary.anchorCondition("无条件执行", "Resume", false))
         assertEquals("OCR", PipelineConditionSummary.anchorCondition("OCR", "Resume", false))
     }

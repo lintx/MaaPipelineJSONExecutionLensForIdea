@@ -943,7 +943,8 @@ internal object PipelineDocumentIndexer {
                 ?.let { "自定义(${it.take(40)}${if (it.length > 40) "…" else ""})" } ?: "自定义"
             "And", "Or" -> {
                 val children = parameter(if (type == "And") "all_of" else "any_of") as? JsonArray
-                if (depth >= 3) "$type(…)" else children?.valueList?.let { values ->
+                val operator = type.lowercase()
+                if (depth >= 3) "$operator(…)" else children?.valueList?.let { values ->
                     val parts = values.take(4).map { child ->
                         val childObject = child as? JsonObject
                         val recognition = childObject?.findProperty("recognition")?.value
@@ -951,15 +952,21 @@ internal object PipelineDocumentIndexer {
                             recognition != null -> summarizeRecognitionForFlow(recognition, childObject, depth + 1)
                             childObject?.findProperty("type") != null -> summarizeRecognitionForFlow(child, childObject, depth + 1)
                             childObject != null -> summarizeRecognitionForFlow(null, childObject, depth + 1)
-                            else -> "引用(${scalarText(child).take(32)})"
+                            else -> "{${scalarText(child)}}"
                         }
                     } + if (values.size > 4) listOf("…") else emptyList()
-                    "$type(${parts.joinToString(", ")})"
-                } ?: "$type(?)"
+                    when (parts.size) {
+                        0 -> "$operator(?)"
+                        1 -> parts.single()
+                        else -> parts.joinToString(" $operator ", "(", ")")
+                    }
+                } ?: "$operator(?)"
             }
             else -> type.take(48)
         }
-        return if (parameter("inverse")?.text == "true") "Not($condition)" else condition
+        return if (parameter("inverse")?.text == "true") {
+            "not " + if (condition.startsWith('(') && condition.endsWith(')')) condition else "($condition)"
+        } else condition
     }
 
     private fun summarizeAction(value: JsonValue?, owner: JsonObject?): String? =
