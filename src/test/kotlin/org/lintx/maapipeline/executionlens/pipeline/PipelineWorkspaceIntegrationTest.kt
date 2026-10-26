@@ -1646,6 +1646,61 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val updated = (modelField.get(panel) as PipelineDocumentModel).projectNodes
                 .single { it.name == "Unrelated" }
             assertTrue(updated.rawJson.contains("after"))
+
+            var showedLoading = false
+            logic.addContainerListener(object : java.awt.event.ContainerAdapter() {
+                override fun componentAdded(event: java.awt.event.ContainerEvent) {
+                    if (textComponents(event.child).any { it.text == "正在应用覆盖参数…" }) showedLoading = true
+                }
+            })
+            tabs.selectedIndex = 1
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            val beforeEdit = modelField.get(panel)
+            viewport.extentSize = java.awt.Dimension(900, 100)
+            viewport.viewSize = java.awt.Dimension(900, logic.preferredSize.height)
+            logic.doLayout()
+            viewport.viewPosition = java.awt.Point(0, 80)
+            assertTrue("回归必须覆盖非顶部阅读位置", viewport.viewPosition.y > 0)
+            val position = viewport.viewPosition
+            val stableRows = logic.components.toList()
+            val comma = textEditor.document.text.indexOf("[\"Done\"]", child.propertyRange.startOffset) + "[\"Done\"]".length
+            WriteCommandAction.runWriteCommandAction(project, "为首次编辑的节点添加尾逗号", null, Runnable {
+                textEditor.document.insertString(comma, ",")
+                textEditor.caretModel.moveToOffset(comma + 1)
+            })
+            fun inputPause() {
+                val until = System.nanoTime() + 250_000_000L
+                PlatformTestUtil.waitWithEventsDispatching("输入停顿未处理", { System.nanoTime() >= until }, 5)
+                assertSame("连续输入期间不应用中间快照", beforeEdit, modelField.get(panel))
+                assertEquals(stableRows, logic.components.toList())
+                assertEquals(position, viewport.viewPosition)
+                assertTrue(textComponents(panel).any { it.text.contains("编辑中 · 流程暂未同步") })
+            }
+            inputPause()
+            WriteCommandAction.runWriteCommandAction(project, Runnable {
+                textEditor.document.insertString(comma + 1, " ")
+                textEditor.caretModel.moveToOffset(comma + 2)
+            })
+            inputPause()
+            val expectedCaret = comma + 2
+            PlatformTestUtil.waitWithEventsDispatching("逗号编辑没有同步", { modelField.get(panel) !== beforeEdit }, 30)
+            com.intellij.openapi.application.impl.NonBlockingReadActionImpl.waitForAsyncTaskCompletion()
+            com.intellij.util.ui.UIUtil.dispatchAllInvocationEvents()
+            assertFalse("文档同步不能先清空流程显示加载行", showedLoading)
+            assertEquals("编辑同步不能导航到节点开头", expectedCaret, textEditor.caretModel.offset)
+            assertEquals("没有高度变化时保持流程滚动位置", position, viewport.viewPosition)
+            val validModel = modelField.get(panel)
+            val quote = textEditor.document.text.indexOf("\"Child\"")
+            WriteCommandAction.runWriteCommandAction(project, Runnable { textEditor.document.deleteString(quote, quote + 1) })
+            PlatformTestUtil.waitWithEventsDispatching("语法未完成时没有保留流程状态", {
+                textComponents(panel).any { it.text.contains("JSON 未完成 · 保留原流程") }
+            }, 30)
+            assertSame(validModel, modelField.get(panel))
+            assertEquals(position, viewport.viewPosition)
+            WriteCommandAction.runWriteCommandAction(project, Runnable { textEditor.document.insertString(quote, "\"") })
+            PlatformTestUtil.waitWithEventsDispatching("恢复语法后没有同步", {
+                modelField.get(panel) !== validModel && textComponents(panel).none { it.text.contains("JSON 未完成") || it.text.contains("正在同步") }
+            }, 30)
         } finally {
             if (attach) logic.removeNotify()
             manager.closeFile(workspace.file)

@@ -70,7 +70,7 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
 
     fun clearNodeSources() { nodeSourceKey = "" }
 
-    fun showNode(node: PipelineNodeLocation, overlays: List<PipelineOverrideLocation>, environmentId: String = "") {
+    fun showNode(node: PipelineNodeLocation, overlays: List<PipelineOverrideLocation>, environmentId: String = "", navigate: Boolean = true) {
         val base = node.sourceFile ?: return
         val resolvedSources = ReadAction.compute<List<PipelineProjectFiles.ResourceSource>, RuntimeException> {
             val manifest = PipelineProjectFiles.manifest(project, base)
@@ -121,7 +121,7 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
         val selectedLayer = layerSources.firstOrNull { it.file == nodeSourceFile }
         val overlay = overlays.lastOrNull { it.file == nodeSourceFile }
         // 内容同步只刷新资源入口；显式选中节点或切换资源时才移动源码光标。
-        if (preservePosition && nodeSourceFile == currentFile) return
+        if ((!navigate && currentFile != null) || preservePosition && nodeSourceFile == currentFile) return
         showFile(nodeSourceFile ?: base, overlay?.range ?: selectedLayer?.let { if (it.file == base) node.nameRange else TextRange(0, 0) } ?: node.nameRange, false)
     }
 
@@ -246,9 +246,11 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
         }
         updateActiveEditor()
         navigating = true
+        val targetOffset = range.startOffset.coerceIn(0, textEditor.editor.document.textLength)
         try {
-            textEditor.editor.caretModel.moveToOffset(range.startOffset.coerceIn(0, textEditor.editor.document.textLength))
+            textEditor.editor.caretModel.moveToOffset(targetOffset)
         } finally { navigating = false }
+        val requestedStamp = textEditor.editor.document.modificationStamp
         while (editors.size > 8) {
             val unused = editors.keys.firstOrNull { it != pinnedFile && it != file } ?: break
             editors.remove(unused)?.let {
@@ -258,9 +260,11 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
         }
         ApplicationManager.getApplication().invokeLater({
             if (disposed || request != generation || textEditor.editor.isDisposed) return@invokeLater
+            // 延后滚动只服务本次导航，不能覆盖用户在下一轮事件中输入或移动的新位置。
+            if (textEditor.editor.document.modificationStamp != requestedStamp ||
+                textEditor.editor.caretModel.offset != targetOffset) return@invokeLater
             navigating = true
             try {
-                textEditor.editor.caretModel.moveToOffset(range.startOffset.coerceIn(0, textEditor.editor.document.textLength))
                 textEditor.editor.scrollingModel.scrollToCaret(ScrollType.CENTER)
                 if (focus && active && workspaceActive) textEditor.editor.contentComponent.requestFocusInWindow()
             } finally { navigating = false }

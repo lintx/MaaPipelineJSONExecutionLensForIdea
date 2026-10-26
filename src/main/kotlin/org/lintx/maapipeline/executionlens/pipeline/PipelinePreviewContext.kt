@@ -29,8 +29,10 @@ internal class PipelinePreviewContext(private val context: PipelineJsonContext) 
                 environmentId = environment.id, controllerType = environment.controller)
         }
         val base = definitions.firstOrNull() ?: return null
-        var json = PipelineJsonc.parse(base.rawJson)
-        definitions.drop(1).forEach { json = PipelineTaskContext.merge(json, PipelineJsonc.parse(it.rawJson)) }
+        // 输入中的不完整 JSON 是正常编辑状态，不能让后台悬停任务向 IDE 抛出解析异常。
+        val parsed = definitions.map { PipelineVisualModel.parse(it.rawJson) ?: return null }
+        var json: com.google.gson.JsonElement = parsed.first()
+        parsed.drop(1).forEach { json = PipelineTaskContext.merge(json, it) }
         return base.copy(rawJson = if (definitions.size == 1) base.rawJson else json.toString(),
             previewSources = definitions.map { PipelinePreviewSource(it.rawJson, it.sourceFile) }).also { catalog[name] = it }
     }

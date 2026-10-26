@@ -12,10 +12,15 @@
     <depends>com.intellij.modules.json</depends>
     <depends>com.intellij.platform.images</depends>
 
+    <extensions defaultExtensionNs="JavaScript">
+        <JsonSchema.ProviderFactory implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonSchemaProvider"/>
+    </extensions>
+
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable parentId="tools" id="org.lintx.maapipeline.settings" displayName="MaaPipeline" instance="org.lintx.maapipeline.executionlens.pipeline.PipelinePreviewSettingsConfigurable"/>
         <json.jsonStandardComplianceProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonCompliance"/>
         <completion.contributor language="JSON" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonCompletion"/>
+        <codeInsight.inlayProvider language="JSON" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonDescriptionHints"/>
         <virtualFileSystem key="maa-pipeline" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineWorkspaceFileSystem" physical="false"/>
         <fileEditorProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
         <postStartupActivity implementation="org.lintx.maapipeline.executionlens.MaaPipelineStartupActivity"/>

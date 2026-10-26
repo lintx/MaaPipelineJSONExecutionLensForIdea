@@ -14,14 +14,37 @@ import com.intellij.util.io.EnumeratorStringDescriptor
 
 class PipelineNavigationIndex : FileBasedIndexExtension<String, String>() {
     override fun getName() = NAME
-    override fun getVersion() = 3
+    override fun getVersion() = 5
     override fun dependsOnFileContent() = true
     override fun getKeyDescriptor() = EnumeratorStringDescriptor()
     override fun getValueExternalizer() = EnumeratorStringDescriptor()
     override fun getInputFilter() = FileBasedIndex.InputFilter { it.extension?.lowercase() in EXTENSIONS }
     override fun getIndexer() = DataIndexer<String, String, FileContent> { input ->
         if (input.contentAsText.length > 2_000_000) emptyMap()
-        else symbols(input.contentAsText.toString(), input.file.extension.orEmpty(), input.file)
+        else {
+            val result = symbols(input.contentAsText.toString(), input.file.extension.orEmpty(), input.file).toMutableMap()
+            if (input.file.extension?.lowercase() in setOf("json", "jsonc")) {
+                val psi = input.psiFile as? com.intellij.json.psi.JsonFile
+                if (psi != null && isMaaJson(psi)) {
+                    val root = psi.topLevelValue as? com.intellij.json.psi.JsonObject
+                    if (PipelineFileDetector.isPipelineFile(input.file, input.contentAsText.toString())) {
+                        root?.propertyList?.forEach { property ->
+                            PipelineJsonSymbols.description(property)?.let {
+                                result["desc:${property.name}"] = com.google.gson.JsonPrimitive(it).toString()
+                            }
+                        }
+                    }
+                    // 仅检查当前被索引文件的 PSI；索引构建期间不解析目标、不访问其他文件。
+                    com.intellij.psi.util.PsiTreeUtil.findChildrenOfType(psi, com.intellij.json.psi.JsonStringLiteral::class.java)
+                        .mapNotNull { literal -> PipelineJsonSymbols.use(literal)?.takeUnless { it.anchor }?.let {
+                            "use:${it.name}" to literal.textOffset.toString()
+                        } }.groupBy({ it.first }, { it.second }).forEach { (key, positions) ->
+                            result[key] = positions.joinToString("\n")
+                        }
+                }
+            }
+            result
+        }
     }
 
     companion object {
@@ -131,6 +154,26 @@ class PipelineNavigationIndex : FileBasedIndexExtension<String, String>() {
                     if (bindingFile.extension == "go") targetFile.parent == bindingFile.parent else true
                 }.mapNotNull { (targetFile, offset) -> offset.toIntOrNull()?.let { targetFile to it } }
             }.distinct()
+        }
+
+        internal fun customNames(project: Project, kind: String): Set<String> {
+            if (DumbService.isDumb(project)) return emptySet()
+            val keys = FileBasedIndex.getInstance().getAllKeys(NAME, project)
+            val prefix = "custom:$kind:"
+            val result = keys.filter { it.startsWith(prefix) }.mapTo(sortedSetOf()) { it.removePrefix(prefix) }
+            val registrations = keys.filter { it.startsWith("registration:$kind:") }.associate { key ->
+                key.substringAfterLast(':') to values(project, key).map { it.first.parent }.toSet()
+            }
+            // 注册名与注册调用可以分属同一 Go 包的不同文件，补全和源码导航必须使用同一绑定规则。
+            if (registrations.isNotEmpty()) {
+                keys.filter { it.startsWith("constant:") }.forEach { key ->
+                    ProgressManager.checkCanceled()
+                    if (values(project, key).any { (file, identifier) -> file.parent in registrations[identifier].orEmpty() }) {
+                        result += key.removePrefix("constant:")
+                    }
+                }
+            }
+            return result
         }
     }
 }

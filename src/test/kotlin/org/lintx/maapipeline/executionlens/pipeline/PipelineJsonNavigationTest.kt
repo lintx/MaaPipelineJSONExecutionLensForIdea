@@ -13,6 +13,68 @@ import java.io.ByteArrayOutputStream
 import javax.imageio.ImageIO
 
 class PipelineJsonNavigationTest : BasePlatformTestCase() {
+    fun testCompositeHoverGroupsReferencesAndSelectsOnlyTheCurrentInlineCondition() {
+        myFixture.addFileToProject("assets/resource/pipeline/Referenced.json", """
+            {"InWorld":{"recognition":"And","all_of":[
+                {"recognition":"TemplateMatch","template":"world-menu.png"},
+                {"recognition":{"type":"OCR","param":{"expected":"world-text"}}}
+            ]}}
+        """.trimIndent())
+        val source = myFixture.addFileToProject("assets/resource/pipeline/Conditions.json", """
+            {"Root":{"recognition":{"type":"And","param":{"all_of":[
+                "InWorld",
+                {"recognition":{"type":"Or","param":{"any_of":[
+                    {"recognition":{"type":"TemplateMatch","param":{"template":"inline-icon.png","green_mask":true}}},
+                    {"recognition":"Custom","custom_recognition":"IconRecognition"}
+                ]}}},
+                {"recognition":"OCR","expected":"other-branch"},
+                {"recognition":"ColorMatch","method":40,"lower":[60,255,255],"upper":[60,255,255]}
+            ]}}}}
+        """.trimIndent())
+        val provider = PipelineJsonDocumentationProvider()
+        fun hover(text: String): String {
+            val element = source.findElementAt(source.text.indexOf(text))!!
+            assertNotNull("应支持悬停 $text", provider.previewElement(element))
+            val modern = PipelineDocumentationTargetProvider().documentationTargets(source, element.textOffset).single()
+            assertNotNull("原生悬停入口应返回文档", modern.computeDocumentation())
+            return provider.generateDoc(element, element)!!
+        }
+        val all = hover("And")
+        assertTrue(all.contains("InWorld: And"))
+        assertTrue(all.contains("world-menu.png")); assertTrue(all.contains("IconRecognition")); assertTrue(all.contains("other-branch"))
+        assertTrue(all.contains("margin-left"))
+        assertTrue(hover("all_of").contains("other-branch"))
+        val reference = hover("InWorld")
+        assertTrue(reference.contains("InWorld: And")); assertTrue(reference.contains("world-menu.png"))
+        assertFalse(reference.contains("inline-icon.png")); assertFalse(reference.contains("other-branch"))
+        val nested = hover("any_of")
+        assertTrue(nested.contains("inline-icon.png")); assertTrue(nested.contains("IconRecognition"))
+        assertFalse(nested.contains("world-menu.png")); assertFalse(nested.contains("other-branch"))
+        val custom = hover("custom_recognition")
+        assertTrue(custom.contains("IconRecognition"))
+        assertFalse(custom.contains("inline-icon.png")); assertFalse(custom.contains("world-menu.png"))
+        val template = hover("inline-icon.png")
+        assertTrue(template.contains("inline-icon.png")); assertFalse(template.contains("IconRecognition"))
+        assertFalse(hover("green_mask").contains("IconRecognition"))
+        val colorLink = Regex("maa-image:(colors:[^\"]+)").find(all)!!.groupValues[1]
+        val full = PipelineHoverImages.load(source.findElementAt(source.text.indexOf("And"))!!, colorLink)!!
+        assertEquals(Color.GREEN.rgb, full.image.getRGB(0, 0))
+    }
+
+    fun testHoverToleratesIncompleteJsonDuringEditing() {
+        val source = myFixture.addFileToProject("assets/resource/pipeline/Incomplete.json", """
+            {"Broken":{"recognition":{"type":"And","param":{"all_of":[
+                {"recognition":"Custom","custom_recognition":"IconRecognition","custom_recognition_param":{"t"}}
+            ]}}}}
+        """.trimIndent())
+        val element = source.findElementAt(source.text.indexOf("custom_recognition"))!!
+        val context = PipelineJsonContext.at(element)!!
+        assertNull(PipelinePreviewContext(context).resolve("Broken"))
+        assertNull(PipelineJsonDocumentationProvider().generateDoc(element, element))
+        assertNull(PipelineHoverImages.load(element, "preview"))
+        assertNull(PipelineDocumentationTargetProvider().documentationTargets(source, element.textOffset).single().computeDocumentation())
+    }
+
     fun testIndexedActionSummaryDoesNotDropTheFourthCoordinate() {
         val psi = myFixture.addFileToProject("assets/resource/pipeline/Main.json", """
             {"Click":{"action":"Click","target":[10,20,30,40]},

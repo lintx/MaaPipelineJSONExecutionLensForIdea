@@ -97,7 +97,10 @@ internal class PipelineFlowPanel(
     private companion object {
         // 逻辑视图只负责帮助理解当前路径；对大型项目设置上限，避免一次创建过多 Swing 组件。
         private const val MAX_LOGIC_NODES = 200
+        private const val EDIT_IDLE_DELAY_MS = 800
     }
+
+    private enum class DocumentState { SYNCED, EDITING, SYNCING, INCOMPLETE }
 
     private data class LogicOverrideNote(val condition: String, val fields: Map<String, String>, val active: Boolean)
 
@@ -166,6 +169,7 @@ internal class PipelineFlowPanel(
     private var detailsDirty = true
     private var renderedContext: String? = null
     private val refreshAlarm = com.intellij.util.Alarm(com.intellij.util.Alarm.ThreadToUse.SWING_THREAD, this)
+    private var documentState = DocumentState.SYNCED
     private var currentTrace: PipelineExecutionTrace? = null
     private var traceSourceVersions: Map<VirtualFile, Long> = emptyMap()
     private var traceSourceVersionState: Boolean? = null
@@ -199,7 +203,7 @@ internal class PipelineFlowPanel(
     private var overrideNotes: Map<String, List<LogicOverrideNote>> = emptyMap()
     private val documentListener = object : DocumentListener {
         override fun documentChanged(event: DocumentEvent) {
-            refreshFromDocument(event.document)
+            refreshFromDocument(event.document, editing = true)
         }
     }
 
@@ -385,7 +389,7 @@ internal class PipelineFlowPanel(
                 val changed = FileDocumentManager.getInstance().getFile(event.document) ?: return
                 if (changed in currentModel.indexedVersions || changed == file ||
                     changed in currentModel.pipelineEntries.map { it.file } ||
-                    changed.path.contains("/locales/")) refreshFromDocument(event.document)
+                    changed.path.contains("/locales/")) refreshFromDocument(event.document, editing = true)
             }
         }, this)
         source.onCaret = { sourceFile, offset ->
@@ -395,7 +399,10 @@ internal class PipelineFlowPanel(
                     session.sourceOffset = offset
                 }
                 val selected = selectedDetail()
-                if (selected?.sourceFile != sourceFile || !selected.propertyRange.containsOffset(offset)) {
+                val sourceDocument = FileDocumentManager.getInstance().getCachedDocument(sourceFile)
+                if (documentState == DocumentState.SYNCED &&
+                    sourceDocument?.modificationStamp == currentModel.indexedVersions[sourceFile] &&
+                    (selected?.sourceFile != sourceFile || !selected.propertyRange.containsOffset(offset))) {
                     val nodes = sourceNodes[sourceFile].orEmpty()
                     val index = nodes.binarySearchBy(offset) { it.propertyRange.startOffset }
                         .let { if (it >= 0) it else -it - 2 }
@@ -838,7 +845,9 @@ internal class PipelineFlowPanel(
         return if (currentTrace == null) label else "$label（日志未记录匹配的启动覆盖）"
     }
 
-    private fun rebuildEffectiveContext() {
+    private fun rebuildEffectiveContext() = rebuildEffectiveContext(false)
+
+    private fun rebuildEffectiveContext(preserveFlow: Boolean) {
         stopSimulation()
         refreshEnvironments()
         playbackToolbar.pause()
@@ -859,20 +868,25 @@ internal class PipelineFlowPanel(
             PipelineTaskContext.activeOverrides(it, currentModel.pipelineOverrides, session.selections)
         }.orEmpty()
         val overrides = if (overrideToggle.isSelected) selectedOverrides else emptyList()
-        effectiveNodes = emptyMap()
-        readingGraph = null
         val temporary = session.temporaryOverrides.takeIf { overrideToggle.isSelected } ?: "{}"
         contextLoading = overrides.isNotEmpty() || logged != null || PipelineVisualModel.parse(temporary)?.size()?.let { it > 0 } == true
         updateTaskControls()
         updateSummary()
         if (!contextLoading) {
             effectiveNodes = emptyMap()
+            readingGraph = null
             syncNodeSelector()
             renderSelectedNode(updateFlow = true)
             restoreReadingPosition()
+            if (pendingChangedFiles.isEmpty()) setDocumentState(DocumentState.SYNCED)
             return
         }
-        renderSelectedNode(updateFlow = true)
+        // 编辑同步保留上一份完整流程，覆盖计算完成后原子替换，避免每个字符都经历加载态。
+        if (!preserveFlow) {
+            effectiveNodes = emptyMap()
+            readingGraph = null
+            renderSelectedNode(updateFlow = true)
+        }
         val inputs = session.inputs.toMap()
         val taskOptions = selectedEntry?.taskOptions.orEmpty()
         ReadAction.nonBlocking<Pair<List<PipelineOverrideLocation>, Map<String, PipelineNodeLocation>>> {
@@ -888,6 +902,7 @@ internal class PipelineFlowPanel(
             readingGraph = null
             renderSelectedNode(updateFlow = true)
             restoreReadingPosition()
+            if (pendingChangedFiles.isEmpty()) setDocumentState(DocumentState.SYNCED)
         }.expireWhen { generation != effectiveGeneration }
             .coalesceBy(this, "pipeline-effective")
             .submit(AppExecutorUtil.getAppExecutorService())
@@ -973,18 +988,28 @@ internal class PipelineFlowPanel(
         selected = selectedDetail(), choose = ::inspectNode,
     )
 
-    private fun refreshFromDocument(document: Document, fullRefresh: Boolean = false) {
+    private fun setDocumentState(state: DocumentState) {
+        if (documentState == state) return
+        documentState = state
+        updateSummary()
+    }
+
+    private fun refreshFromDocument(document: Document, fullRefresh: Boolean = false, editing: Boolean = false) {
         traceSourceVersionState = null
         FileDocumentManager.getInstance().getFile(document)?.let(pendingChangedFiles::add)
         fullRefreshRequired = fullRefreshRequired || fullRefresh
         val generation = ++refreshGeneration
         effectiveGeneration++
         refreshAlarm.cancelAllRequests()
-        refreshAlarm.addRequest({ indexDocument(generation) }, 40)
+        val isEditing = editing && currentModel.version >= 0
+        setDocumentState(if (isEditing) DocumentState.EDITING else DocumentState.SYNCING)
+        // 连续输入只重置空闲计时，不把每个中间文本当作可展示的流程版本。
+        refreshAlarm.addRequest({ indexDocument(generation) }, if (isEditing) EDIT_IDLE_DELAY_MS else 40)
     }
 
     private fun indexDocument(generation: Long) {
         if (disposed || generation != refreshGeneration) return
+        setDocumentState(DocumentState.SYNCING)
         val previous = currentModel.takeUnless { fullRefreshRequired || it.version < 0 }
         val changedFiles = pendingChangedFiles.toSet()
         val environmentId = session.environmentId
@@ -1021,17 +1046,26 @@ internal class PipelineFlowPanel(
         )
         val selectedEnvironment = environmentId.takeIf { id -> environments.any { it.id == id } }
             ?: environments.first().id
-        ReadAction.nonBlocking<PipelineDocumentModel> {
+        ReadAction.nonBlocking<PipelineDocumentModel?> {
+            // 输入中的不完整 JSON 保留上一份流程；语法恢复后再应用新快照。
+            if (previous != null && changedFiles.any { changed ->
+                val psi = changed.takeIf { it.isValid }?.let { PsiManager.getInstance(project).findFile(it) }
+                psi is JsonFile && PsiTreeUtil.hasErrorElements(psi)
+            }) return@nonBlocking null
             PipelineDocumentIndexer.index(project, file, previous, changedFiles, selectedEnvironment)
         }.expireWith(this).finishOnUiThread(ModalityState.any()) { model ->
             if (
                 disposed ||
                 generation != refreshGeneration ||
-                document.modificationStamp != requestedStamp ||
-                model.version != document.modificationStamp
+                document.modificationStamp != requestedStamp
             ) {
                 return@finishOnUiThread
             }
+            if (model == null) {
+                setDocumentState(DocumentState.INCOMPLETE)
+                return@finishOnUiThread
+            }
+            if (model.version != document.modificationStamp) return@finishOnUiThread
             saveSession()
             pendingChangedFiles.clear()
             fullRefreshRequired = false
@@ -1045,7 +1079,6 @@ internal class PipelineFlowPanel(
             sourceNodes = model.projectNodes.groupBy { it.sourceFile }.mapValues { (_, nodes) ->
                 nodes.sortedBy { it.propertyRange.startOffset }
             }
-            readingGraph = null
             nodeListModel.removeAllElements()
             model.nodes.forEach { nodeListModel.addElement(it.name) }
             syncingNodeSelector = true
@@ -1063,6 +1096,11 @@ internal class PipelineFlowPanel(
             inspectedLogicNode = model.projectNodes.firstOrNull {
                 logicNodeKey(it.name, it.sourceFile ?: file) == (previousDetail ?: session.selectedNode)
             }
+            if (!initialSnapshot && rightTabs.selectedIndex == 1) source.currentFile?.let { currentFile ->
+                val offset = source.editorFor(currentFile).editor.caretModel.offset
+                sourceNodes[currentFile]?.firstOrNull { it.propertyRange.containsOffset(offset) }
+                    ?.let { inspectedLogicNode = it }
+            }
             if (initialSnapshot) restoreSession()
             entryStatusLabel.text = when {
                 selectedEntry?.issue != null -> selectedEntry?.issue
@@ -1075,12 +1113,15 @@ internal class PipelineFlowPanel(
             nodeList.repaint()
             nodeSelector.repaint()
             refreshing = false
-            if (rightTabs.selectedIndex == 1) selectedDetail()?.let(::showNodeSource)
+            if (rightTabs.selectedIndex == 1) selectedDetail()?.let { location ->
+                source.showNode(location, currentModel.resourceOverrides.filter { it.targetName == location.name },
+                    currentModel.environmentId, navigate = false)
+            }
             val request = pendingSource
             if (request != null) {
                 pendingSource = null
                 openFromSource(request.first, request.second)
-            } else rebuildEffectiveContext()
+            } else rebuildEffectiveContext(preserveFlow = !initialSnapshot)
         }
             .expireWhen { generation != refreshGeneration }
             .coalesceBy(this, "pipeline-index")
@@ -1191,6 +1232,12 @@ internal class PipelineFlowPanel(
         val suffix = if (currentModel.hasSyntaxErrors) "（JSON 语法暂不可完整解析）" else ""
         summaryLabel.text = buildString {
             append("项目资源：${currentModel.projectNodes.size} 个节点 $suffix")
+            when (documentState) {
+                DocumentState.EDITING -> append("　编辑中 · 流程暂未同步")
+                DocumentState.SYNCING -> append("　正在同步")
+                DocumentState.INCOMPLETE -> append("　JSON 未完成 · 保留原流程")
+                DocumentState.SYNCED -> Unit
+            }
             if (selectedEntry != null || traceOverrides() != null) append("　覆盖：${overrideSourceLabel()}")
             currentTrace?.let { trace ->
                 val events = trace.eventsForEntry(selectedEntry?.entryName)
@@ -3405,6 +3452,7 @@ internal class PipelineFlowPanel(
                 context.document.replaceString(it.range.startOffset, it.range.endOffset, it.replacement)
             }
         })
+        refreshFromDocument(context.document)
     }
 
     private fun editJsonField(field: PipelineFieldLocation, sourceFile: VirtualFile) {

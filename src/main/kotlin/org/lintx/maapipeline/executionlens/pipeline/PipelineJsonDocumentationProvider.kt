@@ -27,7 +27,11 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         val context = PipelineJsonContext.at(element) ?: return null
         val comment = generateSequence(element) { it.parent }.filterIsInstance<PsiComment>().firstOrNull()
         if (comment != null && (comment.text.contains("@preview") || comment.text.contains("@roi"))) return comment
-        return element.takeIf { context.field?.name in setOf("template", "lower", "upper", "method", "recognition", "action", "anchor", "target", "begin", "end", "roi", "custom_action", "custom_recognition") }
+        val properties = generateSequence(element) { it.parent }.filterIsInstance<JsonProperty>().toList()
+        if (properties.drop(1).any { it.name in setOf("custom_action_param", "custom_recognition_param") }) return null
+        val scope = PipelineJsonOperationContext.at(element) ?: return null
+        val fields = PipelineVisualModel.operationKeys(scope.isAction) + setOf("type", "param", "anchor")
+        return element.takeIf { context.field?.name in fields }
     }
 
     override fun generateHoverDoc(element: PsiElement, originalElement: PsiElement?): String? = generateDoc(element, originalElement)
@@ -38,10 +42,13 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         val project = origin.project
         val previewContext = PipelinePreviewContext(context)
         val node = previewContext.location
+        if (PipelineVisualModel.parse(node.rawJson) == null) return null
         val environmentId = previewContext.environment.id
         fun resolve(name: String) = previewContext.resolve(name)
         val comment = generateSequence(origin) { it.parent }.filterIsInstance<PsiComment>().firstOrNull()
         val key = context.field?.name
+        val scope = PipelineJsonOperationContext.at(origin)
+        val selected = scope?.operation(origin, context, node, ::resolve)
         if ((comment != null && (comment.text.contains("@preview") || comment.text.contains("@roi"))) ||
             key in setOf("roi", "target", "begin", "end")) {
             val hint = PipelinePreviewHints.preview(node)
@@ -51,7 +58,8 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
                 else PipelinePreviewSettings.getInstance().background(context.file.virtualFile)?.second
             val recognition = PipelineVisualModel.operation(node, resolve = ::resolve)
             val action = PipelineVisualModel.operation(node, true, ::resolve)
-            val operations = PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
+            val operations = if (comment?.text?.contains("@preview") != true && selected != null) PipelineVisualAssets.leaves(selected)
+                else PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
             val annotation = PipelineHoverImages.annotationAt(origin, operations)
             return html {
                 line(path?.let { "参考图 · $it" } ?: "默认预览", true)
@@ -64,23 +72,23 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
                 }
             }
         }
-        if (key !in setOf("template", "lower", "upper", "method", "recognition", "action", "anchor", "target", "begin", "end", "roi", "custom_action", "custom_recognition")) return null
-        val action = key in setOf("action", "custom_action", "target", "begin", "end") || generateSequence(origin) { it.parent }.filterIsInstance<JsonProperty>().any { it.name == "action" }
-        val owner = generateSequence(origin) { it.parent }.filterIsInstance<JsonObject>()
-            .firstOrNull { it.findProperty(if (action) "action" else "recognition") != null || it.findProperty("type") != null }
-        val operation = PipelineVisualModel.operation(node.copy(rawJson = owner?.text ?: node.rawJson), action, ::resolve)
+        if (previewElement(origin) == null) return null
+        val operation = selected ?: return null
         return html {
-            line(operation.title, true)
-            PipelineVisualModel.mode(operation)?.let { (mode, _) -> line(mode) }
-            if (key in setOf("roi", "target", "begin", "end")) {
-                val region = PipelineVisualModel.region(operation, key!!, ::resolve)
-                line(region.summary, true)
+            var count = 0
+            fun render(current: PipelineOperation, label: String = "") {
+                if (count++ >= 24) return
+                val reference = current.reference?.let { "$it: " }.orEmpty()
+                line(label + reference + current.title, true)
+                PipelineVisualModel.mode(current)?.let { (mode, _) -> line(mode) }
+                current.parameters.filterKeys { it in setOf("expected", "custom_recognition", "custom_action", "roi", "target", "begin", "end", "threshold", "count", "inverse", "duration", "input_text", "key", "package") }
+                    .forEach { (name, value) -> line("$name: ${PipelineVisualModel.display(value).take(180)}") }
+                operationImages(current, context, this, environmentId)
+                current.children.forEachIndexed { index, child ->
+                    group { render(child, "${index + 1}. ") }
+                }
             }
-            operationImages(operation, context, this, environmentId)
-            if (operation.children.isNotEmpty()) PipelineVisualAssets.leaves(operation).take(12).forEach {
-                line(it.title, true)
-                operationImages(it, context, this, environmentId)
-            }
+            render(operation)
         }
     }
 
@@ -103,7 +111,10 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
             html.line("${colors.space} 颜色范围样本", true)
             colors.ranges.take(8).forEach { range ->
                 if (colors.samples(range).isEmpty()) html.line(if (colors.supported) "没有有效颜色，请检查通道数及上下限。" else "此颜色空间暂不生成 RGB 图示。")
-                else PipelineVisualAssets.colorImage(colors.copy(ranges = listOf(range)))?.let { html.picture(it, 216, 42, "colors"); html.link("colors", "打开大图") }
+                else PipelineVisualAssets.colorImage(colors.copy(ranges = listOf(range)))?.let {
+                    val key = PipelineHoverImages.colorKey(operation)
+                    html.picture(it, 216, 42, key); html.link(key, "打开大图")
+                }
             }
             if (colors.ranges.size > 8) html.line("其余颜色范围请在详情中查看。")
         }
@@ -115,6 +126,11 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         private val content = StringBuilder("<html><body>")
         private val metrics = java.awt.Canvas().getFontMetrics(com.intellij.util.ui.UIUtil.getLabelFont())
         private var pictureCount = 0
+        fun group(body: Html.() -> Unit) {
+            content.append("<div style=\"margin-left:12px;margin-top:8px\">")
+            body()
+            content.append("</div>")
+        }
         fun line(value: String, bold: Boolean = false) {
             val bounded = value.take(800)
             val lines = mutableListOf<String>()

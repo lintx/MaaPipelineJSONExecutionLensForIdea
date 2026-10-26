@@ -10,6 +10,34 @@ import javax.swing.SwingUtilities
 class PipelineWorkspaceSourceThreadingTest : BasePlatformTestCase() {
     override fun runInDispatchThread(): Boolean = false
 
+    fun testDeferredNavigationDoesNotOverrideTypingOrCaretMovement() {
+        lateinit var source: PipelineWorkspaceSource
+        lateinit var file: com.intellij.openapi.vfs.VirtualFile
+        var expected = -1
+        EdtTestUtil.runInEdtAndWait<RuntimeException> {
+            file = myFixture.addFileToProject("assets/resource/pipeline/Editing.json",
+                """{"First":{"next":["Second"]},"Second":{}}""").virtualFile
+            source = PipelineWorkspaceSource(project)
+            Disposer.register(testRootDisposable, source)
+            source.showFile(file, TextRange(2, 2), false)
+            val editor = source.editorFor(file).editor
+            com.intellij.openapi.command.WriteCommandAction.runWriteCommandAction(project, Runnable {
+                val offset = editor.document.text.indexOf(']') + 1
+                editor.document.insertString(offset, ",")
+                expected = offset + 1
+                editor.caretModel.moveToOffset(expected)
+            })
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals("延后导航不能覆盖逗号输入后的光标", expected, source.editorFor(file).editor.caretModel.offset)
+            source.showFile(file, TextRange(2, 2), false)
+            source.editorFor(file).editor.caretModel.moveToOffset(expected)
+        }
+        SwingUtilities.invokeAndWait {
+            assertEquals("延后导航不能覆盖主动移动的光标", expected, source.editorFor(file).editor.caretModel.offset)
+        }
+    }
+
     fun testColdSourceEditorCanBeCreatedFromAnEdtCallbackWithoutReadAccess() {
         lateinit var source: PipelineWorkspaceSource
         lateinit var file: com.intellij.openapi.vfs.VirtualFile
