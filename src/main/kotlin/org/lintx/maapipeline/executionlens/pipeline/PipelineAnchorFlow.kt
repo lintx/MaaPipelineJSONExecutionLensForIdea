@@ -43,19 +43,53 @@ internal class PipelineAnchorFlow(
     fun afterNode(node: PipelineNodeLocation, incoming: PipelineAnchorContext): PipelineAnchorContext {
         val value = effective(node)
         if (!value.enabled) return PipelineAnchorContext()
-        var context = incoming
+        var context = beforeAction(node, incoming)
         if (opaque(value)) context = PipelineAnchorContext()
-        else if (context.values.isNotEmpty() && (value.next + value.onError + value.embeddedReferences).any { it.isCycle }) {
-            context = widen(context, effectsFrom(node))
-        }
+        else context = afterSubtasks(value.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }, context)
         // anchor 在动作完成后应用，当前节点的显式赋值覆盖此前调用产生的不确定状态。
         val definitions = value.anchorDefinitions.associate { definition -> definition.name to assigned(node, definition) }
         return context.copy(values = context.values + definitions)
     }
 
+    fun forSubtask(node: PipelineNodeLocation, index: Int, incoming: PipelineAnchorContext): PipelineAnchorContext {
+        val value = effective(node)
+        val references = value.embeddedReferences.filter { it.kind == PipelineReferenceKind.SUBTASK }
+        val parameters = PipelineVisualModel.operation(value, isAction = true).parameters["custom_action_param"]
+        val random = parameters?.takeIf { it.isJsonObject }?.asJsonObject?.get("random_choice")
+            ?.takeIf { it.isJsonPrimitive }?.asString?.toIntOrNull() ?: 0
+        val previous = when {
+            random == 1 -> emptyList()
+            random > 1 -> references.filterIndexed { candidate, _ -> candidate != index }
+            else -> references.take(index)
+        }
+        // 父动作尚未完成，不能提前应用父 Anchor；此前子调用的可能改写需要传给后续调用。
+        return afterSubtasks(previous, beforeAction(node, incoming))
+    }
+
+    private fun beforeAction(node: PipelineNodeLocation, incoming: PipelineAnchorContext): PipelineAnchorContext {
+        val value = effective(node)
+        if (!value.enabled) return PipelineAnchorContext()
+        var context = incoming
+        if (value.recognition?.summary?.startsWith("Custom") == true) context = PipelineAnchorContext()
+        else if (context.values.isNotEmpty() && (value.next + value.onError + value.embeddedReferences).any { it.isCycle }) {
+            context = widen(context, effectsFrom(node))
+        }
+        return context
+    }
+
+    private fun afterSubtasks(references: List<PipelineReference>, incoming: PipelineAnchorContext): PipelineAnchorContext {
+        var context = incoming
+        references.forEach { reference ->
+            val possible = targets(reference, context)
+            if (possible.isEmpty() || reference.isAnchor && context.value(reference.targetName).unknown) return PipelineAnchorContext()
+            possible.forEach { context = widen(context, effectsFrom(it)) }
+        }
+        return context
+    }
+
     fun forBranch(references: List<PipelineReference>, field: String,
         incoming: PipelineAnchorContext): PipelineAnchorContext {
-        if (field == "subtask") return PipelineAnchorContext()
+        if (field == "subtask") return incoming
         var context = incoming
         if (references.any { reference -> targets(reference, incoming).any { effective(it).recognition?.summary?.startsWith("Custom") == true } }) {
             context = PipelineAnchorContext()
@@ -143,5 +177,6 @@ internal class PipelineAnchorFlow(
         else PipelineAnchorValue(setOf(definition.targetNodeName ?: owner.name))
 
     private fun opaque(node: PipelineNodeLocation): Boolean =
-        node.action?.summary?.startsWith("Custom") == true || node.recognition?.summary?.startsWith("Custom") == true
+        node.recognition?.summary?.startsWith("Custom") == true ||
+            node.action?.summary?.startsWith("Custom") == true && node.embeddedReferences.none { it.kind == PipelineReferenceKind.SUBTASK }
 }

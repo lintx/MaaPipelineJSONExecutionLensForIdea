@@ -1013,6 +1013,44 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             PipelineSourceTarget(psi, target.nameRange.startOffset, "Remote").navigate(true)
             assertSame(existing, manager.selectedEditor)
             assertEquals(1, manager.openFiles.count { it == remote })
+
+            val document = FileDocumentManager.getInstance().getDocument(remote)!!
+            val seedDocument = FileDocumentManager.getInstance().getDocument(seed)!!
+            val seedText = seedDocument.text
+            WriteCommandAction.runWriteCommandAction(project, Runnable {
+                document.setText("// 编辑前其它地方刚修改了此文件\n" + document.text
+                    .replace("确认", "最新完整条件")
+                    .replace("\"next\":[\"Done\",\"Caller\"]", "\"next\":[\"Caller\",{\"name\":\"Done\",\"jump_back\":true}]"))
+            })
+            val contextMethod = PipelineFlowPanel::class.java.getDeclaredMethod("detailEditContext",
+                com.intellij.openapi.vfs.VirtualFile::class.java, TextRange::class.java, String::class.java).apply { isAccessible = true }
+            val context = contextMethod.invoke(panel, remote, target.recognition!!.valueRange, target.name)!!
+            fun contextValue(name: String) = context.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(context)
+            val snapshot = contextValue("snapshot") as PipelineEditSnapshot
+            val owner = contextValue("owner") as com.intellij.json.psi.JsonObject
+            val fresh = contextValue("node") as PipelineNodeLocation
+            assertEquals(document.text, snapshot.text)
+            assertTrue(snapshot.matches(document.modificationStamp, document.text))
+            val fragment = PipelineOperationEdits.fragment(owner, false)
+            assertTrue(fragment.contains("最新完整条件"))
+            assertTrue(fragment.contains("all_of"))
+            assertEquals(listOf("Caller", "Done"), fresh.next.map { it.targetName })
+            val resolve = PipelineFlowPanel::class.java.getDeclaredMethod("detailReference", context.javaClass,
+                PipelineReference::class.java).apply { isAccessible = true }
+            val current = resolve.invoke(panel, context, target.next.first()) as PipelineReference
+            assertEquals("Done", current.targetName)
+            assertTrue(current.isJumpBack)
+            assertFalse(current.isString)
+            val edit = PipelineReferenceEdits.edit(project, snapshot.text, current, "[Anchor]Caller")!!
+            val result = PipelineOperationEdits.objectValue(project, edit.applyTo(snapshot.text))!!
+            val references = ((result.findProperty("Remote")!!.value as com.intellij.json.psi.JsonObject)
+                .findProperty("next")!!.value as com.intellij.json.psi.JsonArray).valueList
+            assertEquals("\"Caller\"", references.first().text)
+            assertTrue(references.last().text.contains("\"anchor\": true"))
+            assertEquals(seedText, seedDocument.text)
+            val changed = PipelineFlowPanel::class.java.getDeclaredField("pendingChangedFiles").apply { isAccessible = true }
+                .get(panel) as Set<*>
+            assertTrue("编辑准备必须同步真正的源文件", remote in changed)
         } finally {
             manager.closeFile(remote)
             manager.closeFile(workspace.file)
@@ -1058,6 +1096,17 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val labels = textComponents(host.component)
             assertTrue(labels.any { it.text.contains("参考图 · reference.png") })
             assertTrue(labels.any { it.text.contains("[5, 6, 7, 8]") })
+            val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
+            val details = PipelineFlowPanel::class.java.getDeclaredField("detailsPanel").apply { isAccessible = true }.get(panel) as javax.swing.JPanel
+            fun position(text: String) = details.components.indexOfFirst { component ->
+                textComponents(component).any { it.text.contains(text) }
+            }
+            val previewPosition = position("参考图 · reference.png")
+            assertTrue(position("路径分析") in 0 until previewPosition)
+            val conditionPosition = details.components.indexOfFirst { component ->
+                descendants(component).filterIsInstance<javax.swing.JLabel>().any { it.text == "条件：" }
+            }
+            assertTrue(previewPosition < conditionPosition)
         } finally { manager.closeFile(workspace.file) }
     }
 

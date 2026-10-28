@@ -99,7 +99,7 @@ class PipelineAnchorFlowTest {
         val after = flow.afterNode(source, PipelineAnchorContext())
         assertEquals("Target", flow.resolve(anchor, after).inlineTarget?.name)
         assertTrue(flow.resolve(anchor, flow.afterNode(custom, after)).value.unknown)
-        assertTrue(flow.resolve(anchor, flow.forBranch(source.next, "subtask", after)).value.unknown)
+        assertEquals("Target", flow.resolve(anchor, flow.forBranch(source.next, "subtask", after)).inlineTarget?.name)
         val jump = reference("Custom", jump = true)
         assertTrue(flow.resolve(anchor, flow.forBranch(listOf(jump), "next", after)).value.unknown)
     }
@@ -159,5 +159,26 @@ class PipelineAnchorFlowTest {
         val after = flow.afterNode(source, PipelineAnchorContext())
         assertTrue(flow.forBranch(listOf(reference("Custom"), anchor), "next", after).value("X").unknown)
         assertTrue(flow.forBranch(listOf(reference("Missing", jump = true)), "next", after).value("X").unknown)
+    }
+
+    @Test
+    fun subtasksInheritBindingsBeforeTheParentAssignmentAndMergeEarlierCallEffects() {
+        val calls = listOf(reference("Writer"), reference("Reader")).map { it.copy(kind = PipelineReferenceKind.SUBTASK) }
+        val caller = node("Caller", "Parent", action = "Custom（SubTask）").copy(embeddedReferences = calls)
+        val graph = PipelineReadingGraph(listOf(caller, node("Writer", "Second"), node("Reader"), node("Target"), node("Second"), node("Parent")))
+        val incoming = PipelineAnchorContext().bind("X", "Target").bind("Untouched", "Target")
+        val flow = graph.anchorFlow
+        assertEquals("Target", flow.resolve(anchor, flow.forSubtask(caller, 0, incoming)).inlineTarget?.name)
+        val later = flow.forSubtask(caller, 1, incoming)
+        assertEquals(setOf("Target", "Second"), later.value("X").targets)
+        assertFalse(later.value("X").unknown)
+        val after = flow.afterNode(caller, incoming)
+        assertEquals(setOf("Parent"), after.value("X").targets)
+        assertEquals(setOf("Target"), after.value("Untouched").targets)
+        assertEquals(setOf("Target"), incoming.value("X").targets)
+
+        val withoutAssignment = caller.copy(anchorDefinitions = emptyList())
+        val withoutParentWrite = PipelineReadingGraph(listOf(withoutAssignment, node("Writer", "Second"), node("Reader"))).anchorFlow
+        assertEquals(setOf("Target", "Second"), withoutParentWrite.afterNode(withoutAssignment, incoming).value("X").targets)
     }
 }

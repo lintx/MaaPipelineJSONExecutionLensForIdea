@@ -1181,7 +1181,6 @@ internal class PipelineFlowPanel(
             } else if (staticPath != null) {
                 addPathAnalysis(staticPath)
             }
-            addRelationshipOverview(location)
             val sourceFile = location.sourceFile ?: file
             addControlFlowExplanation(effectiveLocation, sourceFile, location)
             addAnchorDefinitions(location, sourceFile)
@@ -1634,7 +1633,7 @@ internal class PipelineFlowPanel(
             }
             // RunTask 拥有独立返回栈，不能继承调用者的 JumpBack 返回点。
             appendVirtualLogicBranch(location, subTasks, "subtask", rows, depth + if (repeatedList) 2 else 1,
-                ancestors, instanceKey, bindings, revealIndex = revealIndex)
+                ancestors, instanceKey, anchorContext, revealIndex = revealIndex)
         }
     }
 
@@ -1662,13 +1661,14 @@ internal class PipelineFlowPanel(
             ?.takeIf { location.sourceFile == null || location.sourceFile == file }
             ?.takeIf { !hasTaskOverride(location, it) }
         if (references.isEmpty()) return
-        val bindings = currentReadingGraph().anchorFlow.forBranch(references, fieldName, anchorContext)
+        val branchBindings = currentReadingGraph().anchorFlow.forBranch(references, fieldName, anchorContext)
         // 分支类型已经写进候选标题，省略独立的 on_error 容器，避免同一目标多出一层空壳。
         if (hasTaskOverride(location, fieldName)) {
             appendLogicNote(rows, "$branchKey:override", depth, "字段来自当前任务的 pipeline_override；它替换默认列表。")
         }
         for (index in references.indices.reversed()) scheduleLogic {
             val reference = references[index]
+            val bindings = if (fieldName == "subtask") currentReadingGraph().anchorFlow.forSubtask(location, index, anchorContext) else branchBindings
             val candidateKey = "$branchKey:$index"
             val target = reference.target
             val anchorResolution = reference.takeIf { it.isAnchor }?.let { currentReadingGraph().anchorFlow.resolve(it, bindings) }
@@ -2007,8 +2007,9 @@ internal class PipelineFlowPanel(
         return buildList {
             add(PipelineConditionDetail("subtask · ${source.name} 的 SubTask 动作"))
             add(PipelineConditionDetail(if (random > 0) "随机选取至多 $random 项，实际选择和顺序由本轮抽取决定。"
-                else "按列表顺序调用独立子流程。", 1))
+                else "按列表顺序调用子流程。", 1))
             add(PipelineConditionDetail("每个子流程结束后继续父动作，父动作结束后再处理父节点的 next。", 1))
+            add(PipelineConditionDetail("与父流程共享 Anchor、命中次数和已执行节点的识别结果；JumpBack 返回栈各自独立。", 1))
             listOf("continue", "strict").forEach { name ->
                 parameters?.get(name)?.let { add(PipelineConditionDetail("$name = $it", 1)) }
             }
@@ -2086,13 +2087,14 @@ internal class PipelineFlowPanel(
         val action = PipelineVisualModel.operation(location, isAction = true, resolve = resolve).let { operation ->
             if (frame?.node?.name == location.name) operation.copy(simulatedRegions = frame.targets.mapNotNull { (key, value) -> value?.let { key to it } }.toMap()) else operation
         }
+        visuals.referenceImage(original, recognition, action)?.let { detailsPanel.add(it) }
+        addRelationshipOverview(original)
         addQuickReadField("条件", if (location.enabled) recognition.title + if (location.recognition == null) "（默认）" else "" else "已禁用（enabled=false）",
             location.recognition, sourceFile, emphasized = true, operationEdit = { editOperation(location, sourceFile, false) })
         detailsPanel.add(visuals.operation(recognition))
         addQuickReadField("动作", action.title + if (location.action == null) "（默认）" else "", location.action, sourceFile,
             emphasized = true, operationEdit = { editOperation(location, sourceFile, true) }, action = action)
         detailsPanel.add(visuals.operation(action))
-        visuals.referenceImage(original, recognition, action)?.let { detailsPanel.add(it) }
         PipelineConditionSummary.anchor(location)?.let { anchor ->
             addQuickReadField("锚点", anchor, location.anchor, sourceFile)
         }
@@ -2496,13 +2498,12 @@ internal class PipelineFlowPanel(
     }
 
     private fun addReference(field: PipelineFieldLocation, fieldName: String? = field.name, sourceFile: VirtualFile = file) {
-        val context = detailEditContext(sourceFile) ?: return
+        val context = detailEditContext(sourceFile, field.valueRange) ?: return
+        val range = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes)
         if (!dialog.showAndGet()) return
         val targetName = dialog.value
         if (targetName.isEmpty()) return
-        val range = field.valueRange
-        if (range.startOffset < 0 || range.endOffset > context.snapshot.text.length) return
         val currentValue = context.snapshot.text.substring(range.startOffset, range.endOffset)
         val quotedName = quoteJsonString(targetName)
         val replacement = if (currentValue.trim().startsWith("[") && currentValue.trim().endsWith("]")) {
@@ -2518,13 +2519,11 @@ internal class PipelineFlowPanel(
     }
 
     private fun addMissingNext(sourceFile: VirtualFile) {
-        val location = selectedDetail() ?: return
         val context = detailEditContext(sourceFile) ?: return
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes)
         if (!dialog.showAndGet()) return
         val range = ReadAction.compute<TextRange?, RuntimeException> {
-            val owner = PipelineOperationEdits.objectValue(project, context.snapshot.text)?.findProperty(location.name)?.value as? JsonObject
-            owner?.takeIf { it.findProperty("next") == null }?.textRange
+            context.owner.takeIf { it.findProperty("next") == null }?.textRange
         } ?: return
         val original = context.snapshot.text.substring(range.startOffset, range.endOffset)
         val updated = jsonObjectPropertyInsertion(context.document, range, "next", "[${quoteJsonString(dialog.value)}]")
@@ -3091,13 +3090,14 @@ internal class PipelineFlowPanel(
     }
 
     private fun editReferenceName(reference: PipelineReference, sourceFile: VirtualFile) {
-        val context = detailEditContext(sourceFile) ?: return
-        val initial = (if (reference.isJumpBack) "[JumpBack]" else "") + (if (reference.isAnchor) "[Anchor]" else "") + reference.targetName
+        val context = detailEditContext(sourceFile, reference.range) ?: return
+        val current = detailReference(context, reference) ?: return
+        val initial = (if (current.isJumpBack) "[JumpBack]" else "") + (if (current.isAnchor) "[Anchor]" else "") + current.targetName
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes, initial)
         if (!dialog.showAndGet()) return
         val text = dialog.value
         val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
-            PipelineReferenceEdits.edit(project, context.snapshot.text, reference, text)
+            PipelineReferenceEdits.edit(project, context.snapshot.text, current, text)
         } ?: return
         applyDetailEdits(context, listOf(edit), "修改 Pipeline 引用")
     }
@@ -3418,26 +3418,62 @@ internal class PipelineFlowPanel(
         refreshFromDocument(editor.document)
     }
 
-    private data class DetailEditContext(val file: VirtualFile, val document: Document, val snapshot: PipelineEditSnapshot)
+    private data class DetailEditContext(
+        val file: VirtualFile,
+        val document: Document,
+        val snapshot: PipelineEditSnapshot,
+        val owner: JsonObject,
+        val node: PipelineNodeLocation,
+        val previousNode: PipelineNodeLocation?,
+    )
 
-    private fun detailEditContext(sourceFile: VirtualFile): DetailEditContext? {
+    private fun detailEditContext(sourceFile: VirtualFile, range: TextRange? = null,
+        nodeName: String? = selectedDetail()?.name): DetailEditContext? {
         val document = documentFor(sourceFile) ?: return null
         if (currentModel.indexedVersions[sourceFile] != document.modificationStamp) {
-            refreshFromDocument(editor.document)
-            Messages.showWarningDialog(project, "文件已更新，详情刷新后请重试。", "无法编辑 Pipeline")
-            return null
+            refreshFromDocument(document)
         }
         val snapshot = PipelineEditSnapshot(document.modificationStamp, document.text)
         if (!ensureFileSnapshot(sourceFile, snapshot)) return null
-        val hasErrors = ReadAction.compute<Boolean, RuntimeException> {
-            PsiTreeUtil.hasErrorElements(PsiFileFactory.getInstance(project).createFileFromText(
-                "PipelineEdit.json", JsonFileType.INSTANCE, snapshot.text))
+        val root = ReadAction.compute<JsonObject?, RuntimeException> {
+            PipelineOperationEdits.objectValue(project, snapshot.text)
         }
-        if (hasErrors) {
+        if (root == null) {
             Messages.showWarningDialog(project, "JSON 有语法错误，请先在源码中修复。", "无法编辑 Pipeline")
             return null
         }
-        return DetailEditContext(sourceFile, document, snapshot)
+        // 详情是阅读快照；编辑必须按节点名和来源重新解析，不能要求用户刷新或继续使用旧偏移。
+        val previous = selectedDetail()?.let(::effectiveNode)
+        val override = currentModel.pipelineOverrides.singleOrNull {
+            it.file == sourceFile && it.targetName == nodeName && range != null && it.valueRange.contains(range)
+        }
+        val resolved = ReadAction.compute<Pair<JsonObject, PipelineNodeLocation>?, RuntimeException> {
+            val container = if (override == null) root else
+                taskContextObject(root.containingFile as JsonFile, override.contextPath)
+                    ?.findProperty("pipeline_override")?.value as? JsonObject
+            val property = container?.propertyList?.singleOrNull { it.name == nodeName } ?: return@compute null
+            val owner = property.value as? JsonObject ?: return@compute null
+            val node = PipelineDocumentIndexer.detailNode(owner, sourceFile, currentModel.supportsMaaEndSubTasks)
+                ?: return@compute null
+            owner to node
+        }
+        if (resolved == null) {
+            Messages.showWarningDialog(project, "节点已被删除、重命名或重复定义，无法确定编辑位置。", "无法编辑 Pipeline")
+            return null
+        }
+        return DetailEditContext(sourceFile, document, snapshot, resolved.first, resolved.second, previous)
+    }
+
+    private fun detailReference(context: DetailEditContext, reference: PipelineReference): PipelineReference? {
+        val current = if (reference.kind == PipelineReferenceKind.ON_ERROR) context.node.onError else context.node.next
+        val candidates = current.filter { it.targetName == reference.targetName }
+        if (candidates.size == 1) return candidates.single()
+        val previous = if (reference.kind == PipelineReferenceKind.ON_ERROR) context.previousNode?.onError else context.previousNode?.next
+        val originals = previous.orEmpty().filter { it.targetName == reference.targetName }
+        // 相同目标可重复出现；仅在出现次数未变时沿用原次序，避免误改新增或删除后的另一条引用。
+        if (originals.size == candidates.size) candidates.getOrNull(originals.indexOf(reference))?.let { return it }
+        Messages.showWarningDialog(project, "此引用已被修改或删除，无法确定编辑位置。", "无法编辑 Pipeline")
+        return null
     }
 
     private fun applyDetailEdits(context: DetailEditContext, edits: List<PipelineTextEdit>, title: String) {
@@ -3457,9 +3493,8 @@ internal class PipelineFlowPanel(
 
     private fun editJsonField(field: PipelineFieldLocation, sourceFile: VirtualFile) {
         if (field.isDerived) return
-        val context = detailEditContext(sourceFile) ?: return
-        val range = field.valueRange
-        if (range.startOffset < 0 || range.endOffset > context.snapshot.text.length) return
+        val context = detailEditContext(sourceFile, field.valueRange) ?: return
+        val range = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
         val initialText = context.snapshot.text.substring(range.startOffset, range.endOffset)
         val dialog = PipelineJsonFieldDialog(project, field.name, initialText)
         if (!dialog.showAndGet()) return
@@ -3471,15 +3506,9 @@ internal class PipelineFlowPanel(
     private fun editOperation(node: PipelineNodeLocation, sourceFile: VirtualFile, isAction: Boolean) {
         val field = if (isAction) node.action else node.recognition
         if (field?.isDerived == true) return
-        val context = detailEditContext(field?.sourceFile ?: sourceFile) ?: return
+        val context = detailEditContext(field?.sourceFile ?: sourceFile, field?.valueRange, node.name) ?: return
         val name = if (isAction) "action" else "recognition"
-        val owner = ReadAction.compute<JsonObject?, RuntimeException> {
-            val root = PipelineOperationEdits.objectValue(project, context.snapshot.text) ?: return@compute null
-            if (field == null) root.findProperty(node.name)?.value as? JsonObject
-            else PsiTreeUtil.collectElementsOfType(root, JsonObject::class.java).firstOrNull {
-                it.findProperty(name)?.value?.textRange == field.valueRange
-            }
-        } ?: return
+        val owner = context.owner
         val initial = ReadAction.compute<String, RuntimeException> { PipelineOperationEdits.fragment(owner, isAction) }
         val dialog = PipelineJsonFieldDialog(project, name, initial, isAction)
         if (!dialog.showAndGet()) return
@@ -3508,8 +3537,9 @@ internal class PipelineFlowPanel(
     }
 
     private fun toggleReferenceMarker(reference: PipelineReference, marker: String, enabled: Boolean, sourceFile: VirtualFile) {
-        val context = detailEditContext(sourceFile) ?: return
-        val initial = (if (reference.isJumpBack) "[JumpBack]" else "") + (if (reference.isAnchor) "[Anchor]" else "") + reference.targetName
+        val context = detailEditContext(sourceFile, reference.range) ?: return
+        val current = detailReference(context, reference) ?: return
+        val initial = (if (current.isJumpBack) "[JumpBack]" else "") + (if (current.isAnchor) "[Anchor]" else "") + current.targetName
         val updatedValue = if (enabled) {
             if (initial.contains(marker)) {
                 initial
@@ -3521,7 +3551,7 @@ internal class PipelineFlowPanel(
         }
         if (updatedValue == initial) return
         val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
-            PipelineReferenceEdits.edit(project, context.snapshot.text, reference, updatedValue)
+            PipelineReferenceEdits.edit(project, context.snapshot.text, current, updatedValue)
         } ?: return
         applyDetailEdits(context, listOf(edit), "编辑 Pipeline 引用标记")
     }
@@ -3541,12 +3571,13 @@ internal class PipelineFlowPanel(
     }
 
     private fun moveReference(sourceFile: VirtualFile, references: List<PipelineReference>, fieldName: String?, index: Int, direction: Int) {
-        val targetIndex = index + direction
-        if (targetIndex !in references.indices) return
-        val context = detailEditContext(sourceFile) ?: return
-
-        val currentRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, references[index]) }
-        val targetRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, references[targetIndex]) }
+        val reference = references.getOrNull(index) ?: return
+        val context = detailEditContext(sourceFile, reference.range) ?: return
+        val current = detailReference(context, reference) ?: return
+        val latest = if (reference.kind == PipelineReferenceKind.ON_ERROR) context.node.onError else context.node.next
+        val target = latest.getOrNull(latest.indexOf(current) + direction) ?: return
+        val currentRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
+        val targetRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, target) }
         val lowerRange: TextRange
         val higherRange: TextRange
         if (currentRange.startOffset < targetRange.startOffset) {
@@ -3564,9 +3595,11 @@ internal class PipelineFlowPanel(
     }
 
     private fun removeReference(sourceFile: VirtualFile, field: PipelineFieldLocation, reference: PipelineReference, fieldName: String?) {
-        val context = detailEditContext(sourceFile) ?: return
-        val range = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, reference) }
-        val edits = if (field.valueRange == range) {
+        val context = detailEditContext(sourceFile, field.valueRange) ?: return
+        val current = detailReference(context, reference) ?: return
+        val range = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
+        val valueRange = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange }
+        val edits = if (valueRange == range) {
             listOf(PipelineTextEdit(range, "[]"))
         } else {
             PipelineJsonTextEdits.deletionEdits(context.snapshot.text, range)

@@ -36,9 +36,7 @@ internal data class PipelineSimulationChoice(val reference: PipelineReference, v
 }
 
 internal data class PipelineSimulationReturn(val node: PipelineNodeLocation, val subtask: Boolean,
-    val remaining: List<PipelineReference> = emptyList(), val parentAnchors: Map<String, String> = emptyMap(),
-    val parentResults: Map<String, List<Int>> = emptyMap(), val remainingCount: Int = 0,
-    val parentHits: Map<String, Long> = emptyMap())
+    val remaining: List<PipelineReference> = emptyList(), val remainingCount: Int = 0)
 
 internal data class PipelineSimulationFrame(val node: PipelineNodeLocation, val anchors: Map<String, String>,
     val results: Map<String, List<Int>>, val targets: Map<String, List<Int>?>,
@@ -80,7 +78,7 @@ internal class PipelineSimulation(private val nodes: List<PipelineNodeLocation>,
     private fun choice(reference: PipelineReference, frame: PipelineSimulationFrame, kind: String): PipelineSimulationChoice {
         val node = target(reference, frame)
         val limit = node?.let { property(it, "max_hit") }?.takeIf { it.isJsonPrimitive }?.asString?.toLongOrNull() ?: 4294967295L
-        val hits = if (kind == "subtask") 0 else frame.hits[node?.name] ?: 0
+        val hits = frame.hits[node?.name] ?: 0
         val reason = when {
             node == null -> "未绑定或未解析"
             property(node, "enabled")?.toString() == "false" -> "enabled=false"
@@ -112,19 +110,17 @@ internal class PipelineSimulation(private val nodes: List<PipelineNodeLocation>,
         while (frames.size > index + 1) frames.removeAt(frames.lastIndex)
         var returns = current.returns
         var anchors = current.anchors
-        var results = current.results
-        var hits = current.hits
         if (choice.kind == "subtask") {
             val count = (current.pendingCount - 1).coerceAtLeast(0)
+            // RunTask 只隔离返回栈；共享任务状态继续传递，以不可变快照保留回退历史。
             returns = returns + PipelineSimulationReturn(current.node, true,
-                if (count == 0) emptyList() else current.pending - choice.reference, anchors, results, count, hits)
-            anchors = emptyMap(); results = emptyMap(); hits = emptyMap()
+                if (count == 0) emptyList() else current.pending - choice.reference, count)
         } else if (choice.kind == "on_error" && current.pending.isNotEmpty()) {
             anchors = applyAnchors(current.node, anchors)
         } else if (choice.kind == "next" && choice.reference.isJumpBack) {
             returns = returns + PipelineSimulationReturn(current.node, false)
         }
-        frames += enter(next, anchors, results, returns, "${choice.kind} · ${current.node.name} → ${next.name}", hits)
+        frames += enter(next, anchors, current.results, returns, "${choice.kind} · ${current.node.name} → ${next.name}", current.hits)
         return true
     }
 
@@ -152,16 +148,16 @@ internal class PipelineSimulation(private val nodes: List<PipelineNodeLocation>,
             // 不执行自定义动作；子任务失败后由用户指定父动作结果，不能猜测 continue/strict 的实现。
             if (outcome != PipelineSimulationParentOutcome.FAILED) {
                 val remaining = if (outcome == PipelineSimulationParentOutcome.CONTINUE) continuation.remaining else emptyList()
-                frames += PipelineSimulationFrame(continuation.node,
-                    if (remaining.isEmpty()) applyAnchors(continuation.node, continuation.parentAnchors) else continuation.parentAnchors,
-                    continuation.parentResults, targets(continuation.node, continuation.parentResults, continuation.parentAnchors),
+                val anchors = if (remaining.isEmpty()) applyAnchors(continuation.node, current.anchors) else current.anchors
+                frames += PipelineSimulationFrame(continuation.node, anchors,
+                    current.results, targets(continuation.node, current.results, anchors),
                     remainingReturns, remaining, "子任务失败 · ${outcome?.label}", pendingCount = if (remaining.isEmpty()) 0 else continuation.remainingCount,
-                    hits = continuation.parentHits)
+                    hits = current.hits)
                 return true
             }
-            frames += PipelineSimulationFrame(continuation.node, applyAnchors(continuation.node, continuation.parentAnchors),
-                continuation.parentResults, emptyMap(), remainingReturns, emptyList(),
-                "子任务失败 · 父动作失败，请选择 on_error", failed = true, hits = continuation.parentHits)
+            frames += PipelineSimulationFrame(continuation.node, applyAnchors(continuation.node, current.anchors),
+                current.results, emptyMap(), remainingReturns, emptyList(),
+                "子任务失败 · 父动作失败，请选择 on_error", failed = true, hits = current.hits)
             return true
         }
         if (continuation == null || error) {
@@ -169,11 +165,11 @@ internal class PipelineSimulation(private val nodes: List<PipelineNodeLocation>,
             return true
         }
         if (continuation.subtask) {
-            var anchors = continuation.parentAnchors
+            var anchors = current.anchors
             if (continuation.remaining.isEmpty()) anchors = applyAnchors(continuation.node, anchors)
-            frames += PipelineSimulationFrame(continuation.node, anchors, continuation.parentResults,
-                targets(continuation.node, continuation.parentResults, anchors), current.returns.dropLast(1), continuation.remaining,
-                "subtask 结束 · 继续 ${continuation.node.name}", pendingCount = continuation.remainingCount, hits = continuation.parentHits)
+            frames += PipelineSimulationFrame(continuation.node, anchors, current.results,
+                targets(continuation.node, current.results, anchors), current.returns.dropLast(1), continuation.remaining,
+                "subtask 结束 · 继续 ${continuation.node.name}", pendingCount = continuation.remainingCount, hits = current.hits)
         } else {
             frames += current.copy(node = continuation.node, returns = current.returns.dropLast(1), pending = emptyList(),
                 targets = targets(continuation.node, current.results, current.anchors), text = "JumpBack · 从 ${continuation.node.name} 的 next 第一项重新尝试")

@@ -825,6 +825,12 @@ internal object PipelineDocumentIndexer {
             .firstOrNull { it.isDirectory }
     }
 
+    internal fun detailNode(owner: JsonObject, source: VirtualFile, supportsSubTasks: Boolean): PipelineNodeLocation? {
+        val property = owner.parent as? JsonProperty ?: return null
+        return PipelineNodeLocation(property.name, property.nameElement.textRange, property.textRange, sourceFile = source)
+            .withDetails(owner, supportsSubTasks)
+    }
+
     private fun PipelineNodeLocation.withDetails(valueObject: JsonObject?, supportsSubTasks: Boolean = false): PipelineNodeLocation {
         if (valueObject == null) return this
         return copy(
