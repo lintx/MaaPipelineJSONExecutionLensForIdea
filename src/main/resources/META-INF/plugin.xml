@@ -1,12 +1,24 @@
 <idea-plugin>
     <id>org.lintx.maapipeline.executionlens</id>
     <name>MaaPipeline JSON Execution Lens</name>
-    <vendor email="">MaaPipeline JSON Execution Lens</vendor>
+    <vendor>LinTx</vendor>
 
     <description><![CDATA[
-        MaaFramework Pipeline JSON/JSONC navigation and execution lens for IntelliJ IDEA.
-        The original Pipeline document remains the only source of truth.
+        <p>MaaPipeline JSON Execution Lens helps you read, inspect and edit MaaFramework Pipeline JSON/JSONC in IntelliJ IDEA.</p>
+        <p>在 IntelliJ IDEA 中阅读和编辑 MaaFramework Pipeline JSON/JSONC。</p>
+        <ul>
+            <li>以条件前置的流程视图查看分支、节点动作、Anchor 和 JumpBack。</li>
+            <li>搜索任务与节点，在流程、节点详情和原始 JSON 之间导航。</li>
+            <li>预览模板、颜色匹配与 ROI，查看控制器资源覆盖。</li>
+            <li>通过日志回放和模拟执行检查路径及运行状态。</li>
+            <li>为原始 JSON 提供补全、引用导航和识别预览。</li>
+        </ul>
+        <p>原始 Pipeline 文件始终是唯一数据源，无需转换或复制到其他流程格式。</p>
     ]]></description>
+
+    <change-notes><![CDATA[
+        <p>0.1.0 首次发布：提供 Pipeline 流程阅读、节点详情、源码导航、识别预览及日志回放与模拟。</p>
+    ]]></change-notes>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.json</depends>

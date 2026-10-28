@@ -10,7 +10,7 @@ plugins {
 }
 
 group = "org.lintx.maapipeline.executionlens"
-version = "0.1.0-SNAPSHOT"
+version = providers.gradleProperty("pluginVersion").getOrElse("0.1.0")
 
 repositories {
     mavenCentral()
@@ -22,7 +22,7 @@ repositories {
 val localProperties = Properties()
 val localPropertiesFile = rootProject.file("local.properties")
 if (localPropertiesFile.isFile) {
-    localPropertiesFile.inputStream().use(localProperties::load)
+    localPropertiesFile.reader(Charsets.UTF_8).use(localProperties::load)
 }
 
 val ideaSdkPath = localProperties.getProperty("ideaSdkPath")
@@ -32,6 +32,12 @@ val ideaSdkPath = localProperties.getProperty("ideaSdkPath")
 val maaEndPath = localProperties.getProperty("maaendPath")
     ?: providers.gradleProperty("maaendPath").orNull
     ?: providers.environmentVariable("MAAEND_PATH").orNull
+
+val signingPrivateKeyPath = providers.environmentVariable("PRIVATE_KEY_FILE").orNull
+    ?: localProperties.getProperty("signingPrivateKeyFile")
+val signingCertificatePath = providers.environmentVariable("CERTIFICATE_CHAIN_FILE").orNull
+    ?: localProperties.getProperty("signingCertificateChainFile")
+val signingPassword = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
 
 val requiredPluginIds = "com.intellij.modules.json,com.intellij.platform.images,org.lintx.maapipeline.executionlens"
 val developmentPluginIds = setOf(
@@ -63,6 +69,11 @@ intellijPlatform {
             sinceBuild = "262"
         }
     }
+    signing {
+        signingPrivateKeyPath?.let { privateKeyFile = file(it) }
+        signingCertificatePath?.let { certificateChainFile = file(it) }
+        password = signingPassword
+    }
 }
 
 kotlin {
@@ -70,6 +81,52 @@ kotlin {
 }
 
 tasks {
+    jar {
+        metaInf {
+            from("LICENSE", "NOTICE")
+        }
+    }
+
+    val validateManualRelease by registering {
+        group = "intellij platform"
+        description = "检查手动发布的版本及签名配置。"
+        doLast {
+            check(!project.version.toString().contains("SNAPSHOT", ignoreCase = true)) {
+                "手动发布需要正式版本；请通过 -PpluginVersion 指定版本。"
+            }
+            check(signingPrivateKeyPath?.let { file(it).isFile } == true) {
+                "请通过 local.properties 的 signingPrivateKeyFile 或 PRIVATE_KEY_FILE 环境变量指定签名私钥文件。"
+            }
+            check(signingCertificatePath?.let { file(it).isFile } == true) {
+                "请通过 local.properties 的 signingCertificateChainFile 或 CERTIFICATE_CHAIN_FILE 环境变量指定签名证书文件。"
+            }
+            check(signingPassword.orNull?.isNotEmpty() == true) {
+                "请通过 PRIVATE_KEY_PASSWORD 环境变量提供私钥密码，不要将密码写入工程文件。"
+            }
+        }
+    }
+
+    signPlugin {
+        dependsOn(validateManualRelease)
+    }
+
+    verifyPluginSignature {
+        dependsOn(signPlugin)
+    }
+
+    verifyPluginStructure {
+        ignoreWarnings = false
+    }
+
+    register("prepareManualRelease") {
+        group = "intellij platform"
+        description = "构建、签名并验证手动上传到 Marketplace 的插件 ZIP。"
+        dependsOn(verifyPluginStructure, verifyPluginSignature)
+        doLast {
+            logger.lifecycle("已生成并验签：${signPlugin.get().signedArchiveFile.get().asFile}")
+        }
+    }
+
     wrapper {
         gradleVersion = "9.0.0"
         distributionType = Wrapper.DistributionType.ALL
