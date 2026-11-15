@@ -32,9 +32,16 @@
         <applicationConfigurable parentId="tools" id="org.lintx.maapipeline.settings" displayName="MaaPipeline" instance="org.lintx.maapipeline.executionlens.pipeline.PipelinePreviewSettingsConfigurable"/>
         <json.jsonStandardComplianceProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonCompliance"/>
         <completion.contributor language="JSON" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonCompletion"/>
-        <codeInsight.inlayProvider language="JSON" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonDescriptionHints"/>
+        <typedHandler implementation="org.lintx.maapipeline.executionlens.pipeline.PipelinePreviewCommentTypedHandler"/>
+        <codeInsight.declarativeInlayProvider language="JSON" providerId="maapipeline.descriptions" group="OTHER_GROUP"
+                                            bundle="messages.MaaPipelineBundle" nameKey="inlay.pipeline.name"
+                                            descriptionKey="inlay.pipeline.description" isEnabledByDefault="true"
+                                            implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonDescriptionHints"/>
+        <codeInsight.inlayActionHandler handlerId="maapipeline.references"
+                                       implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonReferenceInlayAction"/>
         <virtualFileSystem key="maa-pipeline" implementationClass="org.lintx.maapipeline.executionlens.pipeline.PipelineWorkspaceFileSystem" physical="false"/>
         <fileEditorProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineFileEditorProvider"/>
+        <fileEditorProvider implementation="org.lintx.maapipeline.executionlens.pipeline.PipelinePreviewFileEditorProvider"/>
         <postStartupActivity implementation="org.lintx.maapipeline.executionlens.MaaPipelineStartupActivity"/>
         <fileBasedIndex implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineNavigationIndex"/>
         <psi.referenceContributor language="JSON" implementation="org.lintx.maapipeline.executionlens.pipeline.PipelineJsonReferenceContributor"/>

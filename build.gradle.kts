@@ -1,6 +1,7 @@
 import java.util.Properties
 import groovy.json.JsonSlurper
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
 import org.jetbrains.intellij.platform.gradle.tasks.PrepareSandboxTask
 
 plugins {
@@ -27,7 +28,7 @@ if (localPropertiesFile.isFile) {
 
 val ideaSdkPath = localProperties.getProperty("ideaSdkPath")
     ?: providers.environmentVariable("IDEA_SDK_PATH").orNull
-    ?: error("Configure ideaSdkPath in local.properties or IDEA_SDK_PATH before running Gradle.")
+val platformVersion = providers.gradleProperty("platformVersion").get()
 
 val maaEndPath = localProperties.getProperty("maaendPath")
     ?: providers.gradleProperty("maaendPath").orNull
@@ -38,6 +39,8 @@ val signingPrivateKeyPath = providers.environmentVariable("PRIVATE_KEY_FILE").or
 val signingCertificatePath = providers.environmentVariable("CERTIFICATE_CHAIN_FILE").orNull
     ?: localProperties.getProperty("signingCertificateChainFile")
 val signingPassword = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+val signingPrivateKey = providers.environmentVariable("PRIVATE_KEY")
+val signingCertificate = providers.environmentVariable("CERTIFICATE_CHAIN")
 
 val requiredPluginIds = "com.intellij.modules.json,com.intellij.platform.images,org.lintx.maapipeline.executionlens"
 val developmentPluginIds = setOf(
@@ -50,7 +53,12 @@ val developmentPluginIds = setOf(
 
 dependencies {
     intellijPlatform {
-        local(file(ideaSdkPath))
+        // 本机继续复用已安装的 IDEA；CI 没有本机路径时下载固定版本，避免 SDK 随时间漂移。
+        if (!ideaSdkPath.isNullOrBlank()) {
+            local(file(ideaSdkPath))
+        } else {
+            intellijIdea(platformVersion)
+        }
         bundledPlugin("com.intellij.modules.json")
         bundledPlugin("com.intellij.platform.images")
         testFramework(TestFrameworkType.Platform)
@@ -65,14 +73,42 @@ dependencies {
 
 intellijPlatform {
     pluginConfiguration {
+        providers.gradleProperty("releaseNotesFile").orNull?.let {
+            changeNotes = file(it).readText(Charsets.UTF_8)
+        }
         ideaVersion {
             sinceBuild = "262"
         }
     }
     signing {
-        signingPrivateKeyPath?.let { privateKeyFile = file(it) }
-        signingCertificatePath?.let { certificateChainFile = file(it) }
+        // CI 直接从 Secrets 注入 PEM 内容，不把私钥写入仓库或构建产物。
+        if (!signingPrivateKey.orNull.isNullOrBlank()) {
+            privateKey = signingPrivateKey
+        } else {
+            signingPrivateKeyPath?.let { privateKeyFile = file(it) }
+        }
+        if (!signingCertificate.orNull.isNullOrBlank()) {
+            certificateChain = signingCertificate
+        } else {
+            signingCertificatePath?.let { certificateChainFile = file(it) }
+        }
         password = signingPassword
+    }
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+        channels = listOf("default")
+    }
+    pluginVerification {
+        ides {
+            if (!ideaSdkPath.isNullOrBlank()) {
+                local(ideaSdkPath)
+            } else {
+                create(IntelliJPlatformType.IntellijIdeaUltimate, platformVersion)
+            }
+            providers.gradleProperty("verificationIdeVersion").orNull?.let {
+                create(IntelliJPlatformType.IntellijIdeaUltimate, it)
+            }
+        }
     }
 }
 
@@ -89,16 +125,16 @@ tasks {
 
     val validateManualRelease by registering {
         group = "intellij platform"
-        description = "检查手动发布的版本及签名配置。"
+        description = "检查正式发布的版本及签名配置。"
         doLast {
-            check(!project.version.toString().contains("SNAPSHOT", ignoreCase = true)) {
-                "手动发布需要正式版本；请通过 -PpluginVersion 指定版本。"
+            check(project.version.toString().matches(Regex("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)"))) {
+                "正式发布版本需要使用 x.y.z 格式；请通过 -PpluginVersion 指定版本。"
             }
-            check(signingPrivateKeyPath?.let { file(it).isFile } == true) {
-                "请通过 local.properties 的 signingPrivateKeyFile 或 PRIVATE_KEY_FILE 环境变量指定签名私钥文件。"
+            check(!signingPrivateKey.orNull.isNullOrBlank() || signingPrivateKeyPath?.let { file(it).isFile } == true) {
+                "请通过 PRIVATE_KEY 提供私钥内容，或通过 signingPrivateKeyFile / PRIVATE_KEY_FILE 指定私钥文件。"
             }
-            check(signingCertificatePath?.let { file(it).isFile } == true) {
-                "请通过 local.properties 的 signingCertificateChainFile 或 CERTIFICATE_CHAIN_FILE 环境变量指定签名证书文件。"
+            check(!signingCertificate.orNull.isNullOrBlank() || signingCertificatePath?.let { file(it).isFile } == true) {
+                "请通过 CERTIFICATE_CHAIN 提供证书内容，或通过 signingCertificateChainFile / CERTIFICATE_CHAIN_FILE 指定证书文件。"
             }
             check(signingPassword.orNull?.isNotEmpty() == true) {
                 "请通过 PRIVATE_KEY_PASSWORD 环境变量提供私钥密码，不要将密码写入工程文件。"
@@ -112,6 +148,11 @@ tasks {
 
     verifyPluginSignature {
         dependsOn(signPlugin)
+    }
+
+    publishPlugin {
+        // 无论从 CI 还是本机发布，都必须先完成结构检查和签名验证。
+        dependsOn(verifyPluginStructure, verifyPluginSignature)
     }
 
     verifyPluginStructure {
@@ -138,7 +179,7 @@ tasks {
 }
 
 tasks.withType<PrepareSandboxTask>().configureEach {
-    if (name == "prepareSandbox_runIde") {
+    if (name == "prepareSandbox_runIde" && !ideaSdkPath.isNullOrBlank()) {
         disabledPlugins.addAll(providers.provider {
             val product = JsonSlurper().parse(file("$ideaSdkPath/product-info.json"), "UTF-8") as Map<*, *>
             (product["bundledPlugins"] as List<*>).filterIsInstance<String>().filterNot { it in developmentPluginIds } +

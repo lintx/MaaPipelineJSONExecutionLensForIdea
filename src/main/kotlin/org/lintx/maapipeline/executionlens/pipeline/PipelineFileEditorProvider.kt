@@ -23,9 +23,6 @@ internal class PipelineFileEditorProvider : FileEditorProvider, DumbAware {
         Disposer.dispose(editor)
     }
 
-    override fun readState(sourceElement: Element, project: Project, file: VirtualFile): FileEditorState =
-        FileEditorState.INSTANCE
-
     override fun writeState(state: FileEditorState, project: Project, targetElement: Element) = Unit
 
     override fun acceptRequiresReadAction(): Boolean = false

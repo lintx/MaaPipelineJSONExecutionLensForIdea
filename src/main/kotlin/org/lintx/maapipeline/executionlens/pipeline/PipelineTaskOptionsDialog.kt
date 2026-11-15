@@ -3,7 +3,6 @@ package org.lintx.maapipeline.executionlens.pipeline
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.ValidationInfo
-import com.intellij.ui.ComboboxSpeedSearch
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
@@ -72,7 +71,7 @@ internal class PipelineTaskOptionsDialog(project: Project, private val entry: Pi
                             }
                         }
                     }
-                    com.intellij.ui.ListSpeedSearch(list) { "${it.name} ${it.label} ${it.description}" }
+                    com.intellij.ui.ListSpeedSearch.installOn(list) { "${it.name} ${it.label} ${it.description}" }
                     row.add(JBScrollPane(list), BorderLayout.CENTER)
                 } else {
                     val chooser = javax.swing.JButton(option.cases.firstOrNull { it.name in chosen }?.label ?: "选择…")

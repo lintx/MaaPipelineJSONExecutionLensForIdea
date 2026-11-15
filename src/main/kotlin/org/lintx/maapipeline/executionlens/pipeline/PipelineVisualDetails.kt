@@ -8,7 +8,6 @@ import com.intellij.openapi.editor.DefaultLanguageHighlighterColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.ui.HideableDecorator
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.panels.VerticalLayout
@@ -43,13 +42,35 @@ internal fun pipelineCollapsedSection(title: String, content: JPanel, expanded: 
 }.apply {
     isOpaque = false
     alignmentX = JComponent.LEFT_ALIGNMENT
-    HideableDecorator(this, title, false).apply {
-        setContentComponent(content)
-        setOn(expanded)
+    val heading = com.intellij.ui.TitledSeparator(title)
+    val toggle = javax.swing.JButton().apply {
+        isBorderPainted = false
+        isContentAreaFilled = false
+        margin = JBUI.emptyInsets()
+        toolTipText = "展开或折叠$title"
+        accessibleContext.accessibleName = title
     }
-    if (subdued) components.filterIsInstance<com.intellij.ui.TitledSeparator>().forEach {
-        it.label.foreground = UIUtil.getContextHelpForeground()
+    val header = JPanel(BorderLayout(JBUI.scale(4), 0)).apply {
+        isOpaque = false
+        add(toggle, BorderLayout.WEST)
+        add(heading, BorderLayout.CENTER)
     }
+    fun update() {
+        toggle.icon = if (content.isVisible) com.intellij.icons.AllIcons.General.ArrowDown else com.intellij.icons.AllIcons.General.ArrowRight
+        revalidate()
+        repaint()
+    }
+    content.isVisible = expanded
+    toggle.addActionListener { content.isVisible = !content.isVisible; update() }
+    val listener = object : MouseAdapter() {
+        override fun mouseClicked(event: MouseEvent) { toggle.doClick() }
+    }
+    heading.addMouseListener(listener)
+    heading.label.addMouseListener(listener)
+    if (subdued) heading.label.foreground = UIUtil.getContextHelpForeground()
+    add(header, BorderLayout.NORTH)
+    add(content, BorderLayout.CENTER)
+    update()
 }
 
 internal class PipelineWrappingLabel(value: String) : JTextArea() {
@@ -253,7 +274,7 @@ internal class PipelineVisualDetails(
         container.add(row)
         val application = ApplicationManager.getApplication()
         application.executeOnPooledThread {
-            val files = ReadAction.compute<List<VirtualFile>, RuntimeException> {
+            val files = ReadAction.computeBlocking<List<VirtualFile>, RuntimeException> {
                 if (project.isDisposed) emptyList() else if (preview) listOfNotNull(PipelineVisualAssets.resolve(project, sourceFile, path, true, environmentId))
                 else PipelineVisualAssets.templates(project, sourceFile, path, environmentId)
             }

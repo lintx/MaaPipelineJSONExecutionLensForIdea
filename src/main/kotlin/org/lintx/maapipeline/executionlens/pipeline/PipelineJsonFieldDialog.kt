@@ -41,7 +41,7 @@ internal class PipelineJsonFieldDialog(
         add(jsonEditor, BorderLayout.CENTER)
     }
 
-    override fun doValidate(): ValidationInfo? = ReadAction.compute<ValidationInfo?, RuntimeException> { validateValue() }
+    override fun doValidate(): ValidationInfo? = ReadAction.computeBlocking<ValidationInfo?, RuntimeException> { validateValue() }
 
     private fun validateValue(): ValidationInfo? {
         val psiFile = PsiFileFactory.getInstance(project).createFileFromText(

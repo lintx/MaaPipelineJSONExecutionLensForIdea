@@ -1,13 +1,17 @@
 package org.lintx.maapipeline.executionlens.pipeline
 
 import com.intellij.codeInsight.hint.HintManager
-import com.intellij.codeInsight.hints.ChangeListener
-import com.intellij.codeInsight.hints.FactoryInlayHintsCollector
-import com.intellij.codeInsight.hints.ImmediateConfigurable
-import com.intellij.codeInsight.hints.InlayHintsProvider
-import com.intellij.codeInsight.hints.InlayHintsSink
-import com.intellij.codeInsight.hints.NoSettings
-import com.intellij.codeInsight.hints.SettingsKey
+import com.intellij.codeInsight.hints.declarative.AboveLineIndentedPosition
+import com.intellij.codeInsight.hints.declarative.EndOfLinePosition
+import com.intellij.codeInsight.hints.declarative.HintColorKind
+import com.intellij.codeInsight.hints.declarative.HintFontSize
+import com.intellij.codeInsight.hints.declarative.HintFormat
+import com.intellij.codeInsight.hints.declarative.HintMarginPadding
+import com.intellij.codeInsight.hints.declarative.InlayActionData
+import com.intellij.codeInsight.hints.declarative.InlayHintsProvider
+import com.intellij.codeInsight.hints.declarative.InlayTreeSink
+import com.intellij.codeInsight.hints.declarative.SharedBypassCollector
+import com.intellij.codeInsight.hints.declarative.StringInlayActionPayload
 import com.intellij.codeInsight.navigation.getPsiElementPopup
 import com.intellij.json.psi.JsonArray
 import com.intellij.json.psi.JsonFile
@@ -25,7 +29,6 @@ import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.util.concurrency.AppExecutorUtil
-import javax.swing.JPanel
 
 internal data class PipelineJsonNodeUse(val name: String, val anchor: Boolean, val field: String)
 
@@ -104,43 +107,30 @@ internal class PipelineJsonSymbolLookup(private val project: Project, private va
     }
 }
 
-class PipelineJsonDescriptionHints : InlayHintsProvider<NoSettings> {
-    override val key = SettingsKey<NoSettings>("maapipeline.descriptions")
-    override val name = "Pipeline 节点说明与引用"
-    override val previewText = """{"Start":{"desc":"任务入口","next":["Finish"]},"Finish":{"desc":"结束"}}"""
-    override fun createSettings() = NoSettings()
-    override fun createConfigurable(settings: NoSettings) = object : ImmediateConfigurable {
-        override fun createComponent(listener: ChangeListener) = JPanel()
-    }
-
-    override fun getCollectorFor(file: PsiFile, editor: Editor, settings: NoSettings, sink: InlayHintsSink): FactoryInlayHintsCollector? {
+class PipelineJsonDescriptionHints : InlayHintsProvider {
+    override fun createCollector(file: PsiFile, editor: Editor): SharedBypassCollector? {
         if (file !is JsonFile || !isMaaJson(file) || DumbService.isDumb(file.project)) return null
         val source = file.virtualFile ?: return null
         val isPipeline = PipelineFileDetector.isPipelineFile(source, file.text)
         val lookup = PipelineJsonSymbolLookup(file.project, file)
-        return object : FactoryInlayHintsCollector(editor) {
-            override fun collect(element: PsiElement, editor: Editor, sink: InlayHintsSink): Boolean {
+        val format = HintFormat(HintColorKind.TextWithoutBackground, HintFontSize.ABitSmallerThanInEditor, HintMarginPadding.OnlyPadding)
+        return object : SharedBypassCollector {
+            override fun collectFromElement(element: PsiElement, sink: InlayTreeSink) {
                 if (isPipeline && element is JsonProperty && element.parent?.parent is JsonFile && element.value is JsonObject) {
                     val nodeName = element.name
                     val count = lookup.usages(nodeName).size
-                    val line = editor.document.getLineNumber(element.textOffset)
-                    val indent = element.textOffset - editor.document.getLineStartOffset(line)
-                    val link = factory.reference(factory.smallTextWithoutBackground("$count 处引用")) {
-                        PipelineJsonReferences.showUsages(file.project, source, nodeName, editor)
+                    sink.addPresentation(AboveLineIndentedPosition(element.textOffset), tooltip = "查看 $nodeName 的引用", hintFormat = format) {
+                        text("$count 处引用", InlayActionData(StringInlayActionPayload(nodeName), PipelineJsonReferenceInlayAction.ID))
                     }
-                    sink.addBlockElement(element.textOffset, true, true, 0,
-                        factory.seq(factory.textSpacePlaceholder(indent, false), link))
                 }
-                if (element !is JsonStringLiteral) return true
+                if (element !is JsonStringLiteral) return
                 val description = PipelineJsonSymbols.use(element)?.let { lookup.description(it.name, it.anchor) }
                 if (description != null) {
                     val compact = description.replace(Regex("\\s+"), " ").trim()
                     val text = compact.take(100) + if (compact.length > 100) "…" else ""
-                    sink.addInlineElement(element.textRange.endOffset, true,
-                        factory.offsetFromTopForSmallText(factory.withTooltip(description,
-                            factory.smallTextWithoutBackground("  $text"))), true)
+                    sink.addPresentation(EndOfLinePosition(editor.document.getLineNumber(element.textOffset), -element.textOffset),
+                        tooltip = description, hintFormat = format) { text(text) }
                 }
-                return true
             }
         }
     }

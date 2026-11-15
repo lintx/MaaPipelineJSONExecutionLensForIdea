@@ -72,7 +72,7 @@ internal class PipelineWorkspaceSource(private val project: Project) : JPanel(Bo
 
     fun showNode(node: PipelineNodeLocation, overlays: List<PipelineOverrideLocation>, environmentId: String = "", navigate: Boolean = true) {
         val base = node.sourceFile ?: return
-        val resolvedSources = ReadAction.compute<List<PipelineProjectFiles.ResourceSource>, RuntimeException> {
+        val resolvedSources = ReadAction.computeBlocking<List<PipelineProjectFiles.ResourceSource>, RuntimeException> {
             val manifest = PipelineProjectFiles.manifest(project, base)
             val layers = manifest?.let { PipelineProjectFiles.resourceLayers(PipelineProjectFiles.text(it), environmentId) }.orEmpty()
             PipelineProjectFiles.resourceLayerFiles(manifest?.parent, base, layers)

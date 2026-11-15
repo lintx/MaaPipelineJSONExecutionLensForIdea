@@ -17,7 +17,8 @@ import javax.imageio.ImageIO
 
 internal object PipelineVisualAssets {
     data class TemplatePreview(val name: String, val image: BufferedImage?)
-    private data class OverlayContent(val text: String? = null, val image: BufferedImage? = null, val spacing: Int = 0)
+    data class OverlayContent(val text: String? = null, val image: BufferedImage? = null, val spacing: Int = 0,
+        val annotationNumber: Int? = null)
     data class OverlayMark(val annotation: PipelinePreviewAnnotation, val original: Boolean = false) {
         val description: String get() = annotation.title + when {
             original -> " · 原始（虚线）"
@@ -140,7 +141,7 @@ internal object PipelineVisualAssets {
             val template = operation.parameters["template"] ?: return@mapNotNull null
             val paths = (if (template.isJsonArray) template.asJsonArray.toList() else listOf(template))
                 .filter { it.isJsonPrimitive }.map { it.asString }
-            val files = ReadAction.compute<List<Pair<String, VirtualFile?>>, RuntimeException> {
+            val files = ReadAction.computeBlocking<List<Pair<String, VirtualFile?>>, RuntimeException> {
                 if (project.isDisposed) emptyList() else paths.flatMap { path ->
                     templates(project, operation.source?.sourceFile ?: source, path, environmentId).map { it.name to it }.ifEmpty { listOf(path to null) }
                 }
@@ -203,16 +204,15 @@ internal object PipelineVisualAssets {
         }
     }
 
-    fun overlay(image: BufferedImage, operations: List<PipelineOperation>,
+    fun previewRegions(width: Int, height: Int, operations: List<PipelineOperation>,
         resolve: (String) -> PipelineNodeLocation? = { null }, selectedAnnotation: Int? = null,
-        templatePreviews: Map<Int, List<TemplatePreview>> = emptyMap(), compact: Boolean = false,
-        excludedAnnotation: Int? = null, originalDraft: List<Int>? = null, finalDraft: List<Int>? = null): BufferedImage {
+        excludedAnnotation: Int? = null, originalDraft: List<Int>? = null, finalDraft: List<Int>? = null): List<OverlayRegion> {
         val draft = if (excludedAnnotation != null && originalDraft != null) excludedAnnotation to originalDraft else null
-        val sourceRegions = overlayRegions(image.width, image.height, operations, resolve, draft).toMutableList()
+        val sourceRegions = overlayRegions(width, height, operations, resolve, draft).toMutableList()
         if (finalDraft != null) {
             PipelinePreviewModel.annotations(operations, resolve).firstOrNull { it.number == excludedAnnotation }
                 ?.takeIf { it.region.originalCoordinates == null }?.let { annotation ->
-                    annotation.region.coordinates?.let { PipelineRegionInfo.rectangle(it, image.width, image.height) }?.let { rectangle ->
+                    annotation.region.coordinates?.let { PipelineRegionInfo.rectangle(it, width, height) }?.let { rectangle ->
                         sourceRegions += OverlayRegion(rectangle, listOf(OverlayMark(annotation, original = true)))
                     }
                 }
@@ -223,97 +223,130 @@ internal object PipelineVisualAssets {
                 if (finalDraft != null) it.original else (!it.original && it.annotation.region.originalCoordinates != null) }
             if (marks.isEmpty()) null else region.copy(marks = marks)
         }
+        return regions.filter { selectedAnnotation == null || it.annotations.any { item -> item.number == selectedAnnotation } }
+            .map { region -> region.copy(marks = region.marks.filter { selectedAnnotation == null || it.annotation.number == selectedAnnotation }) }
+    }
+
+    fun previewContent(region: OverlayRegion, templatePreviews: Map<Int, List<TemplatePreview>>, small: Boolean = false): List<OverlayContent> =
+        region.annotations.flatMap { annotation ->
+            val original = region.marks.any { it.annotation.number == annotation.number && it.original }
+            val final = region.marks.any { it.annotation.number == annotation.number && !it.original }
+            val paragraphs = if (small) listOf("${annotation.number}" + when {
+                original && final -> " 原始/最终"
+                original -> " 原始"
+                annotation.region.originalCoordinates != null -> " 最终"
+                else -> ""
+            }) else buildList {
+                if (original) {
+                    add("${annotation.number} 原始（虚线） ${annotation.key}=${annotation.region.originalCoordinates}")
+                    if (final) add("原始与最终同框")
+                }
+                if (final) addAll(annotation.imageLines(region.rectangle))
+            }
+            val templates = if (small || !final) emptyList() else templatePreviews[annotation.number].orEmpty().distinctBy { it.name }
+            val media = templates.take(4) + if (small || !final) emptyList() else
+                PipelineVisualModel.colors(annotation.operation)?.let { colors ->
+                    colors.ranges.take(8).mapIndexed { rangeIndex, range ->
+                        TemplatePreview("${colors.space} ${rangeIndex + 1}", colorImage(colors.copy(ranges = listOf(range))))
+                    }
+                }.orEmpty()
+            buildList {
+                paragraphs.forEachIndexed { index, text ->
+                    add(OverlayContent(text = text, annotationNumber = annotation.number.takeIf { index == 0 }))
+                }
+                if (templates.size > 4) add(OverlayContent(text = "模板预览：前 4 张，共 ${templates.size} 张"))
+                media.forEach { preview ->
+                    add(OverlayContent(text = preview.name + if (preview.image == null) "（图片不可用）" else ""))
+                    preview.image?.let { add(OverlayContent(image = it)) }
+                    add(OverlayContent(spacing = 4))
+                }
+            }
+        }
+
+    fun overlay(image: BufferedImage, operations: List<PipelineOperation>,
+        resolve: (String) -> PipelineNodeLocation? = { null }, selectedAnnotation: Int? = null,
+        templatePreviews: Map<Int, List<TemplatePreview>> = emptyMap(), compact: Boolean = false,
+        excludedAnnotation: Int? = null, originalDraft: List<Int>? = null, finalDraft: List<Int>? = null): BufferedImage {
+        val regions = previewRegions(image.width, image.height, operations, resolve, null, excludedAnnotation, originalDraft, finalDraft)
         val visible = regions.filter { selectedAnnotation == null || it.annotations.any { item -> item.number == selectedAnnotation } }
             .map { region -> region.copy(marks = region.marks.filter { selectedAnnotation == null || it.annotation.number == selectedAnnotation }) }
             .map { IndexedValue(it.annotations.first().number - 1, it) }
-        val result = BufferedImage(image.width, image.height, BufferedImage.TYPE_INT_ARGB)
-        val graphics = result.createGraphics()
-        val lineWidth = PipelinePreviewSettings.lineWidth()
-        try {
-            graphics.drawImage(image, 0, 0, null)
-            graphics.font = Font(Font.DIALOG, Font.PLAIN, if (compact) maxOf(14, image.width * 12 / 420) else 14)
-            graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-            visible.forEach { (index, region) ->
-                drawRoiFrame(graphics, region.rectangle, index, region.originalOnly, region.dashed, lineWidth)
-            }
-            drawSharedEdges(graphics, visible, lineWidth)
-            val placed = mutableListOf<Rectangle>()
-            visible.forEach { (index, region) ->
-                val rectangle = region.rectangle
-                val labels = region.annotations
-                val metrics = graphics.fontMetrics
-                val small = compact || image.width < 320
+        data class Card(val index: Int, val region: OverlayRegion, val content: List<OverlayContent>, var bounds: Rectangle)
+        val font = Font(Font.DIALOG, Font.PLAIN, if (compact) maxOf(14, image.width * 12 / 420) else 14)
+        val measuring = BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB).createGraphics()
+        val cards = try {
+            measuring.font = font
+            val metrics = measuring.fontMetrics
+            visible.map { (index, region) ->
                 val contentWidth = (image.width - 12).coerceIn(1, 420)
-                val content = labels.flatMap { annotation ->
-                    val original = region.marks.any { it.annotation.number == annotation.number && it.original }
-                    val final = region.marks.any { it.annotation.number == annotation.number && !it.original }
-                    val paragraphs = if (small) listOf("${annotation.number}" + when {
-                        original && final -> " 原始/最终"
-                        original -> " 原始"
-                        annotation.region.originalCoordinates != null -> " 最终"
-                        else -> ""
-                    }) else buildList {
-                        if (original) {
-                            add("${annotation.number} 原始（虚线） ${annotation.key}=${annotation.region.originalCoordinates}")
-                            if (final) add("原始与最终同框")
-                        }
-                        if (final) addAll(annotation.imageLines(rectangle))
-                    }
-                    val templates = if (small || !final) emptyList() else templatePreviews[annotation.number].orEmpty().distinctBy { it.name }
-                    val media = templates.take(4) + if (small || !final) emptyList() else
-                        PipelineVisualModel.colors(annotation.operation)?.let { colors ->
-                            colors.ranges.take(8).mapIndexed { rangeIndex, range ->
-                                TemplatePreview("${colors.space} ${rangeIndex + 1}", colorImage(colors.copy(ranges = listOf(range))))
-                            }
-                        }.orEmpty()
-                    val extra = if (templates.size > 4) listOf("模板预览：前 4 张，共 ${templates.size} 张") else emptyList()
-                    buildList {
-                        wrapOverlayText(paragraphs + extra, metrics, contentWidth).forEach { add(OverlayContent(text = it)) }
-                        media.forEach { preview ->
-                            wrapOverlayText(listOf(preview.name + if (preview.image == null) "（图片不可用）" else ""), metrics, contentWidth)
-                                .forEach { add(OverlayContent(text = it)) }
-                            preview.image?.let { add(OverlayContent(image = it)) }
-                            add(OverlayContent(spacing = 4))
-                        }
-                    }
+                val content = previewContent(region, templatePreviews, small = compact).flatMap { item ->
+                    item.text?.let { text -> wrapOverlayText(listOf(text), metrics, contentWidth).map { OverlayContent(text = it) } }
+                        ?: listOf(item)
                 }
                 val width = (content.maxOfOrNull { it.text?.let(metrics::stringWidth) ?: it.image?.width ?: 0 } ?: 0) + 8
                 val height = content.sumOf { if (it.text != null) metrics.height else (it.image?.height ?: 0) + it.spacing } + 8
-                val candidates = listOf(
-                    Rectangle(rectangle.x, rectangle.y - height - 4, width, height),
-                    Rectangle(rectangle.x, rectangle.y + rectangle.height + 4, width, height),
-                    Rectangle(rectangle.x + rectangle.width + 4, rectangle.y, width, height),
-                    Rectangle(rectangle.x - width - 4, rectangle.y, width, height),
-                ).map { candidate -> Rectangle(candidate.x.coerceIn(0, (image.width - width).coerceAtLeast(0)),
-                    candidate.y.coerceIn(0, (image.height - height).coerceAtLeast(0)), width, height) }
-                fun area(bounds: Rectangle): Long = if (bounds.width <= 0 || bounds.height <= 0) 0 else bounds.width.toLong() * bounds.height
-                val bounds = candidates.withIndex().minBy { (position, candidate) ->
-                    placed.sumOf { area(candidate.intersection(it)) } * 8 +
-                        regions.sumOf { area(candidate.intersection(it.rectangle)) } + position
-                }.value
-                placed += bounds
-                graphics.color = overlayColor(index, region.originalOnly)
-                graphics.stroke = BasicStroke(1f)
-                graphics.drawLine(bounds.x.coerceIn(rectangle.x, rectangle.x + rectangle.width - 1),
-                    bounds.y.coerceIn(rectangle.y, rectangle.y + rectangle.height - 1), bounds.x, bounds.y)
+                Card(index, region, content, Rectangle(0, 0, width, height))
+            }
+        } finally { measuring.dispose() }
+        val lineWidth = PipelinePreviewSettings.lineWidth()
+        val view = Rectangle(0, 0, image.width, image.height)
+        val frames = visible.map { it.value.rectangle }
+        val placed = mutableListOf<Rectangle>()
+        val gap = 4 + kotlin.math.ceil(lineWidth).toInt()
+        val docked = cards.any { card ->
+            val bounds = PipelineAnnotationLayout.place(view, card.region.rectangle, card.bounds.size, placed, frames, gap)
+            if (bounds != null) { card.bounds = bounds; placed += bounds }
+            bounds == null
+        }
+        var resultWidth = image.width
+        var resultHeight = image.height
+        if (docked) {
+            // 静态预览不能滚动卡片；画布不足时将完整说明排在图片外，不能缩成仅编号或互相覆盖。
+            var top = 4
+            cards.forEach { card -> card.bounds.setLocation(image.width + 8, top); top += card.bounds.height + 4 }
+            resultWidth += (cards.maxOfOrNull { it.bounds.width } ?: 0) + 16
+            resultHeight = maxOf(resultHeight, top)
+        }
+        val result = BufferedImage(resultWidth, resultHeight, BufferedImage.TYPE_INT_ARGB)
+        val graphics = result.createGraphics()
+        try {
+            graphics.drawImage(image, 0, 0, null)
+            graphics.font = font
+            graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            if (!docked) {
+                val paths = PipelineAnnotationConnections.routes(cards.map { it.region.rectangle to it.bounds }, frames,
+                    cards.map { it.bounds }, view, gap)
+                cards.zip(paths).forEach { (card, path) ->
+                    if (path == null) return@forEach
+                    graphics.color = overlayColor(card.index, card.region.originalOnly)
+                    graphics.stroke = BasicStroke(1f)
+                    path.zipWithNext().forEach { (a, b) -> graphics.drawLine(a.x, a.y, b.x, b.y) }
+                }
+            }
+            cards.forEach { (index, region, content, bounds) ->
                 graphics.color = Color(0, 0, 0, 220)
                 graphics.fillRect(bounds.x, bounds.y, bounds.width, bounds.height)
                 graphics.color = overlayColor(index, region.originalOnly)
+                graphics.drawRect(bounds.x, bounds.y, bounds.width - 1, bounds.height - 1)
                 var contentTop = bounds.y + 4
                 content.forEach { item ->
                     item.text?.let { text ->
-                        graphics.drawString(text, bounds.x + 4, contentTop + metrics.ascent)
-                        contentTop += metrics.height
+                        graphics.drawString(text, bounds.x + 4, contentTop + graphics.fontMetrics.ascent)
+                        contentTop += graphics.fontMetrics.height
                     }
                     item.image?.let { graphics.drawImage(it, bounds.x + 4, contentTop, null); contentTop += it.height }
                     contentTop += item.spacing
                 }
             }
+            visible.forEach { (index, region) ->
+                drawRoiFrame(graphics, region.rectangle, index, region.originalOnly, region.dashed, lineWidth)
+            }
+            drawSharedEdges(graphics, visible, lineWidth)
         } finally { graphics.dispose() }
         return result
     }
 
-    private fun overlayColor(index: Int, original: Boolean = false): Color = Color.getHSBColor(index * 0.17f % 1f,
+    fun overlayColor(index: Int, original: Boolean = false): Color = Color.getHSBColor(index * 0.17f % 1f,
         if (original) 0.35f else 0.7f, 1f)
 
     fun drawRoiFrame(graphics: Graphics2D, rectangle: Rectangle, index: Int, original: Boolean, dashed: Boolean, lineWidth: Float) {
@@ -335,7 +368,7 @@ internal object PipelineVisualAssets {
         graphics.draw(shape)
     }
 
-    private fun drawSharedEdges(graphics: Graphics2D, regions: List<IndexedValue<OverlayRegion>>, lineWidth: Float) {
+    fun drawSharedEdges(graphics: Graphics2D, regions: List<IndexedValue<OverlayRegion>>, lineWidth: Float) {
         data class Edge(val horizontal: Boolean, val fixed: Int, val start: Int, val end: Int, val index: Int,
             val identity: Int, val original: Boolean)
         val edges = regions.flatMapIndexed { identity, (index, region) ->

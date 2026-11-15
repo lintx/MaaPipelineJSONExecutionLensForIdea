@@ -225,7 +225,7 @@ internal class PipelineFlowPanel(
         nodeSelector.horizontalAlignment = javax.swing.SwingConstants.LEFT
         nodeSelector.toolTipText = "搜索节点 ID 或描述；选择后仅切换详情"
         nodeSelector.addActionListener { showNodeChooser() }
-        com.intellij.ui.ComboboxSpeedSearch(environmentSelector)
+        com.intellij.ui.ComboboxSpeedSearch.installOn(environmentSelector)
         entrySelector.toolTipText = "按任务 ID、名称、注释、UI 文本搜索；最近任务优先"
         entryStatusLabel.foreground = UIUtil.getContextHelpForeground()
         overrideToggle.apply {
@@ -1292,7 +1292,7 @@ internal class PipelineFlowPanel(
         renderedContext = contextKey
     }
 
-    private fun traceSourceChanged(): Boolean = traceSourceVersionState ?: ReadAction.compute<Boolean, RuntimeException> {
+    private fun traceSourceChanged(): Boolean = traceSourceVersionState ?: ReadAction.computeBlocking<Boolean, RuntimeException> {
         traceSourceVersions.any { (source, version) ->
             !source.isValid || (FileDocumentManager.getInstance().getDocument(source)?.modificationStamp ?: source.modificationStamp) != version
         }
@@ -2079,7 +2079,7 @@ internal class PipelineFlowPanel(
             catalog[if (name.startsWith("[Anchor]")) frame?.anchors?.get(name.removePrefix("[Anchor]")) else name]
         }
         val visuals = PipelineVisualDetails(project, sourceFile, resolve, {
-            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(it, true)
+            PipelineNavigation.getInstance(project).open(it)
         }, blocked = { simulation != null || it in currentModel.generatedFiles }, defaults = {
             PipelinePropertyCatalog.resourceDefaults(it ?: location, currentModel)
         }, environmentId = currentModel.environmentId)
@@ -2217,7 +2217,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun showAnchorManager() {
-        val snapshots = ReadAction.compute<Map<VirtualFile, PipelineEditSnapshot>, RuntimeException> {
+        val snapshots = ReadAction.computeBlocking<Map<VirtualFile, PipelineEditSnapshot>, RuntimeException> {
             currentModel.indexedVersions.keys.mapNotNull { sourceFile ->
                 FileDocumentManager.getInstance().getDocument(sourceFile)?.let { document ->
                     sourceFile to PipelineEditSnapshot(document.modificationStamp, document.text)
@@ -2312,7 +2312,7 @@ internal class PipelineFlowPanel(
     }
 
     private fun documentFor(sourceFile: VirtualFile): Document? =
-        ReadAction.compute<Document?, RuntimeException> { FileDocumentManager.getInstance().getDocument(sourceFile) }
+        ReadAction.computeBlocking<Document?, RuntimeException> { FileDocumentManager.getInstance().getDocument(sourceFile) }
 
     private fun ensureFileSnapshot(
         sourceFile: VirtualFile,
@@ -2499,7 +2499,7 @@ internal class PipelineFlowPanel(
 
     private fun addReference(field: PipelineFieldLocation, fieldName: String? = field.name, sourceFile: VirtualFile = file) {
         val context = detailEditContext(sourceFile, field.valueRange) ?: return
-        val range = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
+        val range = ReadAction.computeBlocking<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes)
         if (!dialog.showAndGet()) return
         val targetName = dialog.value
@@ -2522,7 +2522,7 @@ internal class PipelineFlowPanel(
         val context = detailEditContext(sourceFile) ?: return
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes)
         if (!dialog.showAndGet()) return
-        val range = ReadAction.compute<TextRange?, RuntimeException> {
+        val range = ReadAction.computeBlocking<TextRange?, RuntimeException> {
             context.owner.takeIf { it.findProperty("next") == null }?.textRange
         } ?: return
         val original = context.snapshot.text.substring(range.startOffset, range.endOffset)
@@ -2821,9 +2821,9 @@ internal class PipelineFlowPanel(
         val replacementValue = dialog.value
         if (!ensureFileSnapshot(taskFile, snapshot)) return
         PsiDocumentManager.getInstance(project).commitDocument(taskDocument)
-        val insertionPlan = ReadAction.compute<OverrideInsertionPlan?, RuntimeException> {
-            val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@compute null
-            val owner = taskContextObject(jsonFile, override?.contextPath ?: entry.contextPath) ?: return@compute null
+        val insertionPlan = ReadAction.computeBlocking<OverrideInsertionPlan?, RuntimeException> {
+            val jsonFile = PsiManager.getInstance(project).findFile(taskFile) as? JsonFile ?: return@computeBlocking null
+            val owner = taskContextObject(jsonFile, override?.contextPath ?: entry.contextPath) ?: return@computeBlocking null
             val pipelineOverrideProperty = owner.findProperty("pipeline_override")
             val targetProperty = (pipelineOverrideProperty?.value as? JsonObject)
                 ?.propertyList
@@ -3096,7 +3096,7 @@ internal class PipelineFlowPanel(
         val dialog = PipelineReferenceDialog(project, currentModel.projectNodes, initial)
         if (!dialog.showAndGet()) return
         val text = dialog.value
-        val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
+        val edit = ReadAction.computeBlocking<PipelineTextEdit?, RuntimeException> {
             PipelineReferenceEdits.edit(project, context.snapshot.text, current, text)
         } ?: return
         applyDetailEdits(context, listOf(edit), "修改 Pipeline 引用")
@@ -3295,7 +3295,7 @@ internal class PipelineFlowPanel(
         val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
             .withTitle("选择 MaaFramework 运行日志")
             .withDescription("选择 MaaFramework maafw.log 或导出的同类日志文件")
-        val defaultFile = project.baseDir?.findFileByRelativePath("debug/maafw.log")
+        val defaultFile = PipelineProjectFiles.base(project)?.findFileByRelativePath("debug/maafw.log")
         val selected = FileChooser.chooseFile(descriptor, project, defaultFile) ?: return
         val generation = ++traceLoadGeneration
         val sourceFiles = (currentModel.indexedVersions.keys + currentModel.pipelineOverrides.map { it.file } +
@@ -3306,7 +3306,7 @@ internal class PipelineFlowPanel(
             private var sourceVersions: Map<VirtualFile, Long> = emptyMap()
 
             override fun run(indicator: ProgressIndicator) {
-                sourceVersions = ReadAction.compute<Map<VirtualFile, Long>, RuntimeException> {
+                sourceVersions = ReadAction.computeBlocking<Map<VirtualFile, Long>, RuntimeException> {
                     sourceFiles.associateWith { source ->
                         FileDocumentManager.getInstance().getDocument(source)?.modificationStamp ?: source.modificationStamp
                     }
@@ -3377,7 +3377,7 @@ internal class PipelineFlowPanel(
     ): Boolean {
         if (snapshot.matches(document.modificationStamp, document.text)) return true
         val current = PipelineEditSnapshot(document.modificationStamp, document.text)
-        val targetFile = ReadAction.compute<VirtualFile?, RuntimeException> {
+        val targetFile = ReadAction.computeBlocking<VirtualFile?, RuntimeException> {
             FileDocumentManager.getInstance().getFile(document)
         }
         PipelineConflictDialog(
@@ -3402,7 +3402,7 @@ internal class PipelineFlowPanel(
         if (disposed || project.isDisposed || merged == snapshot.text) return
         val edit = PipelineJsonTextEdits.replacementEdit(TextRange(0, snapshot.text.length), snapshot.text, merged)
         if (!ensureFileSnapshot(targetFile, snapshot, listOf(edit))) return
-        val valid = ReadAction.compute<Boolean, RuntimeException> {
+        val valid = ReadAction.computeBlocking<Boolean, RuntimeException> {
             val psiFile = PsiFileFactory.getInstance(project).createFileFromText("PipelineMerge.json", JsonFileType.INSTANCE, merged)
             (psiFile as? JsonFile)?.topLevelValue is JsonObject && !PsiTreeUtil.hasErrorElements(psiFile)
         }
@@ -3435,7 +3435,7 @@ internal class PipelineFlowPanel(
         }
         val snapshot = PipelineEditSnapshot(document.modificationStamp, document.text)
         if (!ensureFileSnapshot(sourceFile, snapshot)) return null
-        val root = ReadAction.compute<JsonObject?, RuntimeException> {
+        val root = ReadAction.computeBlocking<JsonObject?, RuntimeException> {
             PipelineOperationEdits.objectValue(project, snapshot.text)
         }
         if (root == null) {
@@ -3447,14 +3447,14 @@ internal class PipelineFlowPanel(
         val override = currentModel.pipelineOverrides.singleOrNull {
             it.file == sourceFile && it.targetName == nodeName && range != null && it.valueRange.contains(range)
         }
-        val resolved = ReadAction.compute<Pair<JsonObject, PipelineNodeLocation>?, RuntimeException> {
+        val resolved = ReadAction.computeBlocking<Pair<JsonObject, PipelineNodeLocation>?, RuntimeException> {
             val container = if (override == null) root else
                 taskContextObject(root.containingFile as JsonFile, override.contextPath)
                     ?.findProperty("pipeline_override")?.value as? JsonObject
-            val property = container?.propertyList?.singleOrNull { it.name == nodeName } ?: return@compute null
-            val owner = property.value as? JsonObject ?: return@compute null
+            val property = container?.propertyList?.singleOrNull { it.name == nodeName } ?: return@computeBlocking null
+            val owner = property.value as? JsonObject ?: return@computeBlocking null
             val node = PipelineDocumentIndexer.detailNode(owner, sourceFile, currentModel.supportsMaaEndSubTasks)
-                ?: return@compute null
+                ?: return@computeBlocking null
             owner to node
         }
         if (resolved == null) {
@@ -3494,7 +3494,7 @@ internal class PipelineFlowPanel(
     private fun editJsonField(field: PipelineFieldLocation, sourceFile: VirtualFile) {
         if (field.isDerived) return
         val context = detailEditContext(sourceFile, field.valueRange) ?: return
-        val range = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
+        val range = ReadAction.computeBlocking<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange } ?: return
         val initialText = context.snapshot.text.substring(range.startOffset, range.endOffset)
         val dialog = PipelineJsonFieldDialog(project, field.name, initialText)
         if (!dialog.showAndGet()) return
@@ -3509,11 +3509,11 @@ internal class PipelineFlowPanel(
         val context = detailEditContext(field?.sourceFile ?: sourceFile, field?.valueRange, node.name) ?: return
         val name = if (isAction) "action" else "recognition"
         val owner = context.owner
-        val initial = ReadAction.compute<String, RuntimeException> { PipelineOperationEdits.fragment(owner, isAction) }
+        val initial = ReadAction.computeBlocking<String, RuntimeException> { PipelineOperationEdits.fragment(owner, isAction) }
         val dialog = PipelineJsonFieldDialog(project, name, initial, isAction)
         if (!dialog.showAndGet()) return
         if (dialog.value == initial) return
-        val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
+        val edit = ReadAction.computeBlocking<PipelineTextEdit?, RuntimeException> {
             PipelineOperationEdits.operationEdit(project, owner, dialog.value, isAction)
         } ?: return
         applyDetailEdits(context, listOf(edit), "编辑 Pipeline ${if (isAction) "动作" else "条件"}")
@@ -3550,7 +3550,7 @@ internal class PipelineFlowPanel(
             removeLeadingMarker(initial, marker)
         }
         if (updatedValue == initial) return
-        val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
+        val edit = ReadAction.computeBlocking<PipelineTextEdit?, RuntimeException> {
             PipelineReferenceEdits.edit(project, context.snapshot.text, current, updatedValue)
         } ?: return
         applyDetailEdits(context, listOf(edit), "编辑 Pipeline 引用标记")
@@ -3576,8 +3576,8 @@ internal class PipelineFlowPanel(
         val current = detailReference(context, reference) ?: return
         val latest = if (reference.kind == PipelineReferenceKind.ON_ERROR) context.node.onError else context.node.next
         val target = latest.getOrNull(latest.indexOf(current) + direction) ?: return
-        val currentRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
-        val targetRange = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, target) }
+        val currentRange = ReadAction.computeBlocking<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
+        val targetRange = ReadAction.computeBlocking<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, target) }
         val lowerRange: TextRange
         val higherRange: TextRange
         if (currentRange.startOffset < targetRange.startOffset) {
@@ -3597,8 +3597,8 @@ internal class PipelineFlowPanel(
     private fun removeReference(sourceFile: VirtualFile, field: PipelineFieldLocation, reference: PipelineReference, fieldName: String?) {
         val context = detailEditContext(sourceFile, field.valueRange) ?: return
         val current = detailReference(context, reference) ?: return
-        val range = ReadAction.compute<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
-        val valueRange = ReadAction.compute<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange }
+        val range = ReadAction.computeBlocking<TextRange, RuntimeException> { PipelineReferenceEdits.range(project, context.snapshot.text, current) }
+        val valueRange = ReadAction.computeBlocking<TextRange?, RuntimeException> { context.owner.findProperty(field.name)?.value?.textRange }
         val edits = if (valueRange == range) {
             listOf(PipelineTextEdit(range, "[]"))
         } else {

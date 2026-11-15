@@ -2,25 +2,23 @@ package org.lintx.maapipeline.executionlens.pipeline
 
 import com.intellij.json.psi.JsonObject
 import com.intellij.json.psi.JsonProperty
+import com.intellij.lang.documentation.DocumentationProvider
 import com.intellij.lang.documentation.DocumentationProviderEx
 import com.intellij.openapi.editor.Editor
 import com.intellij.psi.PsiComment
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
+import java.awt.Image
 import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
-import java.util.Base64
-import javax.imageio.ImageIO
+
+internal data class PipelineDocumentation(val html: String, val images: Map<String, BufferedImage>, val popupMarker: String)
 
 class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
     override fun getDocumentationElementForLink(psiManager: PsiManager, link: String, context: PsiElement?): PsiElement? =
         context?.takeIf { PipelineHoverImages.open(it, link) }
     override fun getCustomDocumentationElement(editor: Editor, file: PsiFile, contextElement: PsiElement?, targetOffset: Int): PsiElement? =
         previewElement(contextElement ?: file.findElementAt(targetOffset))
-
-    override fun getCustomDocumentationElement(editor: Editor, file: PsiFile, contextElement: PsiElement?): PsiElement? =
-        previewElement(contextElement)
 
     internal fun previewElement(element: PsiElement?): PsiElement? {
         element ?: return null
@@ -36,7 +34,13 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
 
     override fun generateHoverDoc(element: PsiElement, originalElement: PsiElement?): String? = generateDoc(element, originalElement)
 
+    override fun getLocalImageForElement(element: PsiElement, imageSpec: String): Image? = PipelineHoverImages.localImage(imageSpec)
+
     override fun generateDoc(element: PsiElement, originalElement: PsiElement?): String? {
+        return generateContent(element, originalElement)?.html
+    }
+
+    internal fun generateContent(element: PsiElement, originalElement: PsiElement?, popupMarker: String? = null): PipelineDocumentation? {
         val origin = originalElement?.takeIf { PipelineJsonContext.at(it) != null } ?: element
         val context = PipelineJsonContext.at(origin) ?: return null
         val project = origin.project
@@ -61,12 +65,12 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
             val operations = if (comment?.text?.contains("@preview") != true && selected != null) PipelineVisualAssets.leaves(selected)
                 else PipelineVisualAssets.leaves(recognition) + listOf(action).filter { it.type != "DoNothing" }
             val annotation = PipelineHoverImages.annotationAt(origin, operations)
-            return html {
+            return html(popupMarker) {
                 line(path?.let { "参考图 · $it" } ?: "默认预览", true)
                 if (image == null) line("图片未找到或无法解码") else {
                     val templates = PipelineVisualAssets.previewTemplates(project, context.file.virtualFile, operations, ::resolve, environmentId)
                     picture(PipelineVisualAssets.overlay(image, operations, ::resolve, selectedAnnotation = annotation?.number,
-                        templatePreviews = templates, compact = true), 420, 240,
+                        templatePreviews = templates), 420, 240,
                         "preview")
                     link("preview", "打开大图")
                 }
@@ -74,7 +78,7 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         }
         if (previewElement(origin) == null) return null
         val operation = selected ?: return null
-        return html {
+        return html(popupMarker) {
             var count = 0
             fun render(current: PipelineOperation, label: String = "") {
                 if (count++ >= 24) return
@@ -101,7 +105,9 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
                 if (files.isEmpty()) html.line("模板图片未找到")
                 files.take(8).forEach { file -> PipelineVisualAssets.read(file)?.let {
                     val key = "template:" + java.net.URLEncoder.encode(file.url, java.nio.charset.StandardCharsets.UTF_8)
-                    html.picture(it, 280, 140, key)
+                    val sourceUrl = if (file.isInLocalFileSystem)
+                        com.intellij.openapi.vfs.VfsUtilCore.virtualToIoFile(file).toURI().toASCIIString() else null
+                    html.picture(it, 280, 140, key, sourceUrl)
                     html.link(key, "打开大图")
                 } }
                 if (files.size > 8) html.line("其余模板可打开资源目录查看。")
@@ -120,12 +126,14 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         }
     }
 
-    private fun html(body: Html.() -> Unit): String = Html().apply(body).build()
+    private fun html(popupMarker: String? = null, body: Html.() -> Unit): PipelineDocumentation = Html(popupMarker).apply(body).build()
 
-    private class Html {
+    private class Html(requestedMarker: String?) {
         private val content = StringBuilder("<html><body>")
         private val metrics = java.awt.Canvas().getFontMetrics(com.intellij.util.ui.UIUtil.getLabelFont())
         private var pictureCount = 0
+        private val images = linkedMapOf<String, BufferedImage>()
+        private val popupMarker = requestedMarker ?: "maapipeline-hover-" + java.util.UUID.randomUUID()
         fun group(body: Html.() -> Unit) {
             content.append("<div style=\"margin-left:12px;margin-top:8px\">")
             body()
@@ -159,15 +167,14 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
         fun link(key: String, label: String) {
             content.append("<div><a href=\"psi_element://maa-image:${PipelineWrappingLabel.escape(key)}\">${PipelineWrappingLabel.escape(label)}</a></div>")
         }
-        fun picture(image: BufferedImage, width: Int, height: Int, link: String? = null) {
+        fun picture(image: BufferedImage, width: Int, height: Int, link: String? = null, sourceUrl: String? = null) {
             if (pictureCount++ >= 16) {
                 if (pictureCount == 17) line("其余图片请在详情中查看。")
                 return
             }
             val scaled = PipelineVisualAssets.scaled(image, width, height)
-            val output = ByteArrayOutputStream()
-            ImageIO.write(scaled, "png", output)
-            val key = "data:image/png;base64,${Base64.getEncoder().encodeToString(output.toByteArray())}"
+            val key = sourceUrl ?: PipelineHoverImages.imageUrl(scaled)
+            images[key] = scaled
             // 固定单元格宽高，切断自适应图片高度与悬浮窗口可用宽度的相互反馈。
             content.append("<table width=\"${scaled.width}\" cellpadding=\"0\" cellspacing=\"0\" border=\"0\"><tr><td width=\"${scaled.width}\" height=\"${scaled.height}\" style=\"width:${scaled.width}px;height:${scaled.height}px\">")
             if (link != null) content.append("<a href=\"psi_element://maa-image:${PipelineWrappingLabel.escape(link)}\">")
@@ -175,7 +182,12 @@ class PipelineJsonDocumentationProvider : DocumentationProviderEx() {
             if (link != null) content.append("</a>")
             content.append("</td></tr></table>")
         }
-        fun build(): String = content.append("</body></html>").toString()
+        fun build(): PipelineDocumentation {
+            content.insert("<html><body>".length, "<div id=\"$popupMarker\">")
+            content.append("</div></body></html>")
+            images.forEach(PipelineHoverImages::cacheImage)
+            return PipelineDocumentation(content.toString(), images.toMap(), popupMarker)
+        }
     }
 
 }

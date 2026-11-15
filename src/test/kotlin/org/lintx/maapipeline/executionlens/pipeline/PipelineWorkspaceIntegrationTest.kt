@@ -19,6 +19,81 @@ import javax.swing.JLabel
 import javax.swing.text.JTextComponent
 
 class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
+    fun testPreviewTabsReuseTransientTabsAndKeepRetainedComparisonsAndDrafts() {
+        val file = fixture(maaEnd = false)
+        replaceFixtureFile("assets/resource/pipeline/Main.json", """{"Start":{"recognition":"OCR","roi":[10,20,30,40]}}""")
+        val manager = FileEditorManager.getInstance(project)
+        val tabs = PipelinePreviewTabs.getInstance(project)
+        val nodes = ReadAction.computeBlocking<List<PipelineNodeLocation>, RuntimeException> { PipelineDocumentIndexer.index(project, file).projectNodes }
+        val node = nodes.first()
+        fun request(name: String) = PipelinePreviewRequest(node.copy(name = name), java.awt.image.BufferedImage(1280,720,java.awt.image.BufferedImage.TYPE_INT_RGB),
+            listOf(PipelineVisualModel.operation(node)), { null }, emptyMap(), { false })
+        fun open(value: PipelinePreviewRequest) {
+            tabs.open(value)
+            PlatformTestUtil.waitWithEventsDispatching("预览标签未显示最新内容", {
+                manager.openFiles.filterIsInstance<PipelinePreviewFile>().any { it.request === value && manager.getEditors(it).any { editor -> editor is PipelinePreviewFileEditor } }
+            }, 30)
+        }
+        open(request("A"))
+        val first = manager.openFiles.filterIsInstance<PipelinePreviewFile>().single()
+        open(request("B"))
+        assertSame(first, manager.openFiles.filterIsInstance<PipelinePreviewFile>().single())
+        assertTrue(first.name.endsWith("B"))
+        val windows = com.intellij.openapi.fileEditor.ex.FileEditorManagerEx.getInstanceEx(project).windows
+        val firstEditor = manager.getEditors(first).single() as PipelinePreviewFileEditor
+        val retainEvent = com.intellij.openapi.actionSystem.AnActionEvent.createFromAnAction(firstEditor.retain, null,
+            com.intellij.openapi.actionSystem.ActionPlaces.UNKNOWN, com.intellij.openapi.actionSystem.DataContext.EMPTY_CONTEXT)
+        val tabOrder = manager.openFiles.toList()
+        firstEditor.retain.setSelected(retainEvent, true)
+        assertTrue(firstEditor.retain.isSelected(retainEvent))
+        assertFalse("保留预览不应触发 IDEA 原生固定", windows.single { it.isFileOpen(first) }.isFilePinned(first))
+        assertEquals("保留预览不应改变标签排列", tabOrder, manager.openFiles.toList())
+        open(request("C"))
+        assertEquals(2, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+        assertEquals("B", first.request.node.name)
+        val second = manager.openFiles.filterIsInstance<PipelinePreviewFile>().single { it !== first }
+        open(request("D"))
+        assertSame(second, manager.openFiles.filterIsInstance<PipelinePreviewFile>().single { it !== first })
+        assertTrue(manager.getEditors(second).single() is PipelinePreviewFileEditor)
+        val otherRequest = second.request
+        open(request("B"))
+        assertEquals("重开保留的节点不应新增标签", 2, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+        assertSame("不应覆盖另一个可复用标签", otherRequest, second.request)
+        assertSame(first, manager.selectedFiles.first())
+        assertTrue(first.retained)
+        open(request("D"))
+        val editor = manager.getEditors(second).single() as PipelinePreviewFileEditor
+        editor.preview.viewer.zoomModel.zoomFactor = 1.0
+        editor.preview.startEditing(1)
+        val picture = editor.preview.viewer.picture
+        picture.dispatchEvent(java.awt.event.MouseEvent(picture, java.awt.event.MouseEvent.MOUSE_PRESSED, 0, 0, 27,42,1,false,java.awt.event.MouseEvent.BUTTON1))
+        picture.dispatchEvent(java.awt.event.MouseEvent(picture, java.awt.event.MouseEvent.MOUSE_DRAGGED, 0, java.awt.event.MouseEvent.BUTTON1_DOWN_MASK, 37,52,0,false,java.awt.event.MouseEvent.NOBUTTON))
+        assertTrue(editor.isModified)
+        val previous = com.intellij.openapi.ui.TestDialogManager.setTestDialog { com.intellij.openapi.ui.Messages.YES }
+        try { open(request("E")) } finally { com.intellij.openapi.ui.TestDialogManager.setTestDialog(previous) }
+        assertTrue(second.retained)
+        assertFalse("保留 ROI 草稿也不应触发原生固定", windows.single { it.isFileOpen(second) }.isFilePinned(second))
+        assertTrue(editor.isModified)
+        assertEquals("D", second.request.node.name)
+        assertEquals(3, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+        val draftPreview = editor.preview
+        tabs.open(request("D"))
+        PlatformTestUtil.waitWithEventsDispatching("重开有草稿的节点应激活已有标签", { manager.selectedFiles.firstOrNull() === second }, 30)
+        assertEquals(3, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+        assertSame("重开同节点不应重建预览而丢失 ROI 草稿", draftPreview, editor.preview)
+        assertTrue(editor.isModified)
+        manager.closeFile(manager.openFiles.filterIsInstance<PipelinePreviewFile>().single { it !== first && it !== second })
+        firstEditor.retain.setSelected(retainEvent, false)
+        assertFalse(firstEditor.retain.isSelected(retainEvent))
+        open(request("F"))
+        assertEquals("F", first.request.node.name)
+        assertEquals(2, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+        windows.single { it.isFileOpen(first) }.setFilePinned(first, true)
+        open(request("G"))
+        assertEquals("用户手动固定的标签也应避免复用", "F", first.request.node.name)
+        assertEquals(3, manager.openFiles.filterIsInstance<PipelinePreviewFile>().size)
+    }
+
     fun testControllerResourcesMergePartialNodesAndResolveAddedNodes() {
         val file = fixture(maaEnd = false)
         replaceFixtureFile("assets/interface.json", """
@@ -203,6 +278,10 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         assertEquals(file.url, restored!!.url)
         assertTrue(PipelineFileEditorProvider().accept(project, restored))
         assertNull(PipelineWorkspaceFileSystem().findFileByPath("/missing"))
+        var opened = false
+        PipelineNavigation.getInstance(project).open(file, requestFocus = false) { opened = true }
+        PlatformTestUtil.waitWithEventsDispatching("工作区打开后未完成回调", { opened }, 30)
+        assertTrue(FileEditorManager.getInstance(project).getEditors(file).single() is PipelineFileEditor)
     }
 
     fun testWorkspaceControllerSearchSourceTabsAndSharedNodeLocations() {
@@ -226,7 +305,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -299,6 +378,11 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             assertTrue(manager.openFiles.toSet().containsAll(nativeTabs))
             val taskContext = workspace.data.lastContext
             workspace.openNode(shared, "ADB")
+            PlatformTestUtil.waitWithEventsDispatching("独立节点标签未打开", {
+                manager.openFiles.filterIsInstance<PipelineWorkspaceFile>().any { candidate ->
+                    candidate.nodeContext != null && manager.getEditors(candidate).any { it is PipelineFileEditor }
+                }
+            }, 30)
             val separate = manager.openFiles.filterIsInstance<PipelineWorkspaceFile>().single { it.nodeContext != null }
             try {
                 assertSame(separate, com.intellij.openapi.vfs.VirtualFileManager.getInstance().findFileByUrl(separate.url))
@@ -313,7 +397,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 assertNotNull(field("selectedEntry").get(panel))
             } finally { manager.closeFile(separate) }
         } finally { manager.closeFile(workspace.file) }
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -342,7 +426,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -402,7 +486,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val panel = descendants(manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single().component)
                 .filterIsInstance<PipelineFlowPanel>().single()
@@ -485,6 +569,13 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         } finally { source.dispose() }
     }
 
+    private fun openWorkspace(workspace: PipelineWorkspaceState) {
+        workspace.open()
+        PlatformTestUtil.waitWithEventsDispatching("工作区标签未打开", {
+            FileEditorManager.getInstance(project).getEditors(workspace.file).any { it is PipelineFileEditor }
+        }, 30)
+    }
+
     private fun textComponents(root: Component): List<Component> = descendants(root)
         .filter { it is JLabel || it is JTextComponent }
 
@@ -516,7 +607,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single().stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             fun field(name: String) = PipelineFlowPanel::class.java.getDeclaredField(name).apply { isAccessible = true }
@@ -581,8 +672,10 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             val tabs = field("rightTabs").get(panel) as JTabbedPane
             assertEquals("打开来源文件不应切换内嵌 JSON 页", 0, tabs.selectedIndex)
             tabs.selectedIndex = 1
+            loggedNote.setSize(1000, 100)
+            val noteBounds = (loggedNote as PipelineStyledText).modelToView2D(0).bounds
             val click = java.awt.event.MouseEvent(loggedNote, java.awt.event.MouseEvent.MOUSE_CLICKED,
-                0L, 0, 1, 1, 1, false, java.awt.event.MouseEvent.BUTTON1)
+                0L, 0, noteBounds.x + 1, noteBounds.y + noteBounds.height / 2, 1, false, java.awt.event.MouseEvent.BUTTON1)
             loggedNote.mouseListeners.forEach { it.mouseClicked(click) }
             assertEquals("摘要点击应切回详情，即使该节点已被选中", 0, tabs.selectedIndex)
             assertNotNull(field("overrideDetailsHeader").get(panel))
@@ -612,7 +705,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single().stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -665,7 +758,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val flow = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -716,7 +809,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastSourceUrl = file.url
         val before = ReadAction.compute<String, RuntimeException> { PipelineProjectFiles.text(file) }
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -834,7 +927,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = entry.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
@@ -891,7 +984,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = entry.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
@@ -970,7 +1063,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.loadState(PipelineWorkspaceStorage())
         workspace.data.lastSourceUrl = seed.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             PlatformTestUtil.waitWithEventsDispatching("工作区尚未加载", {
@@ -1005,12 +1098,16 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
                 com.intellij.psi.PsiManager.getInstance(project).findFile(remote)
             }!!
             PipelineSourceTarget(psi, target.nameRange.startOffset, "Remote").navigate(true)
+            PlatformTestUtil.waitWithEventsDispatching("源码未定位到普通标签", {
+                manager.isFileOpen(remote) && (manager.selectedEditor as? TextEditor)?.editor?.caretModel?.offset == target.nameRange.startOffset
+            }, 30)
             assertEquals(embeddedBefore, source.currentFile)
             assertTrue(manager.isFileOpen(remote))
             assertEquals(target.nameRange.startOffset, (manager.selectedEditor as TextEditor).editor.caretModel.offset)
             val existing = manager.selectedEditor
             manager.openFile(workspace.file, true)
             PipelineSourceTarget(psi, target.nameRange.startOffset, "Remote").navigate(true)
+            PlatformTestUtil.waitWithEventsDispatching("已有源码标签未复用", { manager.selectedEditor === existing }, 30)
             assertSame(existing, manager.selectedEditor)
             assertEquals(1, manager.openFiles.count { it == remote })
 
@@ -1083,7 +1180,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single().stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             try {
@@ -1306,7 +1403,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             rightTab = 1
         }
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("源码未恢复", {
             descendants(host.component).filterIsInstance<PipelineWorkspaceSource>().any { it.currentFile == file }
@@ -1346,7 +1443,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         val workspace = PipelineWorkspaceState.getInstance(project)
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("嵌入编辑器未加载", {
             descendants(host.component).any { it is PipelineWorkspaceSource }
@@ -1419,7 +1516,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             sourceOffset = 3
         }
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("工作区没有恢复", {
             selectedDetailIn(host.component)?.name == "Child"
@@ -1453,7 +1550,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
             selectedDetailIn(panel)?.name == "Child"
         }, 30)
         manager.closeFile(workspace.file)
-        workspace.open()
+        openWorkspace(workspace)
         PlatformTestUtil.waitWithEventsDispatching("重新打开工作区没有恢复选择", {
             manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().any { editor ->
                 selectedDetailIn(editor.component)?.name == "Child"
@@ -1484,7 +1581,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = entry.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
             descendants(host.component).any { it is PipelineRowsPanel } && workspace.reading(entry.stableId).rootNode.endsWith("#Start")
@@ -1599,7 +1696,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastContext = model.pipelineEntries.single { it.taskId == "Transfer" }.stableId
         workspace.data.lastSourceUrl = file.url
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         try {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
             val logic = descendants(host.component).filterIsInstance<PipelineRowsPanel>().single()
@@ -1643,7 +1740,7 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         workspace.data.lastSourceUrl = file.url
         workspace.reading(entry.stableId).selections["Return"] = mutableListOf("Yes")
         val manager = FileEditorManager.getInstance(project)
-        workspace.open()
+        openWorkspace(workspace)
         val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
         val panel = descendants(host.component).filterIsInstance<PipelineFlowPanel>().single()
         PlatformTestUtil.waitWithEventsDispatching("流程未加载", {
@@ -1762,22 +1859,27 @@ class PipelineWorkspaceIntegrationTest : FileEditorManagerTestCase() {
         val manager = FileEditorManager.getInstance(project)
         workspace.data.lastContext = ""
         workspace.data.lastSourceUrl = file.url
-        workspace.open()
+        openWorkspace(workspace)
         fun readyHost(): PipelineFileEditor {
             val host = manager.getEditors(workspace.file).filterIsInstance<PipelineFileEditor>().single()
+            val modelField = PipelineFlowPanel::class.java.getDeclaredField("currentModel").apply { isAccessible = true }
             PlatformTestUtil.waitWithEventsDispatching("工作区未就绪", {
-                textComponents(host.component).any { it.text.startsWith("项目资源：") }
+                descendants(host.component).filterIsInstance<PipelineFlowPanel>().singleOrNull()?.let {
+                    (modelField.get(it) as PipelineDocumentModel).version >= 0
+                } == true
             }, 30)
             return host
         }
         assertNull(selectedDetailIn(readyHost().component))
         assertEquals("", workspace.data.lastContext)
         manager.closeFile(workspace.file)
+        PlatformTestUtil.waitWithEventsDispatching("工作区未关闭", { manager.getEditors(workspace.file).isEmpty() }, 30)
         workspace.data.lastContext = "${file.url}#task:Removed"
-        workspace.open()
+        openWorkspace(workspace)
         val restored = readyHost()
         assertNull(selectedDetailIn(restored.component))
-        assertTrue(textComponents(restored.component).any { it.text.contains("上次任务或流程已不存在") })
+        assertTrue(textComponents(restored.component).joinToString("\n") { it.text },
+            textComponents(restored.component).any { it.text.contains("上次任务或流程已不存在") })
         manager.closeFile(workspace.file)
     }
 

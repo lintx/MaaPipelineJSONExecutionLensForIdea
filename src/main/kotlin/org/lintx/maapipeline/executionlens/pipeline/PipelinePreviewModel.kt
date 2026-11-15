@@ -35,6 +35,21 @@ internal data class PipelinePreviewAnnotation(
                 colors.ranges.forEach { add("${colors.space}：${it.lower} → ${it.upper}") }
                 if (colors.ranges.isEmpty()) add("${colors.space}：lower=${operation.text("lower")}，upper=${operation.text("upper")}")
             }
+            if (operation.type == "ColorMatch") {
+                val raw = operation.parameters["count"]
+                val countText = raw?.let(PipelineVisualModel::display) ?: "1（默认）"
+                val count = if (raw == null) 1L else countText.toLongOrNull()
+                // 这里只表达条件阈值；比例基于当前有效搜索框，不冒充实际匹配率或动态结果面积。
+                val area = rectangle?.takeIf { !dynamic && it.width > 0 && it.height > 0 }
+                    ?.let { it.width.toLong() * it.height }
+                val proportion = if (count != null && count >= 0 && area != null) {
+                    val percent = count.toDouble() / area * 100
+                    val formatted = if (percent > 0 && percent < 0.01) "<0.01" else
+                        String.format(java.util.Locale.ROOT, "%.2f", percent).trimEnd('0').trimEnd('.')
+                    "（约占 ROI $formatted%）"
+                } else ""
+                add("最低匹配数量 count=$countText 像素$proportion")
+            }
             operation.parameters["custom_recognition"]?.let { add("自定义：${PipelineVisualModel.display(it)}") }
             operation.parameters["model"]?.let { add("模型：${PipelineVisualModel.display(it)}") }
         }

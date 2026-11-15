@@ -13,6 +13,15 @@ import java.io.ByteArrayOutputStream
 import javax.imageio.ImageIO
 
 class PipelineJsonNavigationTest : BasePlatformTestCase() {
+    override fun createTempDirTestFixture(): com.intellij.testFramework.fixtures.TempDirTestFixture =
+        com.intellij.testFramework.fixtures.IdeaTestFixtureFactory.getFixtureFactory().createTempDirTestFixture()
+
+    override fun setUp() {
+        super.setUp()
+        // 真实磁盘夹具的图片及跨文件引用都需要项目内容根，不能依赖其它用例遗留的注册。
+        com.intellij.testFramework.PsiTestUtil.addContentRoot(module, myFixture.tempDirFixture.findOrCreateDir(""))
+    }
+
     fun testCompositeHoverGroupsReferencesAndSelectsOnlyTheCurrentInlineCondition() {
         myFixture.addFileToProject("assets/resource/pipeline/Referenced.json", """
             {"InWorld":{"recognition":"And","all_of":[
@@ -157,6 +166,7 @@ class PipelineJsonNavigationTest : BasePlatformTestCase() {
     }
 
     fun testTemplateAndColorHoverAndPreviewCommentProduceRealImages() {
+        com.intellij.openapi.util.registry.Registry.get("doc.render.adaptive.image").setValue(true, testRootDisposable)
         val image = BufferedImage(120, 80, BufferedImage.TYPE_INT_RGB)
         image.createGraphics().let { graphics -> graphics.color = Color.BLUE; graphics.fillRect(0, 0, 120, 80); graphics.dispose() }
         val output = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
@@ -164,12 +174,14 @@ class PipelineJsonNavigationTest : BasePlatformTestCase() {
         WriteCommandAction.runWriteCommandAction(project, Runnable { resource.virtualFile.setBinaryContent(output) })
         val referenceImage = BufferedImage(1280, 720, BufferedImage.TYPE_INT_RGB)
         referenceImage.createGraphics().let { graphics -> graphics.color = Color.BLUE; graphics.fillRect(0, 0, 1280, 720); graphics.dispose() }
+        val random = java.util.Random(42)
+        for (column in 0 until 200) for (row in 0 until 200) referenceImage.setRGB(column, row, random.nextInt())
         val referenceBytes = ByteArrayOutputStream().also { ImageIO.write(referenceImage, "png", it) }.toByteArray()
         val reference = myFixture.addFileToProject("assets/resource/image/reference.png", "")
         WriteCommandAction.runWriteCommandAction(project, Runnable { reference.virtualFile.setBinaryContent(referenceBytes) })
         val source = myFixture.addFileToProject("assets/resource/pipeline/Main.json", """
             {"Start":{
-              // @preview assets/resource/image/reference.png
+              // @preview ../image/reference.png
               "recognition":"And","all_of":[
                 {"recognition":"TemplateMatch","template":"button.png","roi":[10,10,50,40]},
                 {"recognition":{"type":"ColorMatch","param":{"method":40,"lower":[60,255,255],"upper":[60,255,255]}}}
@@ -190,41 +202,68 @@ class PipelineJsonNavigationTest : BasePlatformTestCase() {
         assertNotNull("动态 target 单选时也应复用其来源模板", templates[3]!!.single().image)
         val registered = com.intellij.codeInsight.documentation.DocumentationManager.getProviderFromElement(template.element, template.element)
         val registeredDoc = registered.generateDoc(template.element, template.element)!!
-        assertTrue("IDEA 的悬浮应包含可直接解码的 PNG", registeredDoc.contains("data:image/png;base64,"))
+        assertTrue("IDEA 的悬浮只保留短图片引用", registeredDoc.length < 10_000)
+        assertFalse(registeredDoc.contains("data:image/png;base64,"))
         val modern = com.intellij.platform.backend.documentation.DocumentationTargetProvider.EP_NAME.extensionList
             .filterIsInstance<PipelineDocumentationTargetProvider>().single()
-        val result = modern.documentationTargets(source, template.element.textOffset + 1).single().computeDocumentation()!!
+        val modernTarget = modern.documentationTargets(source, template.element.textOffset + 1).single() as PipelineDocumentationTarget
+        val result = modernTarget.computeDocumentation()!!
         val content = result.javaClass.declaredFields.single { it.name == "content" }.apply { isAccessible = true }.get(result)
         val nativeHtml = content.javaClass.getMethod("getHtml").invoke(content) as String
         val nativeImages = Regex("src=\"([^\"]+)\"").findAll(nativeHtml).toList()
-        assertTrue("新版原生悬浮必须收到内嵌 PNG", nativeImages.isNotEmpty())
-        assertNativeImageRenders(nativeHtml, Color.BLUE)
+        assertTrue("新版原生悬浮必须包含图片引用", nativeImages.isNotEmpty())
+        assertTrue(nativeHtml.contains("id=\"${modernTarget.popupMarker}\""))
+        val resolver = content.javaClass.getMethod("getImageResolver").invoke(content) as com.intellij.lang.documentation.DocumentationImageResolver
+        nativeImages.forEach { assertNotNull("IDEA 图片解析器应解析 $it", resolver.resolveImage(it.groupValues[1])) }
         val provider = PipelineJsonDocumentationProvider()
-        fun checkImages(element: PsiElement): String {
-            val doc = provider.generateDoc(element, element)!!
-            val specs = Regex("src=\"([^\"]+)\"").findAll(doc).map { it.groupValues[1] }.toList()
+        fun checkImages(element: PsiElement): PipelineDocumentation {
+            val doc = provider.generateContent(element, element)!!
+            val specs = Regex("src=\"([^\"]+)\"").findAll(doc.html).map { it.groupValues[1] }.toList()
             assertTrue("悬浮文档应包含可读取图片", specs.isNotEmpty())
             specs.forEach {
-                assertTrue(it.startsWith("data:image/png;base64,"))
-                val bytes = java.util.Base64.getDecoder().decode(it.substringAfter(','))
-                assertNotNull(ImageIO.read(java.io.ByteArrayInputStream(bytes)))
+                if (it.startsWith("data:image/png;base64,")) assertTrue("生成图片的内嵌 URL 应足够短", it.length < 2800)
+                else {
+                    val url = java.net.URI(it).toURL()
+                    assertEquals("file", url.protocol)
+                    assertNotNull("自适应加载器必须能直接读取图片 URL", ImageIO.read(url))
+                }
+                assertNotNull(doc.images[it])
+                assertNotNull("旧版 IDEA 图片入口也应能解析", provider.getLocalImageForElement(element, it))
             }
             return doc
         }
-        assertTrue(checkImages(template.element).contains("button.png"))
+        val templateDoc = checkImages(template.element)
+        assertTrue(templateDoc.html.contains("button.png"))
+        assertTrue("模板应直接引用原图文件", templateDoc.images.keys.single().endsWith("/button.png"))
+        assertNativeImageRenders(templateDoc, Color.BLUE)
         val lower = source.findElementAt(source.text.indexOf("60,255"))!!
         val colors = checkImages(lower)
-        assertTrue(colors.contains("HSV"))
+        assertTrue(colors.html.contains("HSV"))
         assertNativeImageRenders(colors, Color.GREEN)
         val comment = PsiTreeUtil.findChildOfType(source, com.intellij.psi.PsiComment::class.java)!!
         val preview = checkImages(comment)
+        val full = PipelineVisualAssets.scaled(PipelineVisualAssets.overlay(referenceImage, operations, templatePreviews = templates), 420, 240)
+        val actual = preview.images.values.single()
+        assertEquals("Hover 应显示完整说明卡片", full.width, actual.width)
+        assertEquals(full.height, actual.height)
+        assertTrue("Hover 必须使用与大图一致的完整说明，不能走仅编号模式",
+            full.getRGB(0, 0, full.width, full.height, null, 0, full.width)
+                .contentEquals(actual.getRGB(0, 0, actual.width, actual.height, null, 0, actual.width)))
+        val previewReport = java.nio.file.Path.of("build", "reports", "hover-full-annotations.png")
+        java.nio.file.Files.createDirectories(previewReport.parent)
+        ImageIO.write(actual, "png", previewReport.toFile())
+        assertTrue("带 ROI 的复杂缩略图应使用真实缓存文件", preview.images.keys.single().startsWith("file:"))
         assertNativeImageRenders(preview, Color.BLUE)
-        assertTrue(preview.contains("参考图"))
-        assertTrue(preview.contains("打开大图"))
-        assertTrue(preview.contains("psi_element://maa-image:preview"))
+        assertTrue(preview.html.contains("参考图"))
+        assertTrue(preview.html.contains("打开大图"))
+        assertTrue(preview.html.contains("psi_element://maa-image:preview"))
         val roi = source.findElementAt(source.text.indexOf("10,10,50,40"))!!
-        assertTrue(checkImages(roi).contains("maa-image:preview"))
-        assertFalse(preview.contains("box_index")); assertFalse(preview.contains("实际结果框"))
+        assertTrue(checkImages(roi).html.contains("maa-image:preview"))
+        assertFalse(preview.html.contains("box_index")); assertFalse(preview.html.contains("实际结果框"))
+        val popupPane = com.intellij.ui.components.JBHtmlPane().apply { text = nativeHtml }
+        com.intellij.openapi.util.Disposer.register(testRootDisposable, popupPane)
+        assertSame(popupPane, PipelineDocumentationPopup.pane(popupPane, modernTarget.popupMarker))
+        assertNull(PipelineDocumentationPopup.pane(popupPane, "another-preview"))
         val large = PipelineHoverImages.load(comment, "preview")!!
         assertEquals(1280, large.image.width)
         assertEquals(3, large.operations.size)
@@ -236,10 +275,10 @@ class PipelineJsonNavigationTest : BasePlatformTestCase() {
         assertEquals(Color.BLUE.rgb, largeTemplate.image.getRGB(0,0))
     }
 
-    private fun assertNativeImageRenders(html: String, color: Color) {
-        val pane = com.intellij.ui.components.JBHtmlPane()
+    private fun assertNativeImageRenders(document: PipelineDocumentation, color: Color) {
+        val pane = com.intellij.codeInsight.documentation.DocumentationHintEditorPane(project, emptyMap(), document.images::get)
         com.intellij.openapi.util.Disposer.register(testRootDisposable, pane)
-        pane.text = html
+        pane.text = document.html
         pane.setSize(600, 1200)
         com.intellij.testFramework.PlatformTestUtil.waitWithEventsDispatching("原生文档组件未绘制实际图片", {
             val rendered = BufferedImage(600, 1200, BufferedImage.TYPE_INT_RGB)

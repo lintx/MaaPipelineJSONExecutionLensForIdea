@@ -1,0 +1,9 @@
+{
+  "Start": {
+    "desc": "任务入口",
+    "next": ["Finish"]
+  },
+  "Finish": {
+    "desc": "结束"
+  }
+}

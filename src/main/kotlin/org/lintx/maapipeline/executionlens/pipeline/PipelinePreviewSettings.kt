@@ -3,7 +3,6 @@ package org.lintx.maapipeline.executionlens.pipeline
 import com.intellij.openapi.components.*
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
-import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.ColorPanel
@@ -64,7 +63,7 @@ class PipelinePreviewSettingsConfigurable : Configurable {
         form.add(JLabel("画布尺寸")); form.add(JPanel().apply { add(this@PipelinePreviewSettingsConfigurable.width); add(JLabel("×")); add(this@PipelinePreviewSettingsConfigurable.height) })
         form.add(JLabel("画布颜色")); form.add(color)
         form.add(JLabel("预览框线宽（px）")); form.add(lineWidth)
-        path.addBrowseFolderListener(null, FileChooserDescriptorFactory.createSingleFileDescriptor())
+        path.addBrowseFolderListener(null, com.intellij.openapi.fileChooser.FileChooserDescriptor(true, false, false, false, false, false))
         mode.addActionListener { updateEnabled() }
         add(form, java.awt.BorderLayout.NORTH)
         reset()

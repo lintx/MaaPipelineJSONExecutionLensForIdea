@@ -87,7 +87,7 @@ internal class PipelineNodeDialog(
         add(JLabel("节点对象必须是 JSON 对象；Pipeline JSON/JSONC 仍是唯一事实来源。"), BorderLayout.SOUTH)
     }
 
-    override fun doValidate(): ValidationInfo? = ReadAction.compute<ValidationInfo?, RuntimeException> { validateNode() }
+    override fun doValidate(): ValidationInfo? = ReadAction.computeBlocking<ValidationInfo?, RuntimeException> { validateNode() }
 
     private fun validateNode(): ValidationInfo? {
         if (nodeName.isEmpty()) return ValidationInfo("节点名不能为空。", nameField)

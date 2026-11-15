@@ -69,7 +69,7 @@ internal class PipelinePlaybackToolbar(
                 event.presentation.text = session?.granularity?.label ?: "节点"
                 event.presentation.isEnabled = session?.size?.let { it > 0 } == true
             }
-            override fun createPopupActionGroup(button: JComponent) = DefaultActionGroup().apply {
+            override fun createPopupActionGroup(button: JComponent, dataContext: com.intellij.openapi.actionSystem.DataContext) = DefaultActionGroup().apply {
                 PipelinePlaybackGranularity.entries.forEach { value ->
                     add(object : DumbAwareAction(value.label) {
                         override fun actionPerformed(event: AnActionEvent) {
@@ -86,7 +86,7 @@ internal class PipelinePlaybackToolbar(
                 event.presentation.description = "回放速度（1× 每秒前进一步）"
                 event.presentation.isEnabled = session?.source?.canAutoplay == true
             }
-            override fun createPopupActionGroup(button: JComponent) = DefaultActionGroup().apply {
+            override fun createPopupActionGroup(button: JComponent, dataContext: com.intellij.openapi.actionSystem.DataContext) = DefaultActionGroup().apply {
                 listOf(0.5, 1.0, 2.0, 4.0).forEach { value ->
                     add(object : DumbAwareAction("${value}×") {
                         override fun actionPerformed(event: AnActionEvent) {
@@ -124,7 +124,7 @@ internal class PipelinePlaybackToolbar(
                 timer.stop()
                 if (slider.valueIsAdjusting) {
                     updatePositionPreview(target)
-                    toolbar.updateActionsImmediately()
+                    toolbar.updateActionsAsync()
                 } else seek(target)
             }
         }
@@ -168,7 +168,7 @@ internal class PipelinePlaybackToolbar(
             } ?: "当前入口没有可回放的日志事件"
             eventLabel.toolTipText = eventLabel.text
         } finally { updating = false }
-        toolbar.updateActionsImmediately()
+        toolbar.updateActionsAsync()
     }
 
     private fun updatePositionPreview(position: Int) {

@@ -14,7 +14,7 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
     private val blocked: (VirtualFile) -> Boolean = { false }) {
     private data class Source(val document: Document, var snapshot: PipelineEditSnapshot)
     private val appliedValues = mutableMapOf<Pair<String, List<String>>, MutableMap<String, com.google.gson.JsonElement>>()
-    private val sources = ReadAction.compute<Map<VirtualFile, Source>, RuntimeException> {
+    private val sources = ReadAction.computeBlocking<Map<VirtualFile, Source>, RuntimeException> {
         operations.flatMap { operation -> listOfNotNull(operation.source?.sourceFile) +
             operation.roiHints.values.mapNotNull { it.sourceFile } +
             operation.source?.let(PipelinePreviewHints::sources).orEmpty().mapNotNull { it.sourceFile } }.distinct().mapNotNull { file ->
@@ -22,21 +22,21 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         }.toMap()
     }
 
-    fun unavailable(annotation: PipelinePreviewAnnotation, offset: Boolean = false): String? = ReadAction.compute<String?, RuntimeException> {
-        val node = annotation.operation.source ?: return@compute "没有可写入的节点定义"
-        val file = sourceFile(annotation, offset) ?: return@compute "没有可写入的源文件"
-        val source = sources[file] ?: return@compute "无法读取源文件"
+    fun unavailable(annotation: PipelinePreviewAnnotation, offset: Boolean = false): String? = ReadAction.computeBlocking<String?, RuntimeException> {
+        val node = annotation.operation.source ?: return@computeBlocking "没有可写入的节点定义"
+        val file = sourceFile(annotation, offset) ?: return@computeBlocking "没有可写入的源文件"
+        val source = sources[file] ?: return@computeBlocking "无法读取源文件"
         val definition = annotation.operation.copy(simulatedRegions = annotation.operation.simulatedRegions - annotation.key)
         if (!offset && PipelineVisualModel.region(definition, annotation.key).coordinates == null)
-            return@compute "运行时目标；请调整其来源条件的 ROI"
-        if (!file.isWritable || blocked(file) || generated(source.snapshot.text)) return@compute "源文件只读或由生成器维护"
+            return@computeBlocking "运行时目标；请调整其来源条件的 ROI"
+        if (!file.isWritable || blocked(file) || generated(source.snapshot.text)) return@computeBlocking "源文件只读或由生成器维护"
         PipelineOperationEdits.objectValue(project, source.snapshot.text)?.findProperty(node.name)?.value
-            ?: return@compute "无法定位节点定义"
+            ?: return@computeBlocking "无法定位节点定义"
         val actual = sourceOperation(annotation, file)
         val key = if (offset) "${annotation.key}_offset" else annotation.key
         if (!editingComment(annotation, offset) && (actual == null ||
             actual.parameters[key] != annotation.operation.parameters[key]))
-            return@compute "当前值包含任务覆盖，请在对应的原始 JSON 中调整 ROI"
+            return@computeBlocking "当前值包含任务覆盖，请在对应的原始 JSON 中调整 ROI"
         null
     }
 
@@ -60,9 +60,9 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         val node = annotation.operation.source ?: return false
         val file = sourceFile(annotation, field.endsWith("_offset")) ?: return false
         val source = sources.getValue(file)
-        val edit = ReadAction.compute<PipelineTextEdit?, RuntimeException> {
+        val edit = ReadAction.computeBlocking<PipelineTextEdit?, RuntimeException> {
             val owner = PipelineOperationEdits.objectValue(project, source.snapshot.text)?.findProperty(node.name)?.value
-                as? com.intellij.json.psi.JsonObject ?: return@compute null
+                as? com.intellij.json.psi.JsonObject ?: return@computeBlocking null
             createEdit(owner)
         } ?: return false
         var applied = false
@@ -82,10 +82,10 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         return applied
     }
 
-    fun currentOperation(operation: PipelineOperation): PipelineOperation = ReadAction.compute<PipelineOperation, RuntimeException> {
-        val source = operation.source ?: return@compute operation
-        val text = sources[source.sourceFile]?.snapshot?.text ?: return@compute operation
-        val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(source.name) ?: return@compute operation
+    fun currentOperation(operation: PipelineOperation): PipelineOperation = ReadAction.computeBlocking<PipelineOperation, RuntimeException> {
+        val source = operation.source ?: return@computeBlocking operation
+        val text = sources[source.sourceFile]?.snapshot?.text ?: return@computeBlocking operation
+        val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(source.name) ?: return@computeBlocking operation
         val layered = source.previewSources.isNotEmpty()
         val updatedSources = if (!layered) emptyList() else source.previewSources.map { layer ->
             val currentText = sources[layer.sourceFile]?.snapshot?.text
@@ -108,10 +108,10 @@ internal class PipelineRoiEditSession(private val project: Project, operations: 
         !offset && annotation.region.fromComment
 
     private fun sourceOperation(annotation: PipelinePreviewAnnotation, file: VirtualFile): PipelineOperation? =
-        ReadAction.compute<PipelineOperation?, RuntimeException> {
-        val node = annotation.operation.source ?: return@compute null
-        val text = sources[file]?.snapshot?.text ?: return@compute null
-        val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(node.name) ?: return@compute null
+        ReadAction.computeBlocking<PipelineOperation?, RuntimeException> {
+        val node = annotation.operation.source ?: return@computeBlocking null
+        val text = sources[file]?.snapshot?.text ?: return@computeBlocking null
+        val property = PipelineOperationEdits.objectValue(project, text)?.findProperty(node.name) ?: return@computeBlocking null
         val root = PipelineVisualModel.operation(node.copy(sourceFile = file, rawJson = PipelinePreviewHints.sourceText(property),
             previewSource = null, previewSources = emptyList()), annotation.operation.isAction)
         fun find(operation: PipelineOperation): PipelineOperation? = if (operation.ownerPath == annotation.operation.ownerPath) operation

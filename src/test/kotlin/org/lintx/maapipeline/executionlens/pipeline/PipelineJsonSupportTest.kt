@@ -8,6 +8,35 @@ import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 
 class PipelineJsonSupportTest : BasePlatformTestCase() {
+    fun testPreviewAndRoiCommentCompletionInsertsDirectivesControllersPathsAndCoordinates() {
+        myFixture.addFileToProject("assets/interface.json", """{"controller":[{"name":"Cloud Adb","type":"Adb"},{"name":"ADB","type":"Adb"}]}""")
+        myFixture.addFileToProject("assets/resource/image/按钮.png", "image")
+        myFixture.addFileToProject("assets/resource/image/reference image.png", "image")
+        fun comment(body: String) = "{\"Start\":{\n// $body\n\"recognition\":\"OCR\",\"action\":\"Click\"}}"
+        val directive = complete(comment("@pre<caret>"), "@preview").text
+        assertTrue("补全后的 PSI：$directive；文档：${myFixture.editor.document.text}", directive.contains("// @preview "))
+        assertFalse(directive.contains("\"@preview\""))
+        val controller = complete(comment("@preview Clo<caret>"), "\"Cloud Adb\"").text
+        assertTrue(controller.contains("// @preview \"Cloud Adb\" "))
+        myFixture.configureByText("Completion.json", comment("@preview ad<caret>"))
+        myFixture.complete(CompletionType.BASIC)
+        val candidates = myFixture.lookupElements.orEmpty().map { it.lookupString }
+        assertEquals("控制器名称和类型忽略大小写去重", 1, candidates.count { it.equals("ADB", true) || it.equals("Adb", true) })
+        assertEquals("控制器候选应排在参考图片之前", "ADB", candidates.first())
+        val path = complete(comment("@preview Adb 按钮<caret>"), "assets/resource/image/按钮.png").text
+        assertTrue(path.contains("// @preview Adb assets/resource/image/按钮.png"))
+        val quotedPath = complete(comment("@preview \"reference<caret>\""), "\"assets/resource/image/reference image.png\"").text
+        assertTrue(quotedPath.contains("// @preview \"assets/resource/image/reference image.png\"\n"))
+        val field = complete(comment("@roi Adb tar<caret>"), "target").text
+        assertTrue(field.contains("// @roi Adb target "))
+        val region = complete(comment("@roi target Adb [<caret>]"), "[0, 0, 0, 0]").text
+        assertTrue(region.contains("// @roi target Adb [0, 0, 0, 0]\n"))
+        val hint = PipelinePreviewHints.read(region.substringAfter("\"Start\":").removeSuffix("}"))[emptyList()]!!.regions.single()
+        assertEquals("Adb", hint.controller)
+        assertEquals("target", hint.key)
+        complete("{\"Start\":{\"recognition\":\"OCR\",\"roi\":[/* @r<caret> */0,0,10,10]}}", "@roi")
+    }
+
     fun testRegisteredParameterCompletionWithDevelopmentProjectSchema() {
         val projectPath = System.getenv("MAAEND_PATH") ?: return
         val schemaRoot = java.nio.file.Path.of(projectPath, "tools", "schema")
@@ -257,24 +286,31 @@ class PipelineJsonSupportTest : BasePlatformTestCase() {
         assertTrue(usages.any { it.containingFile.name == "Tasks.json" })
         assertTrue(usages.none { (it.parent as? com.intellij.json.psi.JsonProperty)?.name == "template" })
         val before = myFixture.editor.document.text
-        val hints = mutableListOf<Pair<Int, Boolean>>()
-        val sink = object : com.intellij.codeInsight.hints.InlayHintsSink by com.intellij.codeInsight.hints.InlayHintsSinkImpl(myFixture.editor) {
-            override fun addInlineElement(offset: Int, relatesToPrecedingText: Boolean,
-                presentation: com.intellij.codeInsight.hints.presentation.InlayPresentation, placeAtTheEndOfLine: Boolean) {
-                hints += offset to placeAtTheEndOfLine
+        val hints = mutableListOf<com.intellij.codeInsight.hints.declarative.InlayPosition>()
+        val sink = object : com.intellij.codeInsight.hints.declarative.InlayTreeSink {
+            override fun addPresentation(position: com.intellij.codeInsight.hints.declarative.InlayPosition,
+                payloads: List<com.intellij.codeInsight.hints.declarative.InlayPayload>?, tooltip: String?,
+                hintFormat: com.intellij.codeInsight.hints.declarative.HintFormat,
+                builder: com.intellij.codeInsight.hints.declarative.PresentationTreeBuilder.() -> Unit) {
+                hints += position
             }
+            override fun whenOptionEnabled(optionId: String, block: () -> Unit) = block()
         }
         val provider = PipelineJsonDescriptionHints()
-        val collector = provider.getCollectorFor(file, myFixture.editor, provider.createSettings(), sink)!!
+        val collector = provider.createCollector(file, myFixture.editor)!!
         val literals = PsiTreeUtil.findChildrenOfType(file, com.intellij.json.psi.JsonStringLiteral::class.java)
-        literals.forEach { collector.collect(it, myFixture.editor, sink) }
+        literals.forEach { collector.collectFromElement(it, sink) }
         assertTrue(literals.filter { it.value in setOf("Target", "[JumpBack]Target", "Resume") &&
-            (it.parent as? com.intellij.json.psi.JsonProperty)?.nameElement != it }.all { it.textRange.endOffset to true in hints })
+            (it.parent as? com.intellij.json.psi.JsonProperty)?.nameElement != it }.all { literal ->
+                hints.filterIsInstance<com.intellij.codeInsight.hints.declarative.EndOfLinePosition>()
+                    .any { it.line == myFixture.editor.document.getLineNumber(literal.textOffset) }
+            })
         val root = file.topLevelValue as JsonObject
-        assertTrue("定义处不重复显示 desc", root.propertyList.none { property -> hints.any { it.first == property.nameElement.textRange.endOffset } })
+        root.propertyList.forEach { collector.collectFromElement(it, sink) }
+        assertEquals("定义处只显示引用计数", root.propertyList.size,
+            hints.filterIsInstance<com.intellij.codeInsight.hints.declarative.AboveLineIndentedPosition>().size)
         myFixture.doHighlighting()
         assertTrue("说明必须显示在行尾", myFixture.editor.inlayModel.getAfterLineEndElementsInRange(0, before.length).isNotEmpty())
-        assertTrue(com.intellij.codeInsight.hints.InlayHintsProviderExtension.findProviders().any { it.provider is PipelineJsonDescriptionHints })
         val blocks = myFixture.editor.inlayModel.getBlockElementsInRange(0, before.length)
         assertEquals("定义上方必须实际显示原生引用提示", root.propertyList.size, blocks.size)
         assertEquals(before, myFixture.editor.document.text)

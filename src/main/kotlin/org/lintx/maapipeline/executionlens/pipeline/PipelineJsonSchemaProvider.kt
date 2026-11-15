@@ -20,16 +20,16 @@ class PipelineJsonSchemaProvider : JsonSchemaProviderFactory {
         override fun getName() = "MaaPipeline project schema"
         override fun getSchemaType() = SchemaType.schema
         override fun getSchemaVersion() = JsonSchemaVersion.SCHEMA_2020_12
-        override fun getSchemaFile(): VirtualFile? = ReadAction.compute<VirtualFile?, RuntimeException> {
+        override fun getSchemaFile(): VirtualFile? = ReadAction.computeBlocking<VirtualFile?, RuntimeException> {
             val roots = listOfNotNull(project.basePath?.let { LocalFileSystem.getInstance().findFileByPath(it) }) +
                 ProjectRootManager.getInstance(project).contentRoots
             val source = roots.distinct().firstNotNullOfOrNull { root ->
                 listOf("tools/schema/pipeline.schema.json", "tools/pipeline.schema.json", "pipeline.schema.json")
                     .firstNotNullOfOrNull { root.findFileByRelativePath(it) }
-            } ?: return@compute null
+            } ?: return@computeBlocking null
             synchronized(this) {
-                if (snapshotSource == source && snapshot?.isCurrent() == true) return@compute snapshot?.file
-                val updated = PipelineProjectSchemaBundle.build(source) ?: return@compute null
+                if (snapshotSource == source && snapshot?.isCurrent() == true) return@computeBlocking snapshot?.file
+                val updated = PipelineProjectSchemaBundle.build(source) ?: return@computeBlocking null
                 snapshotSource = source
                 snapshot = updated
                 updated.file
@@ -37,7 +37,7 @@ class PipelineJsonSchemaProvider : JsonSchemaProviderFactory {
         }
         override fun isAvailable(file: VirtualFile): Boolean {
             if (file.extension?.lowercase() !in setOf("json", "jsonc") || file.name.endsWith(".schema.json") || getSchemaFile() == null) return false
-            return ReadAction.compute<Boolean, RuntimeException> {
+            return ReadAction.computeBlocking<Boolean, RuntimeException> {
                 if (PipelineFileDetector.isPipelineFile(file, PipelineProjectFiles.text(file))) true
                 else {
                     // 补全时 JSON 常处于半成品状态，不能因尚未输入冒号而撤掉已能从 PSI 辨认的节点 schema。

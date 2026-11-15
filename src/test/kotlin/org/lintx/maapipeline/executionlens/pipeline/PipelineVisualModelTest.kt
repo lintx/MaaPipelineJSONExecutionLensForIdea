@@ -14,6 +14,24 @@ class PipelineVisualModelTest {
     private fun node(raw: String, name: String = "Test") = PipelineNodeLocation(name, TextRange(0, 1), TextRange(0, 1), rawJson = raw)
 
     @Test
+    fun colorCountPercentageUsesEffectiveRoiWithoutInventingRuntimeResults() {
+        fun line(fields: String, width: Int = 100, height: Int = 100): String {
+            val operation = PipelineVisualModel.operation(node("""{"recognition":"ColorMatch","lower":[128],"upper":[255],$fields}"""))
+            val annotation = PipelinePreviewModel.annotations(listOf(operation)).single()
+            return annotation.imageLines(annotation.region.rectangle(width, height)).single { it.contains("count=") }
+        }
+        assertTrue(line(""""roi":[10,10,25,25],"count":100""").contains("count=100 像素（约占 ROI 16%）"))
+        assertTrue(line(""""roi":[10,10,25,25],"roi_offset":[0,0,25,0],"count":100""").contains("ROI 8%"))
+        assertTrue(line(""""roi":[90,90,25,25],"count":100""").contains("ROI 100%"))
+        assertTrue(line(""""roi":[25,25,-25,-25],"count":100""").contains("ROI 16%"))
+        assertTrue(line(""""roi":[0,0,0,0],"count":100""").contains("ROI 1%"))
+        assertTrue(line(""""roi":[10,10,25,25]""").contains("count=1（默认） 像素（约占 ROI 0.16%）"))
+        assertTrue(line(""""roi":[0,0,0,0]""", 1280, 720).contains("ROI <0.01%"))
+        assertTrue(line(""""roi":[10,10,25,25],"count":700""").contains("ROI 112%"))
+        assertFalse(line(""""roi":"Unknown","count":100""").contains("%"))
+    }
+
+    @Test
     fun defaultPreviewRequiresARegionUnlessAnExplicitPreviewImageExists() {
         val noRegion = node("""{"action":"Click"}""")
         val noRegionOperations = listOf(PipelineVisualModel.operation(noRegion), PipelineVisualModel.operation(noRegion, true))

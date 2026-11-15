@@ -49,6 +49,11 @@ class PipelineJsonCompletion : CompletionContributor() {
     override fun fillCompletionVariants(parameters: CompletionParameters, result: CompletionResultSet) {
         val file = parameters.originalFile
         if (!isMaaJson(file)) return
+        if (PipelinePreviewCommentCompletion.complete(parameters, result)) {
+            result.stopHere()
+            return
+        }
+        if (PsiTreeUtil.getParentOfType(parameters.position, PsiComment::class.java, false) != null) return
         val position = parameters.position
         val property = generateSequence(position) { it.parent }.filterIsInstance<JsonProperty>().firstOrNull()
         val literal = generateSequence(position) { it.parent }.filterIsInstance<JsonStringLiteral>().firstOrNull()
@@ -276,7 +281,7 @@ class PipelineJsonCompletion : CompletionContributor() {
 }
 
 internal class PipelineCompletionMatcher(prefix: String) : PrefixMatcher(prefix) {
-    private val matcher = NameUtil.buildMatcher("*$prefix").withCaseSensitivity(NameUtil.MatchingCaseSensitivity.NONE).build()
+    private val matcher = NameUtil.buildMatcher("*$prefix").withMatchingMode(com.intellij.util.text.matching.MatchingMode.IGNORE_CASE).build()
     override fun prefixMatches(name: String): Boolean = matcher.matches(name)
     override fun cloneWithPrefix(prefix: String): PrefixMatcher = PipelineCompletionMatcher(prefix)
 }

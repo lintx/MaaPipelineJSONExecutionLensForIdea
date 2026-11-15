@@ -59,8 +59,10 @@ internal class PipelineWorkspaceState(private val project: Project) : Persistent
         requestedFile = source
         requestedOffset = offset
         storage.reopen = true
-        FileEditorManager.getInstance(project).openFile(file, true)
-            .filterIsInstance<PipelineFileEditor>().firstOrNull()?.acceptSourceRequest()
+        PipelineNavigation.getInstance(project).open(file) {
+            FileEditorManager.getInstance(project).getEditors(file)
+                .filterIsInstance<PipelineFileEditor>().firstOrNull()?.acceptSourceRequest()
+        }
     }
 
     fun clearSourceRequest() { requestedFile = null }
@@ -74,7 +76,7 @@ internal class PipelineWorkspaceState(private val project: Project) : Persistent
         }
         val target = VirtualFileManager.getInstance().getFileSystem(PipelineWorkspaceFileSystem.PROTOCOL)
             .findFileByPath(PipelineWorkspaceFileSystem.nodePath(project.locationHash, source.url, node.name)) ?: return
-        FileEditorManager.getInstance(project).openFile(target, true)
+        PipelineNavigation.getInstance(project).open(target)
     }
     fun reading(context: String): PipelineReadingState = if (context.isEmpty()) emptyReading else
         storage.sessions.getOrPut(context) { PipelineReadingState() }

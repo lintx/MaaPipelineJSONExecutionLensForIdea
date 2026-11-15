@@ -3,13 +3,12 @@ package org.lintx.maapipeline.executionlens.pipeline
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.DialogWrapper
+import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.util.ui.JBUI
-import org.intellij.images.editor.impl.ImageEditorManagerImpl
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Cursor
@@ -41,9 +40,11 @@ internal class PipelineImagePreview(
     private val roiSession: PipelineRoiEditSession? = null,
     private val onApplied: () -> Unit = {},
     private val node: PipelineNodeLocation? = null,
+    retainAction: AnAction? = null,
 ) : JPanel(BorderLayout()), Disposable {
-    val viewer = ImageEditorManagerImpl.createImageEditorUI(original)
-    private val picture = ImageEditorManagerImpl.getImageComponent(viewer)
+    val viewer = PipelineImageViewer(original, retainAction)
+    private val picture = viewer.picture
+    private val overlay = PipelinePreviewOverlay(picture, templates, ::screenRectangle)
     private var displayOperations = operations
     private var annotations = PipelinePreviewModel.annotations(displayOperations, resolve)
     private val editReasons = annotations.map { roiSession?.unavailable(it) }
@@ -96,13 +97,14 @@ internal class PipelineImagePreview(
                     horizontalScrollBarPolicy = JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
                 }, BorderLayout.CENTER)
             }
-            if (annotations.isNotEmpty()) add(chooser, BorderLayout.SOUTH)
         }
         add(top, BorderLayout.NORTH)
         add(viewer, BorderLayout.CENTER)
+        add(overlay.overflow, BorderLayout.EAST)
         add(status, BorderLayout.SOUTH)
         chooser.name = "pipeline-preview-annotations"
-        com.intellij.ui.ComboboxSpeedSearch(chooser)
+        if (annotations.isNotEmpty()) viewer.toolbarPanel.add(chooser, BorderLayout.CENTER)
+        com.intellij.ui.ComboboxSpeedSearch.installOn(chooser)
         chooser.addActionListener { updateImage(); updateControls() }
         picture.layout = null
         (editButtons + offsetButtons + listOf(apply, cancel, numeric)).forEach(picture::add)
@@ -114,11 +116,12 @@ internal class PipelineImagePreview(
         scroll.viewport.addChangeListener { positionButtons() }
         picture.border = object : AbstractBorder() {
             override fun paintBorder(component: Component, graphics: Graphics, x: Int, y: Int, width: Int, height: Int) {
-                if (!editingVisible()) return
-                val rectangle = region ?: return
-                val bounds = screenRectangle(rectangle)
                 val pen = graphics.create() as Graphics2D
                 try {
+                    overlay.paint(pen)
+                    if (!editingVisible()) return
+                    val rectangle = region ?: return
+                    val bounds = screenRectangle(rectangle)
                     PipelineVisualAssets.drawRoiFrame(pen, bounds, (editingNumber ?: 1) - 1, original = !editingOffset,
                         dashed = true, PipelinePreviewSettings.lineWidth())
                     pen.color = JBColor.BLUE
@@ -195,12 +198,16 @@ internal class PipelineImagePreview(
     private fun editingVisible(): Boolean = editing && (selected() == null || selected()?.number == editingNumber)
 
     private fun updateImage() {
-        val zoom = viewer.zoomModel.zoomFactor
-        picture.document.setValue(if (displayOperations.isEmpty()) original else
-            PipelineVisualAssets.overlay(original, displayOperations, resolve, selected()?.number, templates,
-                excludedAnnotation = editingNumber, originalDraft = regionValues.takeUnless { editingOffset },
-                finalDraft = regionValues.takeIf { editingOffset }))
-        viewer.zoomModel.zoomFactor = zoom
+        val edited = if (editingVisible()) editingAnnotation()?.let { annotation -> region?.let { rectangle ->
+            val information = annotation.region.copy(coordinates = regionValues,
+                originalCoordinates = if (editingOffset) offsetBase else regionValues,
+                coordinateOffset = if (editingOffset) offsetValues() else annotation.region.coordinateOffset)
+            PipelineVisualAssets.OverlayRegion(Rectangle(rectangle),
+                listOf(PipelineVisualAssets.OverlayMark(annotation.copy(region = information), original = !editingOffset)))
+        } } else null
+        overlay.update(PipelineVisualAssets.previewRegions(original.width, original.height, displayOperations, resolve, selected()?.number,
+            excludedAnnotation = editingNumber, originalDraft = regionValues.takeUnless { editingOffset },
+            finalDraft = regionValues.takeIf { editingOffset }), edited)
         positionButtons()
         picture.repaint()
     }
@@ -250,22 +257,6 @@ internal class PipelineImagePreview(
         }
 
     private fun positionButtons() {
-        val visible = picture.visibleRect
-        val occupied = mutableListOf<Rectangle>()
-        val size = JBUI.scale(24)
-        fun place(button: JButton, rectangle: Rectangle, column: Int = 0) {
-            val frame = screenRectangle(rectangle)
-            button.isVisible = frame.intersects(visible)
-            if (!button.isVisible) return
-            val left = (frame.x + frame.width - (column + 1) * size).coerceIn(visible.x, maxOf(visible.x, visible.x + visible.width - size))
-            var top = (frame.y - size).coerceIn(visible.y, maxOf(visible.y, visible.y + visible.height - size))
-            var bounds = Rectangle(left, top, size, size)
-            while (occupied.any { it.intersects(bounds) } && top + 2 * size <= visible.y + visible.height) {
-                top += size; bounds = Rectangle(left, top, size, size)
-            }
-            button.bounds = bounds
-            occupied += bounds
-        }
         editButtons.forEachIndexed { index, button ->
             val annotation = annotations[index]
             val rectangle = originalRectangle(annotation) ?: annotation.region.rectangle(original.width, original.height)
@@ -274,7 +265,6 @@ internal class PipelineImagePreview(
                 val reason = editReasons[index]
                 button.isEnabled = reason == null
                 button.toolTipText = reason ?: "调整 ${annotation.title} 的原始 ROI（保留 offset）"
-                place(button, rectangle!!)
             }
         }
         offsetButtons.forEachIndexed { index, button ->
@@ -285,13 +275,13 @@ internal class PipelineImagePreview(
                 val reason = roiSession?.unavailable(annotation, offset = true)
                 button.isEnabled = reason == null
                 button.toolTipText = reason ?: "修改 ${annotation.key}_offset（保留原始 ROI）"
-                place(button, rectangle!!, if (annotation.region.originalCoordinates == null) 1 else 0)
             }
         }
         apply.isVisible = editingVisible(); cancel.isVisible = editingVisible(); numeric.isVisible = editingVisible()
-        if (editingVisible()) (region ?: imagePoint(Point(visible.x, visible.y)).let { Rectangle(it.x, it.y, 1, 1) }).let {
-            place(apply, it, 2); place(cancel, it, 1); place(numeric, it)
-        }
+        overlay.position(annotations.mapIndexed { index, annotation ->
+            annotation.number to if (editingVisible() && annotation.number == editingNumber) listOf(apply, cancel, numeric)
+                else listOf(editButtons[index], offsetButtons[index]).filter { it.isVisible }
+        }.toMap())
     }
 
     private fun editCoordinates() {
@@ -379,21 +369,7 @@ internal class PipelineImagePreview(
             resolve: (String) -> PipelineNodeLocation? = { null },
             templates: Map<Int, List<PipelineVisualAssets.TemplatePreview>> = emptyMap(),
             blocked: (VirtualFile) -> Boolean = { false }) {
-            object : DialogWrapper(project, false) {
-                private val preview = PipelineImagePreview(project, original, operations, resolve, templates,
-                    if (operations.isEmpty()) null else PipelineRoiEditSession(project, operations, blocked), node = node)
-                init { title = "识别预览 · ${node.name}"; setOKButtonText("关闭"); init(); Disposer.register(disposable, preview) }
-                override fun createActions() = arrayOf(okAction)
-                override fun createCenterPanel(): JComponent = preview
-                override fun doOKAction() { if (confirmDiscard()) super.doOKAction() }
-                override fun doCancelAction() { if (confirmDiscard()) super.doCancelAction() }
-                private fun confirmDiscard(): Boolean = !preview.hasChanges() ||
-                    com.intellij.openapi.ui.Messages.showYesNoDialog(project, "放弃尚未应用的 ROI 调整？", "关闭预览", null) == com.intellij.openapi.ui.Messages.YES
-                override fun show() {
-                    SwingUtilities.invokeLater { if (window?.isShowing == true) preview.fitToWindow() }
-                    super.show()
-                }
-            }.show()
+            PipelinePreviewTabs.getInstance(project).open(PipelinePreviewRequest(node, original, operations, resolve, templates, blocked))
         }
     }
 }

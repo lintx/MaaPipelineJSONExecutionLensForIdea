@@ -9,8 +9,36 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiElement
 import com.intellij.psi.SmartPointerManager
 import java.awt.image.BufferedImage
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.PathManager
+import com.intellij.openapi.components.Service
+import com.intellij.openapi.components.service
+import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import javax.imageio.ImageIO
 
 internal object PipelineHoverImages {
+    fun imageUrl(image: BufferedImage): String = service<PipelineHoverImageCache>().imageUrl(image)
+
+    private val hoverImages = java.util.Collections.synchronizedMap(object : LinkedHashMap<String, BufferedImage>(64, 0.75f, true) {
+        private var pixels = 0L
+        override fun put(key: String, value: BufferedImage): BufferedImage? {
+            val previous = super.put(key, value)
+            pixels += value.width.toLong() * value.height - (previous?.let { it.width.toLong() * it.height } ?: 0L)
+            while (pixels > 16_000_000L && size > 1) {
+                val oldest = entries.iterator().next()
+                pixels -= oldest.value.width.toLong() * oldest.value.height
+                remove(oldest.key)
+            }
+            return previous
+        }
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BufferedImage>?): Boolean = false
+    })
+
+    fun cacheImage(key: String, image: BufferedImage) { hoverImages[key] = image }
+    fun localImage(key: String): java.awt.Image? = hoverImages[key]
+
     internal fun colorKey(operation: PipelineOperation): String {
         val identity = listOf(operation.source?.sourceFile?.url.orEmpty(), operation.source?.name.orEmpty(),
             operation.ownerPath.joinToString("/")).joinToString("\n")
@@ -41,13 +69,17 @@ internal object PipelineHoverImages {
         val catalog: Map<String, PipelineNodeLocation> = emptyMap(),
         val templates: Map<Int, List<PipelineVisualAssets.TemplatePreview>> = emptyMap())
 
-    fun open(element: PsiElement, link: String): Boolean {
+    fun open(element: PsiElement, link: String, popupMarker: String? = null): Boolean {
         val key = link.removePrefix("psi_element://").takeIf { it.startsWith("maa-image:") }?.removePrefix("maa-image:") ?: return false
         val pointer = SmartPointerManager.createPointer(element)
         val project = element.project
         val application = ApplicationManager.getApplication()
+        if (popupMarker != null) {
+            if (application.isDispatchThread) PipelineDocumentationPopup.close(popupMarker)
+            else application.invokeLater({ PipelineDocumentationPopup.close(popupMarker) }, ModalityState.nonModal())
+        }
         application.executeOnPooledThread {
-            val preview = ReadAction.compute<Preview?, RuntimeException> {
+            val preview = ReadAction.computeBlocking<Preview?, RuntimeException> {
                 if (project.isDisposed) null else pointer.element?.let { load(it, key) }
             } ?: return@executeOnPooledThread
             application.invokeLater({
@@ -104,5 +136,29 @@ internal object PipelineHoverImages {
             return Preview(source, image, previewContext.location)
         }
         return null
+    }
+}
+
+@Service(Service.Level.APP)
+internal class PipelineHoverImageCache : Disposable {
+    private var directory: Path? = null
+
+    @Synchronized
+    fun imageUrl(image: BufferedImage): String {
+        val bytes = ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray()
+        if (bytes.size <= 2048) return "data:image/png;base64," + java.util.Base64.getEncoder().encodeToString(bytes)
+        // 新版自适应加载器直接读取 URL，不使用 DocumentationResult 的内存图片解析器。
+        val cache = directory ?: Files.createTempDirectory(Files.createDirectories(Path.of(PathManager.getTempPath())), "maapipeline-hover-")
+            .also { directory = it }
+        val digest = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes))
+        val file = cache.resolve("$digest.png")
+        if (!Files.exists(file)) Files.write(file, bytes)
+        return file.toUri().toASCIIString()
+    }
+
+    @Synchronized
+    override fun dispose() {
+        directory?.let { com.intellij.openapi.util.io.FileUtil.delete(it.toFile()) }
+        directory = null
     }
 }

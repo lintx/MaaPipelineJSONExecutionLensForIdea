@@ -239,7 +239,16 @@ internal class PipelineRowsPanel : JPanel(GridBagLayout()), Scrollable {
 
     override fun removeNotify() {
         playbackScrollRequest++
-        super.removeNotify()
+        val wasVisible = isVisible
+        try {
+            // 同窗口混有原生控件时，每个可见子控件卸载都会触发 AWT 遮挡形状重算。
+            // 先隐藏整棵流程树，让子控件跳过这条路径；不销毁行组件或阅读状态。
+            if (wasVisible) isVisible = false
+            super.removeNotify()
+        } finally {
+            // 此时 peer 已卸载，恢复逻辑可见性不会重新显示窗口；下次挂载可直接复用。
+            if (wasVisible) isVisible = true
+        }
     }
 
     override fun getPreferredScrollableViewportSize(): Dimension = preferredSize

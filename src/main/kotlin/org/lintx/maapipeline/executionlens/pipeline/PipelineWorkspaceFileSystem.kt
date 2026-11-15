@@ -10,6 +10,8 @@ internal class PipelineWorkspaceFileSystem : DeprecatedVirtualFileSystem(), NonP
 
     override fun getProtocol(): String = PROTOCOL
 
+    override fun extractPresentableUrl(path: String): String = files[path]?.name ?: path.substringAfterLast('/')
+
     override fun findFileByPath(path: String): PipelineWorkspaceFile? {
         val parts = path.split('/')
         if (parts.size != 3 || parts[0].isNotEmpty()) return null
@@ -46,5 +48,4 @@ internal class PipelineWorkspaceFile(
     // IDE 恢复标签时可重新解析地址；工作区内容仍由项目阅读状态提供，不创建磁盘文件。
     override fun getFileSystem(): PipelineWorkspaceFileSystem = workspaceFileSystem
     override fun getPath(): String = workspacePath
-    override fun getPresentableUrl(): String = name
 }

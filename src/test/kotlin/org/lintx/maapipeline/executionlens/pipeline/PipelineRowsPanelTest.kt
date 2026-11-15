@@ -9,8 +9,45 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
 import kotlin.test.assertNotSame
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class PipelineRowsPanelTest {
+    @Test
+    fun detachingRowsHidesTheWholeTreeAndPreservesStateWhenReattached() {
+        SwingUtilities.invokeAndWait {
+            val panel = PipelineRowsPanel()
+            var removals = 0
+            val text = object : javax.swing.JTextArea("保留选择和原有控件") {
+                override fun removeNotify() {
+                    assertFalse(panel.isVisible, "必须在卸载子控件之前整体隐藏流程")
+                    assertFalse(isShowing, "子控件卸载不能继续触发可见树的遮挡计算")
+                    removals++
+                    super.removeNotify()
+                }
+            }
+            panel.setRows(listOf(PipelineRow("kept", "revision") { JPanel().apply { add(text) } }))
+            val row = panel.getComponent(0)
+            text.select(2, 4)
+            val selection = text.selectedText
+            repeat(2) {
+                panel.addNotify()
+                try {
+                    assertTrue(text.isShowing)
+                } finally { panel.removeNotify() }
+                assertTrue(panel.isVisible, "卸载结束后恢复逻辑可见性，切回标签可直接挂载")
+                assertFalse(panel.isDisplayable)
+                assertSame(row, panel.getComponent(0))
+                assertEquals(selection, text.selectedText)
+            }
+            panel.isVisible = false
+            panel.addNotify()
+            panel.removeNotify()
+            assertFalse(panel.isVisible, "原本隐藏的流程不能被卸载逻辑打开")
+            assertEquals(3, removals)
+        }
+    }
+
     @Test
     fun playbackFollowUsesTwoFifthsAndClampsToExistingContent() {
         lateinit var panel: PipelineRowsPanel

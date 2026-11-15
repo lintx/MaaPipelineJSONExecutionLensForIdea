@@ -1,0 +1,107 @@
+name: Build and publish
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# 同一个版本的发布串行执行；普通分支检查可以被后续提交替代。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+jobs:
+  build:
+    if: github.event_name != 'release' || (!github.event.release.prerelease && !github.event.release.draft)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release and prepare notes
+        if: github.event_name == 'release'
+        run: ./.github/scripts/prepare-release.ps1
+
+      - name: Check release secrets
+        if: github.event_name == 'release'
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
+        run: |
+          foreach ($name in @('PUBLISH_TOKEN', 'PRIVATE_KEY', 'CERTIFICATE_CHAIN', 'PRIVATE_KEY_PASSWORD')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing GitHub Actions secret: $name"
+            }
+          }
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Test and build
+        run: |
+          $arguments = @('test', 'buildPlugin', 'verifyPluginStructure', '--max-workers=2', '--console=plain', '--no-configuration-cache', '-Pkotlin.daemon.jvmargs=-Xmx2048m')
+          if ($env:RELEASE_VERSION) {
+            $arguments += "-PpluginVersion=$env:RELEASE_VERSION"
+            $arguments += "-PreleaseNotesFile=$env:RELEASE_NOTES_FILE"
+          }
+          & ./gradlew.bat @arguments
+          exit $LASTEXITCODE
+
+      - name: Sign and verify release
+        if: github.event_name == 'release'
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
+        run: |
+          & ./gradlew.bat prepareManualRelease "-PpluginVersion=$env:RELEASE_VERSION" "-PreleaseNotesFile=$env:RELEASE_NOTES_FILE" --max-workers=2 --console=plain --no-configuration-cache
+          exit $LASTEXITCODE
+
+      - name: Save plugin packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ env.RELEASE_VERSION || github.sha }}
+          path: build/distributions/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to JetBrains Marketplace
+        if: github.event_name == 'release'
+        env:
+          PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          CERTIFICATE_CHAIN: ${{ secrets.CERTIFICATE_CHAIN }}
+          PRIVATE_KEY_PASSWORD: ${{ secrets.PRIVATE_KEY_PASSWORD }}
+        run: |
+          & ./gradlew.bat publishPlugin "-PpluginVersion=$env:RELEASE_VERSION" "-PreleaseNotesFile=$env:RELEASE_NOTES_FILE" --max-workers=2 --console=plain --no-configuration-cache
+          exit $LASTEXITCODE
+
+      - name: Save test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/reports/tests/
+            build/test-results/test/
+          if-no-files-found: ignore
+          retention-days: 14

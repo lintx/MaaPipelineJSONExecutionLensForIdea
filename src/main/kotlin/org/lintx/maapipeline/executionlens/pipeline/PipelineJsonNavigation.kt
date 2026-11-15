@@ -4,8 +4,6 @@ import com.intellij.json.psi.JsonFile
 import com.intellij.json.psi.JsonObject
 import com.intellij.json.psi.JsonProperty
 import com.intellij.json.psi.JsonStringLiteral
-import com.intellij.openapi.fileEditor.FileEditorManager
-import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.patterns.PlatformPatterns
@@ -128,6 +126,6 @@ internal class PipelineSourceTarget(private val file: PsiFile, private val offse
     override fun canNavigateToSource() = canNavigate()
     override fun navigate(requestFocus: Boolean) {
         val virtualFile = file.virtualFile ?: return
-        FileEditorManager.getInstance(project).openTextEditor(OpenFileDescriptor(project, virtualFile, offset), requestFocus)
+        PipelineNavigation.getInstance(project).open(virtualFile, offset, requestFocus)
     }
 }

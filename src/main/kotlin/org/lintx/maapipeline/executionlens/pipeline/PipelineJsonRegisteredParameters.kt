@@ -50,7 +50,7 @@ internal object PipelineJsonRegisteredParameters {
                     condition.then?.let(branches::add)
                 }
             }
-            schema.resolveRefSchema(service)?.let(::collect)
+            resolveReference(schema, service)?.let(::collect)
             schema.definitionNames.forEach { name -> schema.getDefinitionByName(name)?.let(::collect) }
             schema.allOf.orEmpty().forEach(::collect)
             schema.anyOf.orEmpty().forEach(::collect)
@@ -107,5 +107,16 @@ internal object PipelineJsonRegisteredParameters {
         }
         val schema = service.getSchemaObjectForSchemaFile(file) ?: return null
         return JsonSchemaCompletionContributor.getCompletionVariants(schema, position, originalPosition, completionType)
+    }
+
+    private fun resolveReference(schema: JsonSchemaObject, service: JsonSchemaService): JsonSchemaObject? {
+        val reference = schema.ref ?: return null
+        val root = if (reference.startsWith('#')) schema.rootSchemaObject else {
+            val source = schema.rawFile ?: return null
+            val target = service.findSchemaFileByReference(reference, source) ?: return null
+            service.getSchemaObjectForSchemaFile(target) ?: return null
+        }
+        val fragment = reference.substringAfter('#', "")
+        return if (fragment.isEmpty()) root else root.findRelativeDefinition("#$fragment")
     }
 }
